@@ -1,0 +1,97 @@
+name: release-runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      runtime:
+        description: "Runtime id to publish, or 'all'"
+        required: true
+        default: "all"
+      publicize:
+        description: "Grant public layer permissions after publish"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - id: matrix
+        env:
+          INPUT_RUNTIME: ${{ github.event.inputs.runtime }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          root = Path.cwd()
+          runtimes = json.loads(
+              subprocess.check_output(
+                  [sys.executable, "tools/runtime_lib/runtime_manifest.py", "list", "--json"],
+                  cwd=root,
+                  text=True,
+              )
+          )
+
+          selected = os.environ["INPUT_RUNTIME"].strip()
+          if selected and selected != "all":
+              if selected not in runtimes:
+                  raise SystemExit(f"Unknown runtime '{selected}'. Available: {', '.join(runtimes)}")
+              runtimes = [selected]
+
+          matrix = json.dumps({"include": [{"runtime": runtime} for runtime in runtimes]})
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          output_path.write_text(f"matrix={matrix}\n", encoding="utf-8")
+          PY
+
+  publish:
+    needs: prepare-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+    env:
+      SAM_CLI_TELEMETRY: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_RELEASE_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Build runtime package
+        run: make build RUNTIME=${{ matrix.runtime }}
+      - name: Audit runtime package
+        run: bash tools/bin/audit-runtime "${{ matrix.runtime }}"
+      - name: Upload runtime artifact to S3
+        run: make upload RUNTIME=${{ matrix.runtime }}
+      - name: Publish Lambda layer
+        if: ${{ github.event.inputs.publicize != 'true' }}
+        run: make publish RUNTIME=${{ matrix.runtime }}
+      - name: Publish and publicize Lambda layer
+        if: ${{ github.event.inputs.publicize == 'true' }}
+        run: make publicize RUNTIME=${{ matrix.runtime }}
+      - name: Summarize latest layer arns
+        run: |
+          {
+            echo "### ${{ matrix.runtime }}"
+            bash tools/bin/latest-runtime "${{ matrix.runtime }}"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"

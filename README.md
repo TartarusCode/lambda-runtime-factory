@@ -1,165 +1,168 @@
-# lambda-runtime-pypy
+# lambda-runtime-monorepo
 
-An AWS Lambda custom runtime layer for [PyPy](https://pypy.org) on `provided.al2023`.
-
-Derived from https://github.com/iopipe/lambda-runtime-pypy3.5
+A monorepo for AWS Lambda custom runtimes, with PyPy as the first implemented runtime.
 
 ## Overview
 
-This project packages a PyPy runtime as a Lambda layer and ships a hardened `bootstrap` that:
+The repository is now organized around runtime packages under `runtimes/` and shared tooling under `tools/`.
 
-- Implements the Lambda Runtime API with correct `/next`, `/response`, `/error`, and `/init/error` lifecycle behavior.
-- Handles `SIGTERM` and `SIGINT` so the runtime can stop polling and exit cleanly.
-- Reports structured error payloads including stack traces.
-- Publishes helper modules for structured logging, optional X-Ray integration, and Provisioned Concurrency init hooks.
+- Runtime-specific code, checksums, examples, and release metadata live under `runtimes/<runtime-id>/`
+- Shared build, audit, publish, and local-test entrypoints live under `tools/bin/`
+- Runtime metadata is declared in `runtimes/<runtime-id>/runtime.json`
+- GitHub Actions uses the runtime manifest list as the source of truth for CI and release matrices
 
-## Supported Runtime
+## Repository Layout
 
-- `pypy3.11-v7.3.21`
-- Lambda runtime target: `provided.al2023`
+```text
+runtimes/
+  pypy311/
+    runtime.json
+    bootstrap/
+    helpers/
+    checksums/
+    examples/
+tools/
+  bin/
+  runtime_lib/
+.github/workflows/
+```
 
-Python 2 and the legacy `provided` runtime are intentionally no longer built or published.
+## Supported Runtimes
 
-## Build
+Current implemented runtime:
 
-Build the runtime layer:
+- `pypy311`
+
+The shared tooling is intentionally runtime-agnostic so additional runtimes can be added without reworking the root build and release flow.
+
+## Runtime Manifest
+
+Each runtime package declares its build and release contract in `runtime.json`, including:
+
+- runtime family
+- runtime version or distribution identifier
+- any overrides to the family defaults
+
+Most runtime details are now derived from runtime-family defaults in `tools/runtime_lib/runtime_manifest.py`. For runtimes that follow an established family layout, the manifest can stay very small.
+
+Use the manifest tooling from the repo root:
 
 ```bash
-make build
+make list-runtimes
+python3 tools/runtime_lib/runtime_manifest.py validate
 ```
 
-Security checks:
+## Common Commands
+
+Supported build environment:
+
+- Linux or WSL is required for build and release commands
+- The shared tooling assumes native Linux tools such as `bash`, `tar`, `zip`, `unzip`, `curl`, `sha256sum`, and `make`
+- Transient build work is staged under `${BUILD_ROOT:-$RUNNER_TEMP}` or `/tmp` to avoid slow cross-OS archive operations
+  - release and CI artifacts are built from temp storage by default
+  - set `EXPORT_ARTIFACT_DIR=/some/path` if you want a copy of the final zip preserved outside temp storage
+
+Build a specific runtime:
 
 ```bash
-make audit
+make build RUNTIME=pypy311
 ```
 
-The build pipeline now:
-
-- Downloads PyPy over HTTPS with retries.
-- Verifies the downloaded archive against the pinned SHA-256 checksum in `checksums/pypy.sha256`.
-- Copies the runtime helper package into the layer's `site-packages`.
-- Runs a best-effort vulnerability scan when `trivy` or `grype` is installed.
-
-## Publish
-
-Upload and publish the layer:
+Audit a built runtime:
 
 ```bash
-make upload
-make publish
+make audit RUNTIME=pypy311
 ```
 
-Published layer versions are marked as compatible with `provided.al2023`.
-
-## Usage
-
-### Basic Handler
-
-```python
-def handler(event, context):
-    return {
-        "statusCode": 200,
-        "body": "Hello from PyPy Lambda!",
-    }
-```
-
-### Structured Logging
-
-```python
-from lambda_runtime_pypy import get_logger
-
-logger = get_logger("app", service="orders")
-
-
-def handler(event, context):
-    logger.info("handling request")
-    return {"statusCode": 200, "body": "ok"}
-```
-
-### Optional Init Hooks
-
-```python
-from lambda_runtime_pypy import register_init_hook
-
-
-@register_init_hook
-def warm_dependencies():
-    import json
-    json.dumps({"warm": True})
-```
-
-You can also register hooks through the `PYPY_RUNTIME_INIT_HOOKS` environment variable using a comma-separated list of `module.function` references.
-
-### Optional X-Ray Helper
-
-```python
-from lambda_runtime_pypy import subsegment
-
-
-def handler(event, context):
-    with subsegment("load-order", annotations={"tenant": "demo"}):
-        return {"statusCode": 200, "body": "ok"}
-```
-
-If `aws_xray_sdk` is not present, the helper becomes a no-op so application code does not need branching logic.
-
-## Handler Resolution
-
-Handlers use the standard `module.function` format and now support nested modules correctly, for example:
-
-- `app.handler`
-- `src.handlers.api.handler`
-
-## Performance Notes
-
-- PyPy can improve warm execution performance for CPU-heavy functions.
-- Cold starts can be slower than CPython because of JIT warm-up.
-- For latency-sensitive workloads, pair this runtime with Provisioned Concurrency and keep init hooks focused on reusable work only.
-
-## Local Build Shell
-
-For a local shell that matches the Lambda base runtime more closely:
+Upload and publish a runtime layer:
 
 ```bash
-make shell
+make upload RUNTIME=pypy311
+make publish RUNTIME=pypy311
 ```
 
-This uses `public.ecr.aws/sam/build-provided.al2023`.
+Publish and publicize a runtime layer:
+
+```bash
+make publicize RUNTIME=pypy311
+```
+
+List the latest published layer versions:
+
+```bash
+make latest RUNTIME=pypy311
+```
 
 ## Local SAM Test Flow
 
-The repo now includes a repeatable local invoke setup for Docker-backed SAM:
+Each runtime can carry its own local SAM assets. For PyPy they live under:
 
-- Template: `examples/sam/template.local.example.yaml`
-- Sample event: `examples/sam/events/hello.json`
-- Function build file: `examples/sam/hello/Makefile`
+- `runtimes/pypy311/examples/sam/template.local.example.yaml`
+- `runtimes/pypy311/examples/sam/events/hello.json`
+- `runtimes/pypy311/examples/sam/hello/Makefile`
 
-From the repo root:
+Run the local smoke test from the repo root:
 
 ```bash
-make local-build
-make local-invoke
+make local-build RUNTIME=pypy311
+make local-invoke RUNTIME=pypy311
 ```
 
-What these targets do:
+This flow:
 
-- `make local-build` builds the PyPy layer zip, unpacks it into `.local-layer`, and runs `sam build --use-container`.
-- `make local-invoke` runs the built function through `sam local invoke` using dummy AWS credentials so expired local profiles do not block testing.
+- builds the runtime package under temp storage
+- expands the local layer under temp storage
+- renders a temp SAM template with resolved local paths
+- runs `sam build --use-container` with a temp SAM build directory
+- assembles a temp invoke bundle for `sam local invoke`
 
 Requirements:
 
-- Run from WSL/Linux for the smoothest Docker behavior.
-- Ensure Docker is available in your shell.
-- Ensure `sam` is installed in the environment where you run the local test commands.
+- Linux or WSL is required for Docker-backed SAM workflows
+- For best local SAM performance, keep the repo on the WSL filesystem instead of `/mnt/c/...`
+- Docker must be available
+- `sam` must be installed in the environment where you run the commands
 
-## Examples
+## GitHub Actions
 
-- `examples/sam/template.yml`
-- `examples/sam/template.local.example.yaml`
-- `examples/sls/serverless.yml`
+The repo includes:
 
-The deployable examples target `provided.al2023` and expect you to supply the published layer ARN for your account and region. The local SAM example uses the locally unpacked `.local-layer` directory instead.
+- `.github/workflows/ci.yml`
+  - manifest validation
+  - shell syntax validation
+  - Python syntax validation for runtime code
+  - runtime build and checksum enforcement
+  - vulnerability audit
+  - local SAM build and invoke smoke tests
+- `.github/workflows/release-runtime.yml`
+  - manual runtime-scoped release flow
+  - rebuild, audit, upload, and publish steps
+
+The release workflow expects an AWS role secret named `AWS_RELEASE_ROLE_ARN`.
+
+## Adding A New Runtime
+
+1. Create a new runtime directory under `runtimes/<runtime-id>/`.
+2. Add a `runtime.json` manifest with artifact, Lambda, release, and local test metadata.
+3. Add the runtime bootstrap, helper package, checksum file, and examples under that directory.
+4. Run:
+
+```bash
+python3 tools/runtime_lib/runtime_manifest.py validate --runtime <runtime-id>
+bash tools/bin/check-runtime <runtime-id>
+make build RUNTIME=<runtime-id>
+```
+
+5. Add or adapt runtime-specific examples under `runtimes/<runtime-id>/examples/`.
+6. Add or update CI expectations if the runtime needs extra validation steps beyond the shared defaults.
+
+## PyPy Notes
+
+The first runtime package, `pypy311`, still ships the hardened Lambda Runtime API implementation and the helper package for:
+
+- structured logging
+- init hooks for Provisioned Concurrency style warm-up
+- optional X-Ray helper utilities
 
 ## License
 

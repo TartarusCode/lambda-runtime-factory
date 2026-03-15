@@ -1,0 +1,15 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+
+runtime_id=${1:-${RUNTIME:-}}
+temp_root=$(common::temp_root)
+
+if [[ -n "${runtime_id}" ]]; then
+    rm -rf "${temp_root}/${runtime_id}"
+    rm -rf "$(common::repo_root)/dist/${runtime_id}"
+else
+    rm -rf "${temp_root}"
+    rm -rf "$(common::repo_root)/dist"
+fi

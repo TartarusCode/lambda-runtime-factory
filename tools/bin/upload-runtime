@@ -1,0 +1,18 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+# Shared runtime environment helpers.
+
+runtime_id=$(common::require_runtime_id "${1:-}")
+common::load_runtime_env "${runtime_id}"
+common::ensure_runtime_built "${runtime_id}"
+
+sha256sum_value=$(common::sha256_file "${PACKAGE_PATH}")
+s3_key="${S3_KEY_PREFIX}/${sha256sum_value}.zip"
+
+for region in ${RELEASE_REGIONS}; do
+    bucket_name="${BUCKET_BASE_NAME}-${region}"
+    echo "Uploading ${PACKAGE_PATH} to s3://${bucket_name}/${s3_key}"
+    aws --region "${region}" s3 cp "${PACKAGE_PATH}" "s3://${bucket_name}/${s3_key}"
+done

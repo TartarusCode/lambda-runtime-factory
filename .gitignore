@@ -1,7 +1,6 @@
-layer
-pypy*.zip
+build/
+dist/
 .aws-sam/
-.local-layer/
 template.local.yaml
 template.local.yml
 event.json

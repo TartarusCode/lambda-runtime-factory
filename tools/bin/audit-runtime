@@ -1,0 +1,52 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+# Shared runtime environment helpers.
+
+best_effort=0
+if [[ "${1:-}" == "--best-effort" ]]; then
+    best_effort=1
+    shift
+fi
+
+runtime_id=$(common::require_runtime_id "${1:-}")
+common::load_runtime_env "${runtime_id}"
+if [[ "${RUNTIME_BUILD_IN_PROGRESS:-0}" == "1" ]]; then
+    target_dir="${LAYER_ROOT}"
+    if [[ ! -d "${target_dir}" ]]; then
+        echo "Expected extracted runtime at ${target_dir}" >&2
+        exit 1
+    fi
+else
+    common::ensure_runtime_built "${runtime_id}"
+    target_dir="${LAYER_ROOT}"
+    if [[ ! -d "${target_dir}" ]]; then
+        echo "Expected extracted runtime at ${target_dir}" >&2
+        exit 1
+    fi
+fi
+
+if type -P trivy >/dev/null; then
+    trivy fs --quiet --severity HIGH,CRITICAL --exit-code 1 "${target_dir}"
+    exit 0
+fi
+
+if type -P grype >/dev/null; then
+    grype "dir:${target_dir}" --fail-on high --only-fixed
+    exit 0
+fi
+
+if type -P docker >/dev/null; then
+    docker run --rm -v "${target_dir}:/scan:ro" aquasec/trivy:latest fs --quiet --severity HIGH,CRITICAL --exit-code 1 /scan
+    exit 0
+fi
+
+message="Install trivy, grype, or docker to perform runtime vulnerability scanning"
+if (( best_effort )); then
+    echo "${message}" >&2
+    exit 0
+fi
+
+echo "${message}" >&2
+exit 1
