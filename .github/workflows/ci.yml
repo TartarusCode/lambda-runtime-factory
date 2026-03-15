@@ -75,7 +75,7 @@ jobs:
       - name: Invoke local SAM example
         run: make local-invoke RUNTIME=${{ matrix.runtime }}
       - name: Upload runtime artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.runtime }}-artifact
           path: ${{ runner.temp }}/lambda-runtime-monorepo/${{ matrix.runtime }}/artifacts/*.zip
