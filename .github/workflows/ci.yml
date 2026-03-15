@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   prepare-matrix:
+    if: ${{ !(github.event_name == 'pull_request' && github.actor == 'dependabot[bot]') }}
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -23,6 +24,7 @@ jobs:
         run: echo "matrix=$(python3 tools/runtime_lib/runtime_manifest.py matrix)" >> "$GITHUB_OUTPUT"
 
   runtime-checks:
+    if: ${{ !(github.event_name == 'pull_request' && github.actor == 'dependabot[bot]') }}
     needs: prepare-matrix
     runs-on: ubuntu-latest
     strategy:
