@@ -16,7 +16,7 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
@@ -34,7 +34,7 @@ jobs:
       SAM_CLI_TELEMETRY: "0"
       BUILD_BEST_EFFORT_AUDIT: "0"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
