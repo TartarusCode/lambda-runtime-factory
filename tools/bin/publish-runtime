@@ -1,0 +1,47 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+# Shared runtime environment helpers.
+
+publicize=0
+if [[ "${1:-}" == "--publicize" ]]; then
+    publicize=1
+    shift
+fi
+
+runtime_id=$(common::require_runtime_id "${1:-}")
+common::load_runtime_env "${runtime_id}"
+common::ensure_runtime_built "${runtime_id}"
+
+sha256sum_value=$(common::sha256_file "${PACKAGE_PATH}")
+s3_key="${S3_KEY_PREFIX}/${sha256sum_value}.zip"
+
+for region in ${RELEASE_REGIONS}; do
+    bucket_name="${BUCKET_BASE_NAME}-${region}"
+
+    echo "Publishing Lambda Layer ${LAYER_NAME} in region ${region}..."
+    version=$(aws lambda publish-layer-version \
+        --layer-name "${LAYER_NAME}" \
+        --description "${LAYER_DESCRIPTION}" \
+        --content "S3Bucket=${bucket_name},S3Key=${s3_key}" \
+        --compatible-runtimes ${COMPATIBLE_RUNTIMES} \
+        --license-info "Apache-2.0" \
+        --output text \
+        --query Version \
+        --region "${region}")
+    echo "Published Lambda Layer ${LAYER_NAME} in region ${region} version ${version}"
+
+    if (( publicize )); then
+        echo "Setting public permissions on Lambda Layer ${LAYER_NAME} version ${version} in region ${region}..."
+        aws lambda add-layer-version-permission \
+            --layer-name "${LAYER_NAME}" \
+            --version-number "${version}" \
+            --statement-id public \
+            --action lambda:GetLayerVersion \
+            --principal "*" \
+            --region "${region}" \
+            > /dev/null
+        echo "Public permissions set on Lambda Layer ${LAYER_NAME} version ${version} in region ${region}"
+    fi
+done

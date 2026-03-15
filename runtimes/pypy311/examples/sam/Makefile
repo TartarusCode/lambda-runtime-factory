@@ -1,3 +1,5 @@
+RUNTIME := pypy311
+
 package:
 	sam package \
 		--template-file template.yml \
@@ -10,4 +12,11 @@ deploy: package
 		--template-file packaged.yml \
 		--stack-name pypy-example-sam \
 		--capabilities CAPABILITY_IAM \
+		--parameter-overrides PyPyLayerArn=$$PYPY_LAYER_ARN \
 		--region us-east-1
+
+local-build:
+	$(MAKE) -C ../../../.. local-build RUNTIME=$(RUNTIME)
+
+local-invoke:
+	$(MAKE) -C ../../../.. local-invoke RUNTIME=$(RUNTIME)

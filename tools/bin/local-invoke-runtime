@@ -1,0 +1,66 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+# Shared runtime environment helpers.
+
+runtime_id=$(common::require_runtime_id "${1:-}")
+
+bash "$(common::repo_root)/tools/bin/local-build-runtime" "${runtime_id}"
+common::load_runtime_env "${runtime_id}"
+
+mkdir -p "${LOCAL_INVOKE_DIR}"
+cp -R "${LOCAL_SOURCE_DIR}/." "${LOCAL_INVOKE_DIR}/"
+cp -R "${LOCAL_LAYER_DIR}/${RUNTIME_DIR_NAME}" "${LOCAL_INVOKE_DIR}/"
+cp "${BOOTSTRAP_SOURCE}" "${LOCAL_INVOKE_DIR}/bootstrap.py"
+
+python3 - "${LOCAL_INVOKE_DIR}/bootstrap" <<'PY'
+import sys
+from pathlib import Path
+
+bootstrap_path = Path(sys.argv[1])
+bootstrap_path.write_text(
+    "#!/bin/sh\n"
+    "set -eu\n"
+    "export PYTHONPATH=\"${LAMBDA_TASK_ROOT}/pypy/site-packages:${LAMBDA_TASK_ROOT}:${PYTHONPATH:-}\"\n"
+    "exec \"${LAMBDA_TASK_ROOT}/pypy/bin/pypy\" \"${LAMBDA_TASK_ROOT}/bootstrap.py\"\n",
+    encoding="utf-8",
+    newline="\n",
+)
+PY
+chmod +x "${LOCAL_INVOKE_DIR}/bootstrap"
+
+python3 - "${LOCAL_INVOKE_TEMPLATE}" "${LOCAL_INVOKE_DIR}" "${LOCAL_FUNCTION_NAME}" "${LOCAL_HANDLER}" <<'PY'
+import sys
+from pathlib import Path
+
+template_path = Path(sys.argv[1])
+code_uri = sys.argv[2]
+function_name = sys.argv[3]
+handler = sys.argv[4]
+
+template_path.write_text(
+    "\n".join(
+        [
+            "AWSTemplateFormatVersion: '2010-09-09'",
+            "Transform: AWS::Serverless-2016-10-31",
+            "Description: \"Runtime local invoke template\"",
+            "",
+            "Resources:",
+            f"  {function_name}:",
+            "    Type: AWS::Serverless::Function",
+            "    Properties:",
+            f"      CodeUri: {code_uri}",
+            f"      Handler: {handler}",
+            "      Runtime: provided.al2023",
+            "      Timeout: 10",
+            "      MemorySize: 256",
+            "",
+        ]
+    ),
+    encoding="utf-8",
+    newline="\n",
+)
+PY
+
+sam local invoke "${LOCAL_FUNCTION_NAME}" --template-file "${LOCAL_INVOKE_TEMPLATE}" --event "${LOCAL_EVENT}"

@@ -2,10 +2,10 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: "PyPy Runtime SAM Example"
 
-Globals:
-  Function:
-    Layers:
-        - arn:aws:lambda:us-east-1:146318645305:layer:pypy35:1
+Parameters:
+  PyPyLayerArn:
+    Type: String
+    Description: ARN of the published PyPy Lambda layer for your region/account
 
 Resources:
   PyPyExample:
@@ -13,4 +13,6 @@ Resources:
     Properties:
       CodeUri: hello/
       Handler: hello.handler
-      Runtime: provided
+      Runtime: provided.al2023
+      Layers:
+        - !Ref PyPyLayerArn

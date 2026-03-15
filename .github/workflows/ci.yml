@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  prepare-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - id: matrix
+        run: echo "matrix=$(python3 tools/runtime_lib/runtime_manifest.py matrix)" >> "$GITHUB_OUTPUT"
+
+  runtime-checks:
+    needs: prepare-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+    env:
+      SAM_CLI_TELEMETRY: "0"
+      BUILD_BEST_EFFORT_AUDIT: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - name: Prepare cache directories
+        run: |
+          echo "DOWNLOAD_CACHE_DIR=${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads" >> "$GITHUB_ENV"
+          echo "TRIVY_CACHE_DIR=${RUNNER_TEMP}/lambda-runtime-monorepo/cache/trivy" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads"
+          mkdir -p "${RUNNER_TEMP}/lambda-runtime-monorepo/cache/trivy"
+      - name: Cache runtime downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.DOWNLOAD_CACHE_DIR }}
+          key: downloads-${{ runner.os }}-${{ matrix.runtime }}-${{ hashFiles(format('runtimes/{0}/runtime.json', matrix.runtime), format('runtimes/{0}/checksums/**', matrix.runtime)) }}
+      - name: Cache Trivy database
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.TRIVY_CACHE_DIR }}
+          key: trivy-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml', '.github/workflows/release-runtime.yml') }}
+          restore-keys: |
+            trivy-${{ runner.os }}-
+      - name: Install shell tooling
+        run: sudo apt-get update && sudo apt-get install -y shellcheck zip unzip
+      - name: Validate manifests
+        run: bash tools/bin/validate-runtimes
+      - name: Validate shell scripts
+        run: |
+          bash -n tools/bin/*.sh
+      - name: Validate Python sources
+        run: bash tools/bin/check-runtime "${{ matrix.runtime }}"
+      - name: Build runtime package
+        run: make build RUNTIME=${{ matrix.runtime }}
+      - name: Audit runtime package
+        run: bash tools/bin/audit-runtime "${{ matrix.runtime }}"
+      - name: Build local SAM example
+        run: make local-build RUNTIME=${{ matrix.runtime }}
+      - name: Invoke local SAM example
+        run: make local-invoke RUNTIME=${{ matrix.runtime }}
+      - name: Upload runtime artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.runtime }}-artifact
+          path: ${{ runner.temp }}/lambda-runtime-monorepo/${{ matrix.runtime }}/artifacts/*.zip

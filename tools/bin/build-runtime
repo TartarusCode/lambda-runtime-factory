@@ -1,0 +1,64 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+
+runtime_id=$(common::require_runtime_id "${1:-}")
+common::load_runtime_env "${runtime_id}"
+
+checksum_for() {
+    awk -v pkg="${CHECKSUM_NAME}" '{ sub(/\r$/, "", $2); if ($2 == pkg) print $1 }' "${CHECKSUM_FILE}"
+}
+
+verify_sha256() {
+    local archive_path=$1
+    local expected
+    expected=$(checksum_for)
+
+    if [[ -z "${expected}" ]]; then
+        echo "Missing checksum for ${CHECKSUM_NAME} in ${CHECKSUM_FILE}" >&2
+        exit 1
+    fi
+
+    if type -P sha256sum >/dev/null; then
+        echo "${expected}  ${archive_path}" | sha256sum --check --status
+    else
+        local actual
+        actual=$(shasum -a 256 "${archive_path}" | awk '{ print $1 }')
+        [[ "${actual}" == "${expected}" ]]
+    fi
+}
+
+rm -rf "${BUILD_DIR}"
+mkdir -p "${LAYER_ROOT}" "${DOWNLOADS_DIR}" "${ARTIFACT_DIR}" "${WORK_DIR}"
+
+cp "${BOOTSTRAP_SOURCE}" "${LAYER_ROOT}/${BOOTSTRAP_OUTPUT}"
+chmod +x "${LAYER_ROOT}/${BOOTSTRAP_OUTPUT}"
+
+if [[ ! -f "${ARCHIVE_PATH}" ]]; then
+    curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --output "${ARCHIVE_PATH}" "${ARCHIVE_URL}"
+fi
+
+verify_sha256 "${ARCHIVE_PATH}"
+
+tar -xjf "${ARCHIVE_PATH}" -C "${WORK_DIR}"
+mv "${WORK_DIR}/${ARCHIVE_ROOT_DIR}" "${LAYER_ROOT}/${RUNTIME_DIR_NAME}"
+
+mkdir -p "${LAYER_ROOT}/${HELPER_INSTALL_DIR}"
+cp -R "${HELPER_SOURCE}" "${LAYER_ROOT}/${HELPER_INSTALL_DIR}/"
+
+if [[ "${BUILD_BEST_EFFORT_AUDIT:-1}" == "1" ]]; then
+    RUNTIME_BUILD_IN_PROGRESS=1 bash "$(common::repo_root)/tools/bin/audit-runtime" --best-effort "${runtime_id}"
+fi
+
+(
+    cd "${LAYER_ROOT}"
+    zip -qr "${PACKAGE_PATH}" .
+)
+
+if [[ -n "${EXPORT_ARTIFACT_DIR}" ]]; then
+    mkdir -p "${EXPORT_ARTIFACT_DIR}/${RUNTIME_ID}"
+    cp "${PACKAGE_PATH}" "${EXPORT_ARTIFACT_DIR}/${RUNTIME_ID}/"
+fi
+
+echo "Built ${runtime_id} runtime package at ${PACKAGE_PATH}"

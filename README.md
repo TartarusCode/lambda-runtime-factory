@@ -1,113 +1,168 @@
-# lambda-runtime-pypy
+# lambda-runtime-monorepo
 
-An AWS Lambda Runtime for [PyPy](http://pypy.org) with enhanced error handling and logging.
-
-Derived from https://github.com/iopipe/lambda-runtime-pypy3.5
+A monorepo for AWS Lambda custom runtimes, with PyPy as the first implemented runtime.
 
 ## Overview
 
-This is an AWS Lambda Runtime for PyPy that provides a high-performance Python runtime for AWS Lambda functions. It uses [portable-pypy](https://github.com/squeaky-pl/portable-pypy), which is a statically-linked distribution of PyPy.
+The repository is now organized around runtime packages under `runtimes/` and shared tooling under `tools/`.
 
-## Features
+- Runtime-specific code, checksums, examples, and release metadata live under `runtimes/<runtime-id>/`
+- Shared build, audit, publish, and local-test entrypoints live under `tools/bin/`
+- Runtime metadata is declared in `runtimes/<runtime-id>/runtime.json`
+- GitHub Actions uses the runtime manifest list as the source of truth for CI and release matrices
 
-- **High Performance**: PyPy's JIT compiler provides significant performance improvements for CPU-intensive workloads
-- **Enhanced Error Handling**: Comprehensive error reporting and logging
-- **Type Safety**: Full type hints throughout the codebase
-- **Robust Logging**: Structured logging with configurable levels
-- **Input Validation**: Thorough validation of environment variables and handler configuration
-- **Resource Management**: Proper cleanup and resource management
+## Repository Layout
 
-## Benefits of PyPy
+```text
+runtimes/
+  pypy311/
+    runtime.json
+    bootstrap/
+    helpers/
+    checksums/
+    examples/
+tools/
+  bin/
+  runtime_lib/
+.github/workflows/
+```
 
-- **Faster Execution**: JIT compilation can provide 2-10x speed improvements for certain workloads
-- **Memory Efficiency**: Better memory usage patterns for long-running functions
-- **Compatibility**: Full compatibility with Python standard library and most packages
+## Supported Runtimes
 
-## Build
+Current implemented runtime:
 
-To build this runtime as a layer:
+- `pypy311`
+
+The shared tooling is intentionally runtime-agnostic so additional runtimes can be added without reworking the root build and release flow.
+
+## Runtime Manifest
+
+Each runtime package declares its build and release contract in `runtime.json`, including:
+
+- runtime family
+- runtime version or distribution identifier
+- any overrides to the family defaults
+
+Most runtime details are now derived from runtime-family defaults in `tools/runtime_lib/runtime_manifest.py`. For runtimes that follow an established family layout, the manifest can stay very small.
+
+Use the manifest tooling from the repo root:
 
 ```bash
-make build
+make list-runtimes
+python3 tools/runtime_lib/runtime_manifest.py validate
 ```
 
-## Usage
+## Common Commands
 
-### Basic Lambda Function
+Supported build environment:
 
-```python
-def handler(event, context):
-    """Example Lambda handler using PyPy runtime."""
-    return {
-        'statusCode': 200,
-        'body': 'Hello from PyPy Lambda!'
-    }
+- Linux or WSL is required for build and release commands
+- The shared tooling assumes native Linux tools such as `bash`, `tar`, `zip`, `unzip`, `curl`, `sha256sum`, and `make`
+- Transient build work is staged under `${BUILD_ROOT:-$RUNNER_TEMP}` or `/tmp` to avoid slow cross-OS archive operations
+  - release and CI artifacts are built from temp storage by default
+  - set `EXPORT_ARTIFACT_DIR=/some/path` if you want a copy of the final zip preserved outside temp storage
+
+Build a specific runtime:
+
+```bash
+make build RUNTIME=pypy311
 ```
 
-### Performance Optimization
+Audit a built runtime:
 
-```python
-import json
-from typing import Dict, Any
-
-def handler(event: Dict[str, Any], context) -> Dict[str, Any]:
-    """
-    Optimized handler for PyPy runtime.
-    
-    Args:
-        event: Lambda event data
-        context: Lambda context object
-        
-    Returns:
-        Response dictionary
-    """
-    # PyPy's JIT will optimize this loop
-    result = sum(i * i for i in range(1000))
-    
-    return {
-        'statusCode': 200,
-        'body': json.dumps({'result': result})
-    }
+```bash
+make audit RUNTIME=pypy311
 ```
 
-## Configuration
+Upload and publish a runtime layer:
 
-### Environment Variables
+```bash
+make upload RUNTIME=pypy311
+make publish RUNTIME=pypy311
+```
 
-- `AWS_LAMBDA_RUNTIME_API`: Runtime API endpoint (automatically set)
-- `_HANDLER`: Handler function specification (e.g., "app.handler")
+Publish and publicize a runtime layer:
 
-### Handler Format
+```bash
+make publicize RUNTIME=pypy311
+```
 
-The handler should be specified in the format `module.function`:
-- `module`: Python module path (e.g., "app" or "src.handlers.api")
-- `function`: Function name within the module
+List the latest published layer versions:
 
-## Best Practices
+```bash
+make latest RUNTIME=pypy311
+```
 
-1. **Use Type Hints**: Leverage PyPy's type checking capabilities
-2. **Optimize Loops**: PyPy's JIT excels at optimizing loops and numerical computations
-3. **Warm Up**: Consider warm-up invocations for JIT compilation
-4. **Memory Management**: PyPy has different memory patterns - monitor usage
-5. **Error Handling**: Use structured logging for better debugging
+## Local SAM Test Flow
 
-## Performance Considerations
+Each runtime can carry its own local SAM assets. For PyPy they live under:
 
-- **Cold Start**: PyPy may have slightly longer cold starts due to JIT compilation
-- **Memory Usage**: Monitor memory usage as PyPy's GC differs from CPython
-- **JIT Warm-up**: First few invocations may be slower as JIT compiles hot code paths
+- `runtimes/pypy311/examples/sam/template.local.example.yaml`
+- `runtimes/pypy311/examples/sam/events/hello.json`
+- `runtimes/pypy311/examples/sam/hello/Makefile`
 
-## Troubleshooting
+Run the local smoke test from the repo root:
 
-### Common Issues
+```bash
+make local-build RUNTIME=pypy311
+make local-invoke RUNTIME=pypy311
+```
 
-1. **Import Errors**: Ensure all dependencies are included in the deployment package
-2. **Memory Limits**: Monitor memory usage, especially for long-running functions
-3. **Timeout Issues**: PyPy may need more time for JIT compilation
+This flow:
 
-### Logging
+- builds the runtime package under temp storage
+- expands the local layer under temp storage
+- renders a temp SAM template with resolved local paths
+- runs `sam build --use-container` with a temp SAM build directory
+- assembles a temp invoke bundle for `sam local invoke`
 
-The runtime provides structured logging. Check CloudWatch logs for detailed execution information.
+Requirements:
+
+- Linux or WSL is required for Docker-backed SAM workflows
+- For best local SAM performance, keep the repo on the WSL filesystem instead of `/mnt/c/...`
+- Docker must be available
+- `sam` must be installed in the environment where you run the commands
+
+## GitHub Actions
+
+The repo includes:
+
+- `.github/workflows/ci.yml`
+  - manifest validation
+  - shell syntax validation
+  - Python syntax validation for runtime code
+  - runtime build and checksum enforcement
+  - vulnerability audit
+  - local SAM build and invoke smoke tests
+- `.github/workflows/release-runtime.yml`
+  - manual runtime-scoped release flow
+  - rebuild, audit, upload, and publish steps
+
+The release workflow expects an AWS role secret named `AWS_RELEASE_ROLE_ARN`.
+
+## Adding A New Runtime
+
+1. Create a new runtime directory under `runtimes/<runtime-id>/`.
+2. Add a `runtime.json` manifest with artifact, Lambda, release, and local test metadata.
+3. Add the runtime bootstrap, helper package, checksum file, and examples under that directory.
+4. Run:
+
+```bash
+python3 tools/runtime_lib/runtime_manifest.py validate --runtime <runtime-id>
+bash tools/bin/check-runtime <runtime-id>
+make build RUNTIME=<runtime-id>
+```
+
+5. Add or adapt runtime-specific examples under `runtimes/<runtime-id>/examples/`.
+6. Add or update CI expectations if the runtime needs extra validation steps beyond the shared defaults.
+
+## PyPy Notes
+
+The first runtime package, `pypy311`, still ships the hardened Lambda Runtime API implementation and the helper package for:
+
+- structured logging
+- init hooks for Provisioned Concurrency style warm-up
+- optional X-Ray helper utilities
 
 ## License
 

@@ -1,0 +1,20 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+# Shared runtime environment helpers.
+
+version=${1:-}
+if [[ -z "${version}" ]]; then
+    echo "Layer version number must be provided as the first argument" >&2
+    exit 1
+fi
+
+runtime_id=$(common::require_runtime_id "${2:-}")
+common::load_runtime_env "${runtime_id}"
+
+for region in ${RELEASE_REGIONS}; do
+    echo "Deleting Lambda Layer ${LAYER_NAME} version ${version} in region ${region}..."
+    aws --region "${region}" lambda delete-layer-version --layer-name "${LAYER_NAME}" --version-number "${version}"
+    echo "Deleted Lambda Layer ${LAYER_NAME} version ${version} in region ${region}"
+done

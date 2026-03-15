@@ -1,0 +1,14 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+# Shared runtime environment helpers.
+
+runtime_id=$(common::require_runtime_id "${1:-}")
+common::load_runtime_env "${runtime_id}"
+
+for region in ${RELEASE_REGIONS}; do
+    bucket_name="${BUCKET_BASE_NAME}-${region}"
+    echo "Creating bucket ${bucket_name}..."
+    aws s3 mb "s3://${bucket_name}" --region "${region}"
+done

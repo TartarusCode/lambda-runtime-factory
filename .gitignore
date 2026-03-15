@@ -1,2 +1,9 @@
-layer
-pypy*.zip
+build/
+dist/
+.aws-sam/
+template.local.yaml
+template.local.yml
+event.json
+event*.json
+__pycache__/
+*.py[cod]

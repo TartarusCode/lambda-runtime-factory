@@ -1,0 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+
+python3 "$(common::manifest_cli)" validate "$@"

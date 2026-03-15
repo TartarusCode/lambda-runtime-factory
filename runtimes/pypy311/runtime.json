@@ -1,0 +1,12 @@
+{
+  "runtime_id": "pypy311",
+  "runtime_family": "portable-pypy",
+  "display_name": "PyPy 3.11",
+  "distribution_version": "pypy3.11-v7.3.21",
+  "artifact": {
+    "checksum_file": "checksums/pypy.sha256"
+  },
+  "release": {
+    "regions": ["eu-central-1", "us-west-1"]
+  }
+}

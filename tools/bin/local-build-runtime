@@ -1,0 +1,30 @@
+#!/bin/bash
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+# Shared runtime environment helpers.
+
+runtime_id=$(common::require_runtime_id "${1:-}")
+
+bash "$(common::repo_root)/tools/bin/build-runtime" "${runtime_id}"
+common::load_runtime_env "${runtime_id}"
+
+rm -rf "${LOCAL_ROOT}"
+mkdir -p "${LOCAL_LAYER_DIR}" "${LOCAL_BUILD_DIR}" "${LOCAL_SOURCE_DIR}"
+unzip -q "${PACKAGE_PATH}" -d "${LOCAL_LAYER_DIR}"
+cp -R "${LOCAL_CODE_URI}/." "${LOCAL_SOURCE_DIR}/"
+
+python3 - "${LOCAL_TEMPLATE}" "${LOCAL_TEMPLATE_RENDERED}" <<'PY'
+import sys
+from pathlib import Path
+
+template_path = Path(sys.argv[1])
+output_path = Path(sys.argv[2])
+
+rendered = template_path.read_text(encoding="utf-8")
+rendered = rendered.replace("__LOCAL_LAYER_CONTENT_URI__", "layer")
+rendered = rendered.replace("__LOCAL_CODE_URI__", "source")
+output_path.write_text(rendered, encoding="utf-8", newline="\n")
+PY
+
+sam build --template-file "${LOCAL_TEMPLATE_RENDERED}" --build-dir "${LOCAL_BUILD_DIR}" --use-container
