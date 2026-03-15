@@ -11,7 +11,8 @@ if [[ -z "${version}" ]]; then
 fi
 
 runtime_id=$(common::require_runtime_id "${2:-}")
-common::load_runtime_env "${runtime_id}"
+arch=$(common::require_arch "${3:-}")
+common::load_runtime_env "${runtime_id}" "${arch}"
 
 for region in ${RELEASE_REGIONS}; do
     echo "Deleting Lambda Layer ${LAYER_NAME} version ${version} in region ${region}..."

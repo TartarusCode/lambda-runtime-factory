@@ -51,7 +51,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ env.DOWNLOAD_CACHE_DIR }}
-          key: downloads-${{ runner.os }}-${{ matrix.runtime }}-${{ hashFiles(format('runtimes/{0}/runtime.json', matrix.runtime), format('runtimes/{0}/checksums/**', matrix.runtime)) }}
+          key: downloads-${{ runner.os }}-${{ matrix.runtime }}-${{ matrix.arch }}-${{ hashFiles(format('runtimes/{0}/runtime.json', matrix.runtime), format('runtimes/{0}/checksums/**', matrix.runtime)) }}
       - name: Cache Trivy database
         uses: actions/cache@v5
         with:
@@ -67,17 +67,17 @@ jobs:
         run: |
           bash -n tools/bin/*.sh
       - name: Validate Python sources
-        run: bash tools/bin/check-runtime "${{ matrix.runtime }}"
+        run: bash tools/bin/check-runtime "${{ matrix.runtime }}" "${{ matrix.arch }}"
       - name: Build runtime package
-        run: make build RUNTIME=${{ matrix.runtime }}
+        run: make build RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Audit runtime package
-        run: bash tools/bin/audit-runtime "${{ matrix.runtime }}"
+        run: bash tools/bin/audit-runtime "${{ matrix.runtime }}" "${{ matrix.arch }}"
       - name: Build local SAM example
-        run: make local-build RUNTIME=${{ matrix.runtime }}
+        run: make local-build RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Invoke local SAM example
-        run: make local-invoke RUNTIME=${{ matrix.runtime }}
+        run: make local-invoke RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Upload runtime artifact
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.runtime }}-artifact
-          path: ${{ runner.temp }}/lambda-runtime-monorepo/${{ matrix.runtime }}/artifacts/*.zip
+          name: ${{ matrix.runtime }}-${{ matrix.arch }}-artifact
+          path: ${{ runner.temp }}/lambda-runtime-monorepo/${{ matrix.runtime }}/${{ matrix.arch }}/artifacts/*.zip

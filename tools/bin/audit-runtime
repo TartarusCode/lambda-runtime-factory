@@ -11,7 +11,8 @@ if [[ "${1:-}" == "--best-effort" ]]; then
 fi
 
 runtime_id=$(common::require_runtime_id "${1:-}")
-common::load_runtime_env "${runtime_id}"
+arch=$(common::require_arch "${2:-}")
+common::load_runtime_env "${runtime_id}" "${arch}"
 if [[ "${RUNTIME_BUILD_IN_PROGRESS:-0}" == "1" ]]; then
     target_dir="${LAYER_ROOT}"
     if [[ ! -d "${target_dir}" ]]; then
@@ -19,7 +20,7 @@ if [[ "${RUNTIME_BUILD_IN_PROGRESS:-0}" == "1" ]]; then
         exit 1
     fi
 else
-    common::ensure_runtime_built "${runtime_id}"
+    common::ensure_runtime_built "${runtime_id}" "${arch}"
     target_dir="${LAYER_ROOT}"
     if [[ ! -d "${target_dir}" ]]; then
         echo "Expected extracted runtime at ${target_dir}" >&2

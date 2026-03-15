@@ -1,0 +1,15 @@
+service: hello-rust185
+
+
+provider:
+  name: aws
+  region: eu-central-1
+
+functions:
+  hello-rust185:
+    handler: handler
+    runtime: provided.al2023
+    # Set RUST_LAYER_ARN before deploy, for example:
+    # RUST_LAYER_ARN=$(aws lambda list-layer-versions --layer-name rust185 --query "LayerVersions[0].LayerVersionArn" --output text --region eu-central-1)
+    layers:
+      - ${env:RUST_LAYER_ARN}

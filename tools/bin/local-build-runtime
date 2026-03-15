@@ -5,9 +5,10 @@ source "$(dirname "$0")/_common.sh"
 # Shared runtime environment helpers.
 
 runtime_id=$(common::require_runtime_id "${1:-}")
+arch=$(common::require_arch "${2:-}")
 
-bash "$(common::repo_root)/tools/bin/build-runtime" "${runtime_id}"
-common::load_runtime_env "${runtime_id}"
+bash "$(common::repo_root)/tools/bin/build-runtime" "${runtime_id}" "${arch}"
+common::load_runtime_env "${runtime_id}" "${arch}"
 
 rm -rf "${LOCAL_ROOT}"
 mkdir -p "${LOCAL_LAYER_DIR}" "${LOCAL_BUILD_DIR}" "${LOCAL_SOURCE_DIR}"

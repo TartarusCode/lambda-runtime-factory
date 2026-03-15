@@ -1,0 +1,15 @@
+service: hello-bun12
+
+
+provider:
+  name: aws
+  region: eu-central-1
+
+functions:
+  hello-bun12:
+    handler: hello.handler
+    runtime: provided.al2023
+    # Set BUN_LAYER_ARN before deploy, for example:
+    # BUN_LAYER_ARN=$(aws lambda list-layer-versions --layer-name bun12 --query "LayerVersions[0].LayerVersionArn" --output text --region eu-central-1)
+    layers:
+      - ${env:BUN_LAYER_ARN}
