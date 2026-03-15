@@ -216,9 +216,13 @@ def runtime_env(runtime_id: str) -> Dict[str, str]:
         or "/tmp"
     ) / "lambda-runtime-monorepo"
     build_dir = temp_root / runtime_id
+    download_cache_root = Path(
+        os.environ.get("DOWNLOAD_CACHE_DIR")
+        or temp_root / "download-cache"
+    )
     dist_dir = repo_root() / "dist" / runtime_id
     layer_root = build_dir / "layer"
-    downloads_dir = build_dir / "downloads"
+    downloads_dir = download_cache_root / runtime_id
     work_dir = build_dir / "work"
 
     env = {

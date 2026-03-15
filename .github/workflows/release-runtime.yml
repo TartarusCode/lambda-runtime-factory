@@ -66,27 +66,55 @@ jobs:
       matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
     env:
       SAM_CLI_TELEMETRY: "0"
+      BUILD_BEST_EFFORT_AUDIT: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Cache runtime downloads
+        uses: actions/cache@v4
+        env:
+          DOWNLOAD_CACHE_DIR: ${{ runner.temp }}/lambda-runtime-monorepo/cache/downloads
+        with:
+          path: ${{ env.DOWNLOAD_CACHE_DIR }}
+          key: downloads-${{ runner.os }}-${{ matrix.runtime }}-${{ hashFiles(format('runtimes/{0}/runtime.json', matrix.runtime), format('runtimes/{0}/checksums/**', matrix.runtime)) }}
+      - name: Cache Trivy database
+        uses: actions/cache@v4
+        env:
+          TRIVY_CACHE_DIR: ${{ runner.temp }}/lambda-runtime-monorepo/cache/trivy
+        with:
+          path: ${{ env.TRIVY_CACHE_DIR }}
+          key: trivy-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml', '.github/workflows/release-runtime.yml') }}
+          restore-keys: |
+            trivy-${{ runner.os }}-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_RELEASE_ROLE_ARN }}
           aws-region: us-east-1
       - name: Build runtime package
+        env:
+          DOWNLOAD_CACHE_DIR: ${{ runner.temp }}/lambda-runtime-monorepo/cache/downloads
         run: make build RUNTIME=${{ matrix.runtime }}
       - name: Audit runtime package
+        env:
+          TRIVY_CACHE_DIR: ${{ runner.temp }}/lambda-runtime-monorepo/cache/trivy
+          DOWNLOAD_CACHE_DIR: ${{ runner.temp }}/lambda-runtime-monorepo/cache/downloads
         run: bash tools/bin/audit-runtime "${{ matrix.runtime }}"
       - name: Upload runtime artifact to S3
+        env:
+          DOWNLOAD_CACHE_DIR: ${{ runner.temp }}/lambda-runtime-monorepo/cache/downloads
         run: make upload RUNTIME=${{ matrix.runtime }}
       - name: Publish Lambda layer
         if: ${{ github.event.inputs.publicize != 'true' }}
+        env:
+          DOWNLOAD_CACHE_DIR: ${{ runner.temp }}/lambda-runtime-monorepo/cache/downloads
         run: make publish RUNTIME=${{ matrix.runtime }}
       - name: Publish and publicize Lambda layer
         if: ${{ github.event.inputs.publicize == 'true' }}
+        env:
+          DOWNLOAD_CACHE_DIR: ${{ runner.temp }}/lambda-runtime-monorepo/cache/downloads
         run: make publicize RUNTIME=${{ matrix.runtime }}
       - name: Summarize latest layer arns
         run: |

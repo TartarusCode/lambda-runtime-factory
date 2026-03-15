@@ -28,7 +28,7 @@ else
 fi
 
 if type -P trivy >/dev/null; then
-    trivy fs --quiet --severity HIGH,CRITICAL --exit-code 1 "${target_dir}"
+    trivy fs --cache-dir "${TRIVY_CACHE_DIR:-${HOME}/.cache/trivy}" --quiet --severity HIGH,CRITICAL --exit-code 1 "${target_dir}"
     exit 0
 fi
 
@@ -38,7 +38,10 @@ if type -P grype >/dev/null; then
 fi
 
 if type -P docker >/dev/null; then
-    docker run --rm -v "${target_dir}:/scan:ro" aquasec/trivy:latest fs --quiet --severity HIGH,CRITICAL --exit-code 1 /scan
+    docker run --rm \
+        -v "${target_dir}:/scan:ro" \
+        -v "${TRIVY_CACHE_DIR:-${HOME}/.cache/trivy}:/root/.cache/trivy" \
+        aquasec/trivy:latest fs --quiet --severity HIGH,CRITICAL --exit-code 1 /scan
     exit 0
 fi
 

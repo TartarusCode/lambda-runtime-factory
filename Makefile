@@ -3,6 +3,7 @@ SHELL=/bin/bash
 RUNTIME ?= pypy311
 RUNTIMES := $(shell python3 tools/runtime_lib/runtime_manifest.py list)
 LOCAL_AWS_ENV := env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_SESSION_TOKEN=test AWS_REGION=us-east-1
+DEV_BUILD_ENV := BUILD_BEST_EFFORT_AUDIT=0
 
 all: validate-runtimes build
 
@@ -18,11 +19,11 @@ check:
 	bash tools/bin/check-runtime "$(RUNTIME)"
 
 build: validate-runtimes
-	bash tools/bin/build-runtime "$(RUNTIME)"
+	$(DEV_BUILD_ENV) bash tools/bin/build-runtime "$(RUNTIME)"
 
 build-all: validate-runtimes
 	@for runtime in $(RUNTIMES); do \
-		bash tools/bin/build-runtime "$$runtime"; \
+		$(DEV_BUILD_ENV) bash tools/bin/build-runtime "$$runtime"; \
 	done
 
 audit:
@@ -72,10 +73,10 @@ create-buckets:
 	bash tools/bin/create-buckets "$(RUNTIME)"
 
 local-build:
-	bash tools/bin/local-build-runtime "$(RUNTIME)"
+	$(DEV_BUILD_ENV) bash tools/bin/local-build-runtime "$(RUNTIME)"
 
 local-invoke:
-	$(LOCAL_AWS_ENV) bash tools/bin/local-invoke-runtime "$(RUNTIME)"
+	$(LOCAL_AWS_ENV) $(DEV_BUILD_ENV) bash tools/bin/local-invoke-runtime "$(RUNTIME)"
 
 clean:
 	bash tools/bin/clean-runtime "$(RUNTIME)"
