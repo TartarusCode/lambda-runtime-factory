@@ -6,7 +6,7 @@ source "$(dirname "$0")/_common.sh"
 
 runtime_id=$(common::require_runtime_id "${1:-}")
 
-"$(common::repo_root)/tools/bin/build-runtime" "${runtime_id}"
+bash "$(common::repo_root)/tools/bin/build-runtime" "${runtime_id}"
 common::load_runtime_env "${runtime_id}"
 
 rm -rf "${LOCAL_ROOT}"
