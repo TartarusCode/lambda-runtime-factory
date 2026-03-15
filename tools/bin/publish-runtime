@@ -26,7 +26,7 @@ for region in ${RELEASE_REGIONS}; do
         --description "${LAYER_DESCRIPTION}" \
         --content "S3Bucket=${bucket_name},S3Key=${s3_key}" \
         --compatible-runtimes ${COMPATIBLE_RUNTIMES} \
-        --license-info "MIT" \
+        --license-info "Apache-2.0" \
         --output text \
         --query Version \
         --region "${region}")

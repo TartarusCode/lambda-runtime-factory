@@ -51,6 +51,8 @@ jobs:
         run: bash tools/bin/audit-runtime "${{ matrix.runtime }}"
       - name: Build local SAM example
         run: make local-build RUNTIME=${{ matrix.runtime }}
+      - name: Invoke local SAM example
+        run: make local-invoke RUNTIME=${{ matrix.runtime }}
       - name: Upload runtime artifact
         uses: actions/upload-artifact@v4
         with:
