@@ -1,0 +1,16 @@
+{
+  "runtime_id": "go126",
+  "runtime_family": "go-toolchain",
+  "display_name": "Go 1.x",
+  "distribution_version": "1.26.1",
+  "artifact": {
+    "checksum_file": "checksums/go.sha256"
+  },
+  "local_testing": {
+    "handler": "handler",
+    "code_uri": "examples/sam/hello"
+  },
+  "release": {
+    "regions": ["eu-central-1", "us-west-1"]
+  }
+}

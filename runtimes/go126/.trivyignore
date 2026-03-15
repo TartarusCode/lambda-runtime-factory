@@ -1,0 +1,3 @@
+# Test private key shipped in go/src/crypto/x509/platform_root_key.pem.
+# This is an upstream test fixture, not a real secret.
+private-key

@@ -1,0 +1,12 @@
+{
+  "runtime_id": "graalpy312",
+  "runtime_family": "graalpy",
+  "display_name": "GraalPy 3.12",
+  "distribution_version": "25.0.2",
+  "artifact": {
+    "checksum_file": "checksums/graalpy.sha256"
+  },
+  "release": {
+    "regions": ["eu-central-1", "us-west-1"]
+  }
+}

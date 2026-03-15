@@ -1,0 +1,15 @@
+service: hello-go126
+
+
+provider:
+  name: aws
+  region: eu-central-1
+
+functions:
+  hello-go126:
+    handler: handler
+    runtime: provided.al2023
+    # Set GO_LAYER_ARN before deploy, for example:
+    # GO_LAYER_ARN=$(aws lambda list-layer-versions --layer-name go126 --query "LayerVersions[0].LayerVersionArn" --output text --region eu-central-1)
+    layers:
+      - ${env:GO_LAYER_ARN}

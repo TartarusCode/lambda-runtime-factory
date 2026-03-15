@@ -1,0 +1,15 @@
+service: hello-graalpy312
+
+
+provider:
+  name: aws
+  region: eu-central-1
+
+functions:
+  hello-graalpy312:
+    handler: hello.handler
+    runtime: provided.al2023
+    # Set GRAALPY_LAYER_ARN before deploy, for example:
+    # GRAALPY_LAYER_ARN=$(aws lambda list-layer-versions --layer-name graalpy312 --query "LayerVersions[0].LayerVersionArn" --output text --region eu-central-1)
+    layers:
+      - ${env:GRAALPY_LAYER_ARN}

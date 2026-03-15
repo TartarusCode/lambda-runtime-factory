@@ -28,8 +28,14 @@ else
     fi
 fi
 
+trivy_ignore="${RUNTIME_DIR}/.trivyignore"
+trivy_ignore_args=()
+if [[ -f "${trivy_ignore}" ]]; then
+    trivy_ignore_args=(--ignorefile "${trivy_ignore}")
+fi
+
 if type -P trivy >/dev/null; then
-    trivy fs --cache-dir "${TRIVY_CACHE_DIR:-${HOME}/.cache/trivy}" --quiet --severity HIGH,CRITICAL --exit-code 1 "${target_dir}"
+    trivy fs --cache-dir "${TRIVY_CACHE_DIR:-${HOME}/.cache/trivy}" --quiet --severity HIGH,CRITICAL --exit-code 1 "${trivy_ignore_args[@]}" "${target_dir}"
     exit 0
 fi
 
@@ -39,10 +45,16 @@ if type -P grype >/dev/null; then
 fi
 
 if type -P docker >/dev/null; then
+    docker_extra_args=()
+    if [[ -f "${trivy_ignore}" ]]; then
+        docker_extra_args=(-v "${trivy_ignore}:/trivyignore:ro")
+        trivy_ignore_args=(--ignorefile /trivyignore)
+    fi
     docker run --rm \
         -v "${target_dir}:/scan:ro" \
         -v "${TRIVY_CACHE_DIR:-${HOME}/.cache/trivy}:/root/.cache/trivy" \
-        aquasec/trivy:latest fs --quiet --severity HIGH,CRITICAL --exit-code 1 /scan
+        "${docker_extra_args[@]}" \
+        aquasec/trivy:latest fs --quiet --severity HIGH,CRITICAL --exit-code 1 "${trivy_ignore_args[@]}" /scan
     exit 0
 fi
 

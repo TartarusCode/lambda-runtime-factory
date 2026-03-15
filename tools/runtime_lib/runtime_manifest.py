@@ -93,7 +93,7 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "bootstrap": "bootstrap/bootstrap.py3",
             "bootstrap_output": "bootstrap",
             "helper_source": "helpers/lambda_runtime_graalpy",
-            "helper_install_dir": "graalpy/lib/python3.11/site-packages",
+            "helper_install_dir": "graalpy/lib/python3.12/site-packages",
         },
     },
     "go-toolchain": {
