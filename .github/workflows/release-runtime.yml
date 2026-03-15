@@ -79,12 +79,12 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads"
           mkdir -p "${RUNNER_TEMP}/lambda-runtime-monorepo/cache/trivy"
       - name: Cache runtime downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.DOWNLOAD_CACHE_DIR }}
           key: downloads-${{ runner.os }}-${{ matrix.runtime }}-${{ hashFiles(format('runtimes/{0}/runtime.json', matrix.runtime), format('runtimes/{0}/checksums/**', matrix.runtime)) }}
       - name: Cache Trivy database
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.TRIVY_CACHE_DIR }}
           key: trivy-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml', '.github/workflows/release-runtime.yml') }}
