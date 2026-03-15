@@ -1,0 +1,25 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: "Go Runtime local SAM example"
+
+Resources:
+  GoLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: local-go-runtime
+      ContentUri: __LOCAL_LAYER_CONTENT_URI__
+      CompatibleRuntimes:
+        - provided.al2023
+
+  HelloFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: __LOCAL_CODE_URI__
+      Handler: handler
+      Runtime: provided.al2023
+      Layers:
+        - !Ref GoLayer
+      Timeout: 10
+      MemorySize: 256

@@ -1,0 +1,18 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: "Bun Runtime SAM Example"
+
+Parameters:
+  BunLayerArn:
+    Type: String
+    Description: ARN of the published Bun Lambda layer for your region/account
+
+Resources:
+  BunExample:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      CodeUri: hello/
+      Handler: hello.handler
+      Runtime: provided.al2023
+      Layers:
+        - !Ref BunLayerArn

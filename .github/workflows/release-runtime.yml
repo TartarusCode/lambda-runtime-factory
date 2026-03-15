@@ -67,9 +67,17 @@ jobs:
           else:
               archs = all_archs
 
+          arch_runners = {
+              "x86_64": "ubuntu-latest",
+              "arm64": "ubuntu-24.04-arm",
+          }
           matrix = json.dumps({
               "include": [
-                  {"runtime": runtime, "arch": arch}
+                  {
+                      "runtime": runtime,
+                      "arch": arch,
+                      "runner": arch_runners.get(arch, "ubuntu-latest"),
+                  }
                   for runtime in runtimes
                   for arch in archs
               ]
@@ -80,7 +88,7 @@ jobs:
 
   publish:
     needs: prepare-matrix
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}

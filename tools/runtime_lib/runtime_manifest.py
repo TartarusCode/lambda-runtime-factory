@@ -419,10 +419,20 @@ def compile_runtime_python(runtime_id: str) -> None:
         )
 
 
+ARCH_RUNNERS: Dict[str, str] = {
+    "x86_64": "ubuntu-latest",
+    "arm64": "ubuntu-24.04-arm",
+}
+
+
 def manifest_matrix() -> Dict[str, Any]:
     return {
         "include": [
-            {"runtime": runtime_id, "arch": arch}
+            {
+                "runtime": runtime_id,
+                "arch": arch,
+                "runner": ARCH_RUNNERS.get(arch, "ubuntu-latest"),
+            }
             for runtime_id in list_runtime_ids()
             for arch in SUPPORTED_ARCHS
         ]
