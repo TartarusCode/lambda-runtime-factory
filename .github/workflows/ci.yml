@@ -37,17 +37,21 @@ jobs:
         with:
           python-version: "3.11"
       - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - name: Prepare cache directories
+        run: |
+          echo "DOWNLOAD_CACHE_DIR=${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads" >> "$GITHUB_ENV"
+          echo "TRIVY_CACHE_DIR=${RUNNER_TEMP}/lambda-runtime-monorepo/cache/trivy" >> "$GITHUB_ENV"
+          mkdir -p "${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads"
+          mkdir -p "${RUNNER_TEMP}/lambda-runtime-monorepo/cache/trivy"
       - name: Cache runtime downloads
         uses: actions/cache@v4
-        env:
-          DOWNLOAD_CACHE_DIR: ${{ runner.temp }}/lambda-runtime-monorepo/cache/downloads
         with:
           path: ${{ env.DOWNLOAD_CACHE_DIR }}
           key: downloads-${{ runner.os }}-${{ matrix.runtime }}-${{ hashFiles(format('runtimes/{0}/runtime.json', matrix.runtime), format('runtimes/{0}/checksums/**', matrix.runtime)) }}
       - name: Cache Trivy database
         uses: actions/cache@v4
-        env:
-          TRIVY_CACHE_DIR: ${{ runner.temp }}/lambda-runtime-monorepo/cache/trivy
         with:
           path: ${{ env.TRIVY_CACHE_DIR }}
           key: trivy-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml', '.github/workflows/release-runtime.yml') }}
@@ -65,17 +69,10 @@ jobs:
       - name: Build runtime package
         run: make build RUNTIME=${{ matrix.runtime }}
       - name: Audit runtime package
-        env:
-          TRIVY_CACHE_DIR: ${{ runner.temp }}/lambda-runtime-monorepo/cache/trivy
-          DOWNLOAD_CACHE_DIR: ${{ runner.temp }}/lambda-runtime-monorepo/cache/downloads
         run: bash tools/bin/audit-runtime "${{ matrix.runtime }}"
       - name: Build local SAM example
-        env:
-          DOWNLOAD_CACHE_DIR: ${{ runner.temp }}/lambda-runtime-monorepo/cache/downloads
         run: make local-build RUNTIME=${{ matrix.runtime }}
       - name: Invoke local SAM example
-        env:
-          DOWNLOAD_CACHE_DIR: ${{ runner.temp }}/lambda-runtime-monorepo/cache/downloads
         run: make local-invoke RUNTIME=${{ matrix.runtime }}
       - name: Upload runtime artifact
         uses: actions/upload-artifact@v4
