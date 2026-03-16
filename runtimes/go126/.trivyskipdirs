@@ -1,0 +1,3 @@
+# Go ships its entire source tree including vendored go.mod files and test fixtures.
+# These are toolchain internals, not runtime dependencies.
+go/src
