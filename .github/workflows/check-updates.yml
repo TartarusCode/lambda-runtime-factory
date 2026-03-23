@@ -1,0 +1,88 @@
+name: check-runtime-updates
+
+on:
+  schedule:
+    - cron: "0 8 * * 1"  # Every Monday at 08:00 UTC
+  workflow_dispatch:
+    inputs:
+      runtime:
+        description: "Runtime ID to check (blank for all)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-and-bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Check for upstream updates
+        id: check
+        run: |
+          args=(check --json)
+          if [[ -n "${{ github.event.inputs.runtime }}" ]]; then
+            args+=(--runtime "${{ github.event.inputs.runtime }}")
+          fi
+          output=$(python3 tools/runtime_lib/bump_version.py "${args[@]}")
+          echo "$output"
+
+          # Extract the JSON object (last line of output)
+          json_line=$(echo "$output" | grep -E '^\{' | tail -1)
+          if [[ -z "$json_line" || "$json_line" == "{}" ]]; then
+            echo "outdated=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "outdated=true" >> "$GITHUB_OUTPUT"
+            echo "updates=$json_line" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump outdated runtimes
+        if: steps.check.outputs.outdated == 'true'
+        run: |
+          args=(bump-latest)
+          if [[ -n "${{ github.event.inputs.runtime }}" ]]; then
+            args+=(--runtime "${{ github.event.inputs.runtime }}")
+          fi
+          python3 tools/runtime_lib/bump_version.py "${args[@]}"
+
+      - name: Build PR description
+        if: steps.check.outputs.outdated == 'true'
+        id: pr-body
+        run: |
+          body="## Runtime Version Bumps"$'\n\n'
+          body+="The following runtimes were updated to their latest upstream versions:"$'\n\n'
+
+          echo '${{ steps.check.outputs.updates }}' | python3 -c "
+          import json, sys
+          updates = json.load(sys.stdin)
+          for rid, info in sorted(updates.items()):
+              print(f'- **{rid}**: {info[\"current\"]} → {info[\"latest\"]}')
+          " >> "$RUNNER_TEMP/pr_updates.txt"
+          body+=$(cat "$RUNNER_TEMP/pr_updates.txt")
+
+          body+=$'\n\n'"Checksums were fetched from the official upstream release channels."
+          body+=$'\n\n'"## Test Plan"
+          body+=$'\n'"- [ ] CI validates manifests and checksums"
+          body+=$'\n'"- [ ] CI builds all updated runtime packages"
+          body+=$'\n'"- [ ] CI audits updated packages with Trivy"
+
+          # Write to file to preserve newlines
+          echo "$body" > "$RUNNER_TEMP/pr_body.txt"
+
+      - name: Create pull request
+        if: steps.check.outputs.outdated == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: bump runtime distribution versions"
+          branch: automated/bump-runtime-versions
+          delete-branch: true
+          title: "chore: bump runtime distribution versions"
+          body-path: ${{ runner.temp }}/pr_body.txt
+          labels: dependencies,automated

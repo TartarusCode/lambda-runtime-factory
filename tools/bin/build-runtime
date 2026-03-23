@@ -4,7 +4,8 @@ set -euo pipefail
 source "$(dirname "$0")/_common.sh"
 
 runtime_id=$(common::require_runtime_id "${1:-}")
-common::load_runtime_env "${runtime_id}"
+arch=$(common::require_arch "${2:-}")
+common::load_runtime_env "${runtime_id}" "${arch}"
 
 checksum_for() {
     awk -v pkg="${CHECKSUM_NAME}" '{ sub(/\r$/, "", $2); if ($2 == pkg) print $1 }' "${CHECKSUM_FILE}"
@@ -41,7 +42,21 @@ fi
 
 verify_sha256 "${ARCHIVE_PATH}"
 
-tar -xjf "${ARCHIVE_PATH}" -C "${WORK_DIR}"
+case "${ARCHIVE_NAME}" in
+    *.tar.bz2)
+        tar -xjf "${ARCHIVE_PATH}" -C "${WORK_DIR}"
+        ;;
+    *.tar.gz | *.tgz)
+        tar -xzf "${ARCHIVE_PATH}" -C "${WORK_DIR}"
+        ;;
+    *.zip)
+        unzip -qo "${ARCHIVE_PATH}" -d "${WORK_DIR}"
+        ;;
+    *)
+        echo "Unsupported archive format: ${ARCHIVE_NAME}" >&2
+        exit 1
+        ;;
+esac
 mv "${WORK_DIR}/${ARCHIVE_ROOT_DIR}" "${LAYER_ROOT}/${RUNTIME_DIR_NAME}"
 
 mkdir -p "${LAYER_ROOT}/${HELPER_INSTALL_DIR}"

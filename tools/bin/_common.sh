@@ -8,22 +8,31 @@ common::manifest_cli() {
     printf '%s/tools/runtime_lib/runtime_manifest.py' "$(common::repo_root)"
 }
 
+common::require_arch() {
+    local arch=${1:-${ARCH:-x86_64}}
+    printf '%s' "${arch}"
+}
+
 common::load_runtime_env() {
     local runtime_id=$1
+    local arch
+    arch=$(common::require_arch "${2:-}")
     eval "$(
-        python3 "$(common::manifest_cli)" env --runtime "${runtime_id}"
+        python3 "$(common::manifest_cli)" env --runtime "${runtime_id}" --arch "${arch}"
     )"
 }
 
 common::ensure_runtime_built() {
     local runtime_id=$1
+    local arch
+    arch=$(common::require_arch "${2:-}")
     if [[ "${RUNTIME_BUILD_IN_PROGRESS:-0}" == "1" ]]; then
         return 0
     fi
 
     if [[ ! -d "${LAYER_ROOT}" || ! -f "${PACKAGE_PATH}" ]]; then
-        bash "$(common::repo_root)/tools/bin/build-runtime" "${runtime_id}"
-        common::load_runtime_env "${runtime_id}"
+        bash "$(common::repo_root)/tools/bin/build-runtime" "${runtime_id}" "${arch}"
+        common::load_runtime_env "${runtime_id}" "${arch}"
     fi
 }
 

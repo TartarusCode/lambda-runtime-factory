@@ -7,6 +7,10 @@ on:
         description: "Runtime id to publish, or 'all'"
         required: true
         default: "all"
+      arch:
+        description: "Architecture to publish: x86_64, arm64, or 'all'"
+        required: true
+        default: "all"
       publicize:
         description: "Grant public layer permissions after publish"
         required: true
@@ -30,6 +34,7 @@ jobs:
       - id: matrix
         env:
           INPUT_RUNTIME: ${{ github.event.inputs.runtime }}
+          INPUT_ARCH: ${{ github.event.inputs.arch }}
         run: |
           python3 - <<'PY'
           import json
@@ -53,14 +58,37 @@ jobs:
                   raise SystemExit(f"Unknown runtime '{selected}'. Available: {', '.join(runtimes)}")
               runtimes = [selected]
 
-          matrix = json.dumps({"include": [{"runtime": runtime} for runtime in runtimes]})
+          all_archs = ["x86_64", "arm64"]
+          selected_arch = os.environ.get("INPUT_ARCH", "all").strip()
+          if selected_arch and selected_arch != "all":
+              if selected_arch not in all_archs:
+                  raise SystemExit(f"Unknown arch '{selected_arch}'. Available: {', '.join(all_archs)}")
+              archs = [selected_arch]
+          else:
+              archs = all_archs
+
+          arch_runners = {
+              "x86_64": "ubuntu-latest",
+              "arm64": "ubuntu-24.04-arm",
+          }
+          matrix = json.dumps({
+              "include": [
+                  {
+                      "runtime": runtime,
+                      "arch": arch,
+                      "runner": arch_runners.get(arch, "ubuntu-latest"),
+                  }
+                  for runtime in runtimes
+                  for arch in archs
+              ]
+          })
           output_path = Path(os.environ["GITHUB_OUTPUT"])
           output_path.write_text(f"matrix={matrix}\n", encoding="utf-8")
           PY
 
   publish:
     needs: prepare-matrix
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
@@ -82,7 +110,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: ${{ env.DOWNLOAD_CACHE_DIR }}
-          key: downloads-${{ runner.os }}-${{ matrix.runtime }}-${{ hashFiles(format('runtimes/{0}/runtime.json', matrix.runtime), format('runtimes/{0}/checksums/**', matrix.runtime)) }}
+          key: downloads-${{ runner.os }}-${{ matrix.runtime }}-${{ matrix.arch }}-${{ hashFiles(format('runtimes/{0}/runtime.json', matrix.runtime), format('runtimes/{0}/checksums/**', matrix.runtime)) }}
       - name: Cache Trivy database
         uses: actions/cache@v5
         with:
@@ -96,21 +124,21 @@ jobs:
           role-to-assume: ${{ secrets.AWS_RELEASE_ROLE_ARN }}
           aws-region: us-east-1
       - name: Build runtime package
-        run: make build RUNTIME=${{ matrix.runtime }}
+        run: make build RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Audit runtime package
-        run: bash tools/bin/audit-runtime "${{ matrix.runtime }}"
+        run: bash tools/bin/audit-runtime "${{ matrix.runtime }}" "${{ matrix.arch }}"
       - name: Upload runtime artifact to S3
-        run: make upload RUNTIME=${{ matrix.runtime }}
+        run: make upload RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Publish Lambda layer
         if: ${{ github.event.inputs.publicize != 'true' }}
-        run: make publish RUNTIME=${{ matrix.runtime }}
+        run: make publish RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Publish and publicize Lambda layer
         if: ${{ github.event.inputs.publicize == 'true' }}
-        run: make publicize RUNTIME=${{ matrix.runtime }}
+        run: make publicize RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Summarize latest layer arns
         run: |
           {
-            echo "### ${{ matrix.runtime }}"
-            bash tools/bin/latest-runtime "${{ matrix.runtime }}"
+            echo "### ${{ matrix.runtime }} (${{ matrix.arch }})"
+            bash tools/bin/latest-runtime "${{ matrix.runtime }}" "${{ matrix.arch }}"
             echo
           } >> "$GITHUB_STEP_SUMMARY"

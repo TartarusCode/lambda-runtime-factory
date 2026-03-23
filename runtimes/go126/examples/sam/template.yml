@@ -1,0 +1,18 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: "Go Runtime SAM Example"
+
+Parameters:
+  GoLayerArn:
+    Type: String
+    Description: ARN of the published Go Lambda layer for your region/account
+
+Resources:
+  GoExample:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      CodeUri: hello/
+      Handler: handler
+      Runtime: provided.al2023
+      Layers:
+        - !Ref GoLayerArn

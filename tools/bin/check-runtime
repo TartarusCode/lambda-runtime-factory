@@ -4,5 +4,6 @@ set -euo pipefail
 source "$(dirname "$0")/_common.sh"
 
 runtime_id=$(common::require_runtime_id "${1:-}")
+arch=$(common::require_arch "${2:-}")
 
-python3 "$(common::manifest_cli)" check --runtime "${runtime_id}"
+python3 "$(common::manifest_cli)" check --runtime "${runtime_id}" --arch "${arch}"

@@ -12,6 +12,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
+SUPPORTED_ARCHS: List[str] = ["x86_64", "arm64"]
+DEFAULT_ARCH = "x86_64"
 
 REPO_DEFAULTS: Dict[str, Any] = {
     "runtime_family": "lambda-layer",
@@ -32,20 +34,108 @@ REPO_DEFAULTS: Dict[str, Any] = {
 
 RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "portable-pypy": {
+        "arch_map": {
+            "x86_64": "linux64",
+            "arm64": "aarch64",
+        },
         "artifact": {
-            "archive_name": "{distribution_version}-linux64.tar.bz2",
-            "archive_url": "https://downloads.python.org/pypy/{distribution_version}-linux64.tar.bz2",
-            "archive_root_dir": "{distribution_version}-linux64",
+            "archive_name": "{distribution_version}-{arch_slug}.tar.bz2",
+            "archive_url": "https://downloads.python.org/pypy/{distribution_version}-{arch_slug}.tar.bz2",
+            "archive_root_dir": "{distribution_version}-{arch_slug}",
             "runtime_dir_name": "pypy",
-            "package_name": "{distribution_version}.zip",
+            "package_name": "{distribution_version}-{arch}.zip",
             "checksum_file": "checksums/pypy.sha256",
-            "checksum_name": "{distribution_version}-linux64.tar.bz2",
+            "checksum_name": "{distribution_version}-{arch_slug}.tar.bz2",
         },
         "layout": {
             "bootstrap": "bootstrap/bootstrap.py3",
             "bootstrap_output": "bootstrap",
             "helper_source": "helpers/lambda_runtime_pypy",
             "helper_install_dir": "pypy/site-packages",
+        },
+    },
+    "bun": {
+        "arch_map": {
+            "x86_64": "linux-x64",
+            "arm64": "linux-aarch64",
+        },
+        "artifact": {
+            "archive_name": "bun-{arch_slug}.zip",
+            "archive_url": "https://github.com/oven-sh/bun/releases/download/bun-v{distribution_version}/bun-{arch_slug}.zip",
+            "archive_root_dir": "bun-{arch_slug}",
+            "runtime_dir_name": "bun",
+            "package_name": "bun-v{distribution_version}-{arch}.zip",
+            "checksum_file": "checksums/bun.sha256",
+            "checksum_name": "bun-{arch_slug}.zip",
+        },
+        "layout": {
+            "bootstrap": "bootstrap/bootstrap",
+            "bootstrap_output": "bootstrap",
+            "helper_source": "helpers/lambda_runtime_bun",
+            "helper_install_dir": "bun/lib",
+        },
+    },
+    "graalpy": {
+        "arch_map": {
+            "x86_64": "linux-amd64",
+            "arm64": "linux-aarch64",
+        },
+        "artifact": {
+            "archive_name": "graalpy-{distribution_version}-{arch_slug}.tar.gz",
+            "archive_url": "https://github.com/oracle/graalpython/releases/download/graal-{distribution_version}/graalpy-{distribution_version}-{arch_slug}.tar.gz",
+            "archive_root_dir": "graalpy-{distribution_version}-{arch_slug}",
+            "runtime_dir_name": "graalpy",
+            "package_name": "graalpy-{distribution_version}-{arch}.zip",
+            "checksum_file": "checksums/graalpy.sha256",
+            "checksum_name": "graalpy-{distribution_version}-{arch_slug}.tar.gz",
+        },
+        "layout": {
+            "bootstrap": "bootstrap/bootstrap.py3",
+            "bootstrap_output": "bootstrap",
+            "helper_source": "helpers/lambda_runtime_graalpy",
+            "helper_install_dir": "graalpy/lib/python3.12/site-packages",
+        },
+    },
+    "go-toolchain": {
+        "arch_map": {
+            "x86_64": "linux-amd64",
+            "arm64": "linux-arm64",
+        },
+        "artifact": {
+            "archive_name": "go{distribution_version}.{arch_slug}.tar.gz",
+            "archive_url": "https://go.dev/dl/go{distribution_version}.{arch_slug}.tar.gz",
+            "archive_root_dir": "go",
+            "runtime_dir_name": "go",
+            "package_name": "go{distribution_version}-{arch}.zip",
+            "checksum_file": "checksums/go.sha256",
+            "checksum_name": "go{distribution_version}.{arch_slug}.tar.gz",
+        },
+        "layout": {
+            "bootstrap": "bootstrap/bootstrap",
+            "bootstrap_output": "bootstrap",
+            "helper_source": "helpers/lambda_runtime_go",
+            "helper_install_dir": "go/lambda",
+        },
+    },
+    "rust-musl": {
+        "arch_map": {
+            "x86_64": "x86_64-unknown-linux-musl",
+            "arm64": "aarch64-unknown-linux-musl",
+        },
+        "artifact": {
+            "archive_name": "rust-{distribution_version}-{arch_slug}.tar.gz",
+            "archive_url": "https://static.rust-lang.org/dist/rust-{distribution_version}-{arch_slug}.tar.gz",
+            "archive_root_dir": "rust-{distribution_version}-{arch_slug}",
+            "runtime_dir_name": "rust",
+            "package_name": "rust-{distribution_version}-{arch}.zip",
+            "checksum_file": "checksums/rust.sha256",
+            "checksum_name": "rust-{distribution_version}-{arch_slug}.tar.gz",
+        },
+        "layout": {
+            "bootstrap": "bootstrap/bootstrap",
+            "bootstrap_output": "bootstrap",
+            "helper_source": "helpers/lambda_runtime_rust",
+            "helper_install_dir": "rust/lambda",
         },
     },
 }
@@ -104,15 +194,30 @@ def _format_values(value: Any, context: Dict[str, str]) -> Any:
     return value
 
 
-def _apply_defaults(runtime_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+def _resolve_arch_slug(family_defaults: Dict[str, Any], arch: str) -> str:
+    arch_map = family_defaults.get("arch_map", {})
+    if arch not in arch_map:
+        raise ValueError(
+            f"Architecture '{arch}' not supported. "
+            f"Available: {', '.join(arch_map.keys())}"
+        )
+    return arch_map[arch]
+
+
+def _apply_defaults(runtime_id: str, data: Dict[str, Any], arch: str = DEFAULT_ARCH) -> Dict[str, Any]:
     runtime_family = data.get("runtime_family", REPO_DEFAULTS["runtime_family"])
-    merged = _deep_merge(REPO_DEFAULTS, RUNTIME_FAMILY_DEFAULTS.get(runtime_family, {}))
+    family_defaults = RUNTIME_FAMILY_DEFAULTS.get(runtime_family, {})
+    merged = _deep_merge(REPO_DEFAULTS, family_defaults)
     merged = _deep_merge(merged, data)
+
+    arch_slug = _resolve_arch_slug(family_defaults, arch) if family_defaults.get("arch_map") else arch
 
     context = {
         "runtime_id": runtime_id,
         "distribution_version": merged.get("distribution_version", ""),
         "display_name": merged.get("display_name", runtime_id),
+        "arch": arch,
+        "arch_slug": arch_slug,
     }
     merged = _format_values(merged, context)
 
@@ -129,7 +234,7 @@ def _apply_defaults(runtime_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
     return merged
 
 
-def load_runtime(runtime_id: str) -> Dict[str, Any]:
+def load_runtime(runtime_id: str, arch: str = DEFAULT_ARCH) -> Dict[str, Any]:
     manifest_path = runtime_manifest_path(runtime_id)
     if not manifest_path.exists():
         raise FileNotFoundError(f"Runtime manifest not found: {manifest_path}")
@@ -137,6 +242,7 @@ def load_runtime(runtime_id: str) -> Dict[str, Any]:
     data = _apply_defaults(
         runtime_id,
         json.loads(manifest_path.read_text(encoding="utf-8")),
+        arch=arch,
     )
     validate_runtime_data(runtime_id, data)
     return data
@@ -206,8 +312,11 @@ def _absolute(runtime_id: str, relative_path: str) -> Path:
     return runtimes_root() / runtime_id / Path(relative_path)
 
 
-def runtime_env(runtime_id: str) -> Dict[str, str]:
-    data = load_runtime(runtime_id)
+def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> Dict[str, str]:
+    if arch not in SUPPORTED_ARCHS:
+        raise ValueError(f"Unsupported architecture '{arch}'. Supported: {', '.join(SUPPORTED_ARCHS)}")
+
+    data = load_runtime(runtime_id, arch=arch)
     runtime_dir = runtimes_root() / runtime_id
     temp_root = Path(
         os.environ.get("BUILD_ROOT")
@@ -215,12 +324,12 @@ def runtime_env(runtime_id: str) -> Dict[str, str]:
         or os.environ.get("TMPDIR")
         or "/tmp"
     ) / "lambda-runtime-monorepo"
-    build_dir = temp_root / runtime_id
+    build_dir = temp_root / runtime_id / arch
     download_cache_root = Path(
         os.environ.get("DOWNLOAD_CACHE_DIR")
         or temp_root / "download-cache"
     )
-    dist_dir = repo_root() / "dist" / runtime_id
+    dist_dir = repo_root() / "dist" / runtime_id / arch
     layer_root = build_dir / "layer"
     downloads_dir = download_cache_root / runtime_id
     work_dir = build_dir / "work"
@@ -232,6 +341,8 @@ def runtime_env(runtime_id: str) -> Dict[str, str]:
         "TEMP_ROOT": str(temp_root),
         "RUNTIME_FAMILY": data["runtime_family"],
         "DISTRIBUTION_VERSION": data["distribution_version"],
+        "ARCH": arch,
+        "LAMBDA_ARCH": arch,
         "BUILD_DIR": str(build_dir),
         "DIST_DIR": str(dist_dir),
         "LAYER_ROOT": str(layer_root),
@@ -280,8 +391,8 @@ def runtime_env(runtime_id: str) -> Dict[str, str]:
     return env
 
 
-def validate_runtime(runtime_id: str) -> None:
-    data = load_runtime(runtime_id)
+def validate_runtime(runtime_id: str, arch: str = DEFAULT_ARCH) -> None:
+    data = load_runtime(runtime_id, arch=arch)
     files_to_check = [
         _absolute(runtime_id, data["artifact"]["checksum_file"]),
         _absolute(runtime_id, data["layout"]["bootstrap"]),
@@ -299,7 +410,7 @@ def compile_runtime_python(runtime_id: str) -> None:
     runtime_dir = runtimes_root() / runtime_id
     python_files = sorted(path for path in runtime_dir.rglob("*.py") if path.is_file())
     if not python_files:
-        raise RuntimeError(f"No Python files found under {runtime_dir}")
+        return
 
     for python_file in python_files:
         subprocess.run(
@@ -308,12 +419,28 @@ def compile_runtime_python(runtime_id: str) -> None:
         )
 
 
+ARCH_RUNNERS: Dict[str, str] = {
+    "x86_64": "ubuntu-latest",
+    "arm64": "ubuntu-24.04-arm",
+}
+
+
 def manifest_matrix() -> Dict[str, Any]:
-    return {"include": [{"runtime": runtime_id} for runtime_id in list_runtime_ids()]}
+    return {
+        "include": [
+            {
+                "runtime": runtime_id,
+                "arch": arch,
+                "runner": ARCH_RUNNERS.get(arch, "ubuntu-latest"),
+            }
+            for runtime_id in list_runtime_ids()
+            for arch in SUPPORTED_ARCHS
+        ]
+    }
 
 
-def print_shell_env(runtime_id: str) -> None:
-    for key, value in runtime_env(runtime_id).items():
+def print_shell_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> None:
+    for key, value in runtime_env(runtime_id, arch=arch).items():
         print(f"{key}={shlex.quote(value)}")
 
 
@@ -329,12 +456,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("--runtime")
+    validate_parser.add_argument("--arch", default=DEFAULT_ARCH)
 
     env_parser = subparsers.add_parser("env")
     env_parser.add_argument("--runtime", required=True)
+    env_parser.add_argument("--arch", default=DEFAULT_ARCH)
 
     check_parser = subparsers.add_parser("check")
     check_parser.add_argument("--runtime", required=True)
+    check_parser.add_argument("--arch", default=DEFAULT_ARCH)
 
     return parser
 
@@ -358,15 +488,16 @@ def main() -> None:
     if args.command == "validate":
         runtime_ids = [args.runtime] if args.runtime else list_runtime_ids()
         for runtime_id in runtime_ids:
-            validate_runtime(runtime_id)
+            for arch in SUPPORTED_ARCHS:
+                validate_runtime(runtime_id, arch=arch)
         return
 
     if args.command == "env":
-        print_shell_env(args.runtime)
+        print_shell_env(args.runtime, arch=args.arch)
         return
 
     if args.command == "check":
-        validate_runtime(args.runtime)
+        validate_runtime(args.runtime, arch=args.arch)
         compile_runtime_python(args.runtime)
         return
 
