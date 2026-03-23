@@ -50,10 +50,10 @@ jobs:
         with:
           path: ${{ env.DOWNLOAD_CACHE_DIR }}
           key: downloads-${{ runner.os }}-${{ matrix.runtime }}-${{ matrix.arch }}-${{ hashFiles(format('runtimes/{0}/runtime.json', matrix.runtime), format('runtimes/{0}/checksums/**', matrix.runtime)) }}
-      - name: Install Grype
-        uses: anchore/scan-action/download-grype@v6
       - name: Install shell tooling
         run: sudo apt-get update && sudo apt-get install -y shellcheck zip unzip
+      - name: Install Grype
+        run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
       - name: Validate manifests
         run: bash tools/bin/validate-runtimes
       - name: Validate shell scripts
