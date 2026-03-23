@@ -426,17 +426,18 @@ ARCH_RUNNERS: Dict[str, str] = {
 
 
 def manifest_matrix() -> Dict[str, Any]:
-    return {
-        "include": [
-            {
+    entries = []
+    for runtime_id in list_runtime_ids():
+        data = json.loads(runtime_manifest_path(runtime_id).read_text(encoding="utf-8"))
+        skip_local = data.get("local_testing", {}).get("skip_local_invoke", False)
+        for arch in SUPPORTED_ARCHS:
+            entries.append({
                 "runtime": runtime_id,
                 "arch": arch,
                 "runner": ARCH_RUNNERS.get(arch, "ubuntu-latest"),
-            }
-            for runtime_id in list_runtime_ids()
-            for arch in SUPPORTED_ARCHS
-        ]
-    }
+                "skip_local_invoke": skip_local,
+            })
+    return {"include": entries}
 
 
 def print_shell_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> None:

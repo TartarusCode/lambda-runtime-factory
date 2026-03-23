@@ -8,7 +8,8 @@
   },
   "local_testing": {
     "handler": "handler",
-    "code_uri": "examples/sam/hello"
+    "code_uri": "examples/sam/hello",
+    "skip_local_invoke": true
   },
   "release": {
     "regions": ["eu-central-1", "us-west-1"]

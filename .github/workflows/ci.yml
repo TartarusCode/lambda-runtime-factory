@@ -66,10 +66,10 @@ jobs:
       - name: Audit runtime package
         run: bash tools/bin/audit-runtime "${{ matrix.runtime }}" "${{ matrix.arch }}"
       - name: Build local SAM example
-        if: matrix.arch == 'x86_64'
+        if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke
         run: make local-build RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Invoke local SAM example
-        if: matrix.arch == 'x86_64'
+        if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke
         run: make local-invoke RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Upload runtime artifact
         uses: actions/upload-artifact@v7
