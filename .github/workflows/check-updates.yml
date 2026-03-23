@@ -30,17 +30,24 @@ jobs:
           if [[ -n "${{ github.event.inputs.runtime }}" ]]; then
             args+=(--runtime "${{ github.event.inputs.runtime }}")
           fi
-          output=$(python3 tools/runtime_lib/bump_version.py "${args[@]}")
-          echo "$output"
+          python3 tools/runtime_lib/bump_version.py "${args[@]}" > "${RUNNER_TEMP}/check_output.txt" 2>&1
+          cat "${RUNNER_TEMP}/check_output.txt"
 
-          # Extract the JSON object (last line of output)
-          json_line=$(echo "$output" | grep -E '^\{' | tail -1)
-          if [[ -z "$json_line" || "$json_line" == "{}" ]]; then
-            echo "outdated=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "outdated=true" >> "$GITHUB_OUTPUT"
-            echo "updates=$json_line" >> "$GITHUB_OUTPUT"
-          fi
+          python3 -c "
+          import json, sys
+          text = open('${RUNNER_TEMP}/check_output.txt').read()
+          for line in reversed(text.splitlines()):
+              line = line.strip()
+              if line.startswith('{'):
+                  data = json.loads(line)
+                  if data:
+                      open('${RUNNER_TEMP}/updates.json', 'w').write(json.dumps(data))
+                      print('outdated=true')
+                  else:
+                      print('outdated=false')
+                  sys.exit(0)
+          print('outdated=false')
+          " >> "$GITHUB_OUTPUT"
 
       - name: Bump outdated runtimes
         if: steps.check.outputs.outdated == 'true'
@@ -53,27 +60,21 @@ jobs:
 
       - name: Build PR description
         if: steps.check.outputs.outdated == 'true'
-        id: pr-body
         run: |
-          body="## Runtime Version Bumps"$'\n\n'
-          body+="The following runtimes were updated to their latest upstream versions:"$'\n\n'
-
-          echo '${{ steps.check.outputs.updates }}' | python3 -c "
-          import json, sys
-          updates = json.load(sys.stdin)
+          python3 -c "
+          import json
+          updates = json.load(open('${RUNNER_TEMP}/updates.json'))
+          lines = ['## Runtime Version Bumps', '',
+                   'The following runtimes were updated to their latest upstream versions:', '']
           for rid, info in sorted(updates.items()):
-              print(f'- **{rid}**: {info[\"current\"]} → {info[\"latest\"]}')
-          " >> "$RUNNER_TEMP/pr_updates.txt"
-          body+=$(cat "$RUNNER_TEMP/pr_updates.txt")
-
-          body+=$'\n\n'"Checksums were fetched from the official upstream release channels."
-          body+=$'\n\n'"## Test Plan"
-          body+=$'\n'"- [ ] CI validates manifests and checksums"
-          body+=$'\n'"- [ ] CI builds all updated runtime packages"
-          body+=$'\n'"- [ ] CI audits updated packages with Grype"
-
-          # Write to file to preserve newlines
-          echo "$body" > "$RUNNER_TEMP/pr_body.txt"
+              lines.append(f'- **{rid}**: {info[\"current\"]} \u2192 {info[\"latest\"]}')
+          lines += ['', 'Checksums were fetched from the official upstream release channels.',
+                    '', '## Test Plan',
+                    '- [ ] CI validates manifests and checksums',
+                    '- [ ] CI builds all updated runtime packages',
+                    '- [ ] CI audits updated packages with Grype']
+          open('${RUNNER_TEMP}/pr_body.txt', 'w').write('\n'.join(lines) + '\n')
+          "
 
       - name: Create pull request
         if: steps.check.outputs.outdated == 'true'
