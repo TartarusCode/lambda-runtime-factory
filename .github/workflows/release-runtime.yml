@@ -103,21 +103,14 @@ jobs:
       - name: Prepare cache directories
         run: |
           echo "DOWNLOAD_CACHE_DIR=${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads" >> "$GITHUB_ENV"
-          echo "TRIVY_CACHE_DIR=${RUNNER_TEMP}/lambda-runtime-monorepo/cache/trivy" >> "$GITHUB_ENV"
           mkdir -p "${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads"
-          mkdir -p "${RUNNER_TEMP}/lambda-runtime-monorepo/cache/trivy"
       - name: Cache runtime downloads
         uses: actions/cache@v5
         with:
           path: ${{ env.DOWNLOAD_CACHE_DIR }}
           key: downloads-${{ runner.os }}-${{ matrix.runtime }}-${{ matrix.arch }}-${{ hashFiles(format('runtimes/{0}/runtime.json', matrix.runtime), format('runtimes/{0}/checksums/**', matrix.runtime)) }}
-      - name: Cache Trivy database
-        uses: actions/cache@v5
-        with:
-          path: ${{ env.TRIVY_CACHE_DIR }}
-          key: trivy-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml', '.github/workflows/release-runtime.yml') }}
-          restore-keys: |
-            trivy-${{ runner.os }}-
+      - name: Install Grype
+        uses: anchore/scan-action/download-grype@v6
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:

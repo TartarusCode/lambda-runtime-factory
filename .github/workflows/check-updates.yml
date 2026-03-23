@@ -70,7 +70,7 @@ jobs:
           body+=$'\n\n'"## Test Plan"
           body+=$'\n'"- [ ] CI validates manifests and checksums"
           body+=$'\n'"- [ ] CI builds all updated runtime packages"
-          body+=$'\n'"- [ ] CI audits updated packages with Trivy"
+          body+=$'\n'"- [ ] CI audits updated packages with Grype"
 
           # Write to file to preserve newlines
           echo "$body" > "$RUNNER_TEMP/pr_body.txt"

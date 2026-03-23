@@ -2,7 +2,6 @@
 set -euo pipefail
 
 source "$(dirname "$0")/_common.sh"
-# Shared runtime environment helpers.
 
 best_effort=0
 if [[ "${1:-}" == "--best-effort" ]]; then
@@ -28,48 +27,18 @@ else
     fi
 fi
 
-trivy_ignore="${RUNTIME_DIR}/.trivyignore"
-trivy_ignore_args=()
-if [[ -f "${trivy_ignore}" ]]; then
-    trivy_ignore_args=(--ignorefile "${trivy_ignore}")
-fi
-
-trivy_skip_dirs="${RUNTIME_DIR}/.trivyskipdirs"
-trivy_skip_args=()
-if [[ -f "${trivy_skip_dirs}" ]]; then
-    while IFS= read -r dir || [[ -n "${dir}" ]]; do
-        dir="${dir%%#*}"
-        dir="${dir// /}"
-        [[ -z "${dir}" ]] && continue
-        trivy_skip_args+=(--skip-dirs "${dir}")
-    done < "${trivy_skip_dirs}"
-fi
-
-if type -P trivy >/dev/null; then
-    trivy fs --cache-dir "${TRIVY_CACHE_DIR:-${HOME}/.cache/trivy}" --quiet --severity HIGH,CRITICAL --exit-code 1 "${trivy_ignore_args[@]}" "${trivy_skip_args[@]}" "${target_dir}"
-    exit 0
+grype_config="${RUNTIME_DIR}/.grype.yaml"
+grype_config_args=()
+if [[ -f "${grype_config}" ]]; then
+    grype_config_args=(-c "${grype_config}")
 fi
 
 if type -P grype >/dev/null; then
-    grype "dir:${target_dir}" --fail-on high --only-fixed
+    grype "${grype_config_args[@]}" --fail-on high --only-fixed "dir:${target_dir}"
     exit 0
 fi
 
-if type -P docker >/dev/null; then
-    docker_extra_args=()
-    if [[ -f "${trivy_ignore}" ]]; then
-        docker_extra_args=(-v "${trivy_ignore}:/trivyignore:ro")
-        trivy_ignore_args=(--ignorefile /trivyignore)
-    fi
-    docker run --rm \
-        -v "${target_dir}:/scan:ro" \
-        -v "${TRIVY_CACHE_DIR:-${HOME}/.cache/trivy}:/root/.cache/trivy" \
-        "${docker_extra_args[@]}" \
-        aquasec/trivy:latest fs --quiet --severity HIGH,CRITICAL --exit-code 1 "${trivy_ignore_args[@]}" "${trivy_skip_args[@]}" /scan
-    exit 0
-fi
-
-message="Install trivy, grype, or docker to perform runtime vulnerability scanning"
+message="Install grype to perform runtime vulnerability scanning: https://github.com/anchore/grype#installation"
 if (( best_effort )); then
     echo "${message}" >&2
     exit 0
