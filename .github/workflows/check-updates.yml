@@ -33,21 +33,24 @@ jobs:
           python3 tools/runtime_lib/bump_version.py "${args[@]}" > "${RUNNER_TEMP}/check_output.txt" 2>&1
           cat "${RUNNER_TEMP}/check_output.txt"
 
-          python3 -c "
-          import json, sys
-          text = open('${RUNNER_TEMP}/check_output.txt').read()
-          for line in reversed(text.splitlines()):
-              line = line.strip()
-              if line.startswith('{'):
-                  data = json.loads(line)
-                  if data:
-                      open('${RUNNER_TEMP}/updates.json', 'w').write(json.dumps(data))
-                      print('outdated=true')
-                  else:
-                      print('outdated=false')
-                  sys.exit(0)
-          print('outdated=false')
-          " >> "$GITHUB_OUTPUT"
+          python3 << 'PYCHECK'
+          import json, os
+          text = open(os.environ["RUNNER_TEMP"] + "/check_output.txt").read()
+          # Extract JSON block: collect lines from first { to last }
+          lines = text.splitlines()
+          start = next((i for i, l in enumerate(lines) if l.strip().startswith("{")), None)
+          end = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip().startswith("}")), None)
+          if start is not None and end is not None:
+              data = json.loads("\n".join(lines[start:end + 1]))
+          else:
+              data = {}
+          output = open(os.environ["GITHUB_OUTPUT"], "a")
+          if data:
+              json.dump(data, open(os.environ["RUNNER_TEMP"] + "/updates.json", "w"))
+              output.write("outdated=true\n")
+          else:
+              output.write("outdated=false\n")
+          PYCHECK
 
       - name: Bump outdated runtimes
         if: steps.check.outputs.outdated == 'true'
@@ -61,20 +64,21 @@ jobs:
       - name: Build PR description
         if: steps.check.outputs.outdated == 'true'
         run: |
-          python3 -c "
-          import json
-          updates = json.load(open('${RUNNER_TEMP}/updates.json'))
-          lines = ['## Runtime Version Bumps', '',
-                   'The following runtimes were updated to their latest upstream versions:', '']
+          python3 << 'PYBODY'
+          import json, os
+          tmp = os.environ["RUNNER_TEMP"]
+          updates = json.load(open(tmp + "/updates.json"))
+          lines = ["## Runtime Version Bumps", "",
+                   "The following runtimes were updated to their latest upstream versions:", ""]
           for rid, info in sorted(updates.items()):
-              lines.append(f'- **{rid}**: {info[\"current\"]} \u2192 {info[\"latest\"]}')
-          lines += ['', 'Checksums were fetched from the official upstream release channels.',
-                    '', '## Test Plan',
-                    '- [ ] CI validates manifests and checksums',
-                    '- [ ] CI builds all updated runtime packages',
-                    '- [ ] CI audits updated packages with Grype']
-          open('${RUNNER_TEMP}/pr_body.txt', 'w').write('\n'.join(lines) + '\n')
-          "
+              lines.append(f"- **{rid}**: {info['current']} \u2192 {info['latest']}")
+          lines += ["", "Checksums were fetched from the official upstream release channels.",
+                    "", "## Test Plan",
+                    "- [ ] CI validates manifests and checksums",
+                    "- [ ] CI builds all updated runtime packages",
+                    "- [ ] CI audits updated packages with Grype"]
+          open(tmp + "/pr_body.txt", "w").write("\n".join(lines) + "\n")
+          PYBODY
 
       - name: Create pull request
         if: steps.check.outputs.outdated == 'true'

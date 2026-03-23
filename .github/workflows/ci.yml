@@ -38,9 +38,8 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-      - uses: aws-actions/setup-sam@v2
-        with:
-          use-installer: true
+      - name: Install SAM CLI
+        run: pip install --quiet aws-sam-cli
       - name: Prepare cache directories
         run: |
           echo "DOWNLOAD_CACHE_DIR=${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads" >> "$GITHUB_ENV"
