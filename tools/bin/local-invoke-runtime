@@ -2,7 +2,6 @@
 set -euo pipefail
 
 source "$(dirname "$0")/_common.sh"
-# Shared runtime environment helpers.
 
 runtime_id=$(common::require_runtime_id "${1:-}")
 arch=$(common::require_arch "${2:-}")
@@ -13,22 +12,19 @@ common::load_runtime_env "${runtime_id}" "${arch}"
 mkdir -p "${LOCAL_INVOKE_DIR}"
 cp -R "${LOCAL_SOURCE_DIR}/." "${LOCAL_INVOKE_DIR}/"
 cp -R "${LOCAL_LAYER_DIR}/${RUNTIME_DIR_NAME}" "${LOCAL_INVOKE_DIR}/"
-cp "${BOOTSTRAP_SOURCE}" "${LOCAL_INVOKE_DIR}/bootstrap.py"
 
-python3 - "${LOCAL_INVOKE_DIR}/bootstrap" <<'PY'
-import sys
-from pathlib import Path
-
-bootstrap_path = Path(sys.argv[1])
-bootstrap_path.write_text(
-    "#!/bin/sh\n"
-    "set -eu\n"
-    "export PYTHONPATH=\"${LAMBDA_TASK_ROOT}/pypy/site-packages:${LAMBDA_TASK_ROOT}:${PYTHONPATH:-}\"\n"
-    "exec \"${LAMBDA_TASK_ROOT}/pypy/bin/pypy\" \"${LAMBDA_TASK_ROOT}/bootstrap.py\"\n",
-    encoding="utf-8",
-    newline="\n",
-)
-PY
+if [[ "${BOOTSTRAP_SOURCE}" == *.py3 ]]; then
+    cp "${BOOTSTRAP_SOURCE}" "${LOCAL_INVOKE_DIR}/bootstrap.py"
+    interp_base=$(basename "$(head -1 "${BOOTSTRAP_SOURCE}" | sed 's|^#!||')")
+    cat > "${LOCAL_INVOKE_DIR}/bootstrap" <<WRAPPER
+#!/bin/sh
+set -eu
+export PYTHONPATH="\${LAMBDA_TASK_ROOT}/${HELPER_INSTALL_DIR}:\${LAMBDA_TASK_ROOT}:\${PYTHONPATH:-}"
+exec "\${LAMBDA_TASK_ROOT}/${RUNTIME_DIR_NAME}/bin/${interp_base}" "\${LAMBDA_TASK_ROOT}/bootstrap.py"
+WRAPPER
+else
+    sed "s|/opt/|/var/task/|g" "${BOOTSTRAP_SOURCE}" > "${LOCAL_INVOKE_DIR}/bootstrap"
+fi
 chmod +x "${LOCAL_INVOKE_DIR}/bootstrap"
 
 python3 - "${LOCAL_INVOKE_TEMPLATE}" "${LOCAL_INVOKE_DIR}" "${LOCAL_FUNCTION_NAME}" "${LOCAL_HANDLER}" <<'PY'
@@ -64,4 +60,10 @@ template_path.write_text(
 )
 PY
 
-sam local invoke "${LOCAL_FUNCTION_NAME}" --template-file "${LOCAL_INVOKE_TEMPLATE}" --event "${LOCAL_EVENT}"
+invoke_output=$(sam local invoke "${LOCAL_FUNCTION_NAME}" --template-file "${LOCAL_INVOKE_TEMPLATE}" --event "${LOCAL_EVENT}" 2>&1) || true
+echo "${invoke_output}"
+
+if echo "${invoke_output}" | grep -qE "(Init failed|Invoke failed|Invoke DONE failed|exit status [1-9])"; then
+    echo "Local invoke failed for ${runtime_id}" >&2
+    exit 1
+fi

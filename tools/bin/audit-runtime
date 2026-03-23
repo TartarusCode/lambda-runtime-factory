@@ -34,7 +34,7 @@ if [[ -f "${grype_config}" ]]; then
 fi
 
 if type -P grype >/dev/null; then
-    grype "${grype_config_args[@]}" --fail-on high --only-fixed "dir:${target_dir}"
+    grype "${grype_config_args[@]}" -q --fail-on high --only-fixed "dir:${target_dir}"
     exit 0
 fi
 
