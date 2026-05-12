@@ -2,7 +2,7 @@
   "runtime_id": "rust194",
   "runtime_family": "rust-musl",
   "display_name": "Rust 1.x",
-  "distribution_version": "1.94.0",
+  "distribution_version": "1.95.0",
   "artifact": {
     "checksum_file": "checksums/rust.sha256"
   },
@@ -12,6 +12,9 @@
     "skip_local_invoke": true
   },
   "release": {
-    "regions": ["eu-central-1", "us-west-1"]
+    "regions": [
+      "eu-central-1",
+      "us-west-1"
+    ]
   }
 }
