@@ -2,7 +2,7 @@
   "runtime_id": "bun13",
   "runtime_family": "bun",
   "display_name": "Bun 1.x",
-  "distribution_version": "1.3.13",
+  "distribution_version": "1.3.14",
   "artifact": {
     "checksum_file": "checksums/bun.sha256"
   },
