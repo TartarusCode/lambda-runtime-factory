@@ -23,7 +23,10 @@ Official downloads from `downloads.python.org/pypy` (portable Linux builds; the 
 
 ## CI / audit
 
-- Grype: `bash tools/bin/audit-runtime` with `--fail-on high --only-fixed` — pin upstream when CVEs have fixed releases (e.g. Go 1.26.3 → 1.26.4).
+- **Workflow layout** (`ci.yml`): `repo-checks` runs validate/bash-n/check once; `runtime-checks` matrix builds and audits per runtime×arch. Release workflow mirrors download + Grype caches only.
+- **Grype**: `bash tools/bin/audit-runtime` with `--fail-on high --only-fixed` — pin upstream when CVEs have fixed releases (e.g. Go 1.26.3 → 1.26.4). CI/release install `v0.98.0` to `${RUNNER_TEMP}/grype/bin` with Actions cache on binary and `~/.cache/grype`.
+- **SAM in CI**: x86 matrix cells with local invoke install from `requirements-ci.txt`, warm Docker image, then `make local-build` / `local-invoke`.
+- **Artifacts**: GitHub Actions zips only on push to `main` (7-day retention); PRs rely on CI logs, not stored artifacts.
 - Builds require Linux/WSL (`bash`, `curl`, `zip`, `unzip`, `make`).
 
 ## Local SAM

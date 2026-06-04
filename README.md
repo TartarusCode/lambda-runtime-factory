@@ -134,17 +134,20 @@ Requirements:
 The repo includes:
 
 - `.github/workflows/ci.yml`
-  - manifest validation
-  - shell syntax validation
-  - Python syntax validation for runtime code
-  - runtime build and checksum enforcement
-  - vulnerability audit
-  - local SAM build and invoke smoke tests
+  - `repo-checks` (once per workflow): manifest validation, shell syntax, Python compile per runtime
+  - `runtime-checks` (matrix): build, Grype audit, local SAM smoke tests on x86 when enabled
+  - caches: upstream runtime downloads, Grype binary (`v0.98.0`) and DB, pip for `requirements-ci.txt` (SAM jobs only)
+  - SAM x86 jobs pre-pull `public.ecr.aws/sam/build-provided.al2023:latest` before `sam build --use-container`
+  - workflow artifacts: built zips upload on **push to `main` only**, `retention-days: 7` (PRs do not upload)
+  - superseded PR runs cancel via workflow concurrency
 - `.github/workflows/release-runtime.yml`
   - manual runtime-scoped release flow
   - rebuild, audit, upload, and publish steps
+  - same download and Grype caches as CI (no SAM)
 
 The release workflow expects an AWS role secret named `AWS_RELEASE_ROLE_ARN`.
+
+CI pins `aws-sam-cli` in `requirements-ci.txt` for reproducible SAM installs.
 
 ## Adding A New Runtime
 

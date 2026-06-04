@@ -21,6 +21,9 @@ permissions:
   contents: read
   id-token: write
 
+env:
+  GRYPE_VERSION: v0.98.0
+
 jobs:
   prepare-matrix:
     runs-on: ubuntu-latest
@@ -95,6 +98,7 @@ jobs:
     env:
       SAM_CLI_TELEMETRY: "0"
       BUILD_BEST_EFFORT_AUDIT: "0"
+      GRYPE_INSTALL_DIR: ${{ runner.temp }}/grype/bin
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -104,13 +108,30 @@ jobs:
         run: |
           echo "DOWNLOAD_CACHE_DIR=${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads" >> "$GITHUB_ENV"
           mkdir -p "${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads"
+          mkdir -p "${GRYPE_INSTALL_DIR}"
       - name: Cache runtime downloads
         uses: actions/cache@v5
         with:
           path: ${{ env.DOWNLOAD_CACHE_DIR }}
           key: downloads-${{ runner.os }}-${{ matrix.runtime }}-${{ matrix.arch }}-${{ hashFiles(format('runtimes/{0}/runtime.json', matrix.runtime), format('runtimes/{0}/checksums/**', matrix.runtime)) }}
+      - name: Cache Grype binary
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.GRYPE_INSTALL_DIR }}
+          key: grype-binary-${{ env.GRYPE_VERSION }}
+      - name: Cache Grype database
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/grype
+          key: grype-db-${{ runner.os }}-${{ env.GRYPE_VERSION }}
+          restore-keys: |
+            grype-db-${{ runner.os }}-
       - name: Install Grype
-        run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+        run: |
+          if [[ ! -x "${GRYPE_INSTALL_DIR}/grype" ]]; then
+            curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b "${GRYPE_INSTALL_DIR}" "${GRYPE_VERSION}"
+          fi
+          echo "${GRYPE_INSTALL_DIR}" >> "$GITHUB_PATH"
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
