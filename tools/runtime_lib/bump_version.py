@@ -68,6 +68,19 @@ def _fetch_checksum_bun(version: str, archive_name: str) -> str:
     raise ValueError(f"Checksum not found for {archive_name} in Bun v{version} SHASUMS256.txt")
 
 
+def _fetch_checksum_deno(version: str, archive_name: str) -> str:
+    sha_url = (
+        f"https://github.com/denoland/deno/releases/download/v{version}/"
+        f"{archive_name}.sha256sum"
+    )
+    content = _http_get_text(sha_url)
+    for line in content.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1] == archive_name:
+            return parts[0]
+    raise ValueError(f"Checksum not found for {archive_name} in Deno v{version} release")
+
+
 def _fetch_checksum_graalpy(version: str, archive_name: str) -> str:
     sha_url = (
         f"https://github.com/oracle/graalpython/releases/download/"
@@ -93,6 +106,7 @@ def _fetch_checksum_pypy(version: str, archive_name: str) -> str:
 CHECKSUM_FETCHERS = {
     "go-toolchain": _fetch_checksum_go,
     "bun": _fetch_checksum_bun,
+    "deno": _fetch_checksum_deno,
     "graalpy": _fetch_checksum_graalpy,
     "rust-musl": _fetch_checksum_rust,
     "portable-pypy": _fetch_checksum_pypy,
@@ -178,6 +192,15 @@ def check_latest_bun() -> Optional[str]:
     return tag.removeprefix("bun-v") if tag else None
 
 
+def check_latest_deno() -> Optional[str]:
+    data = json.loads(_http_get(
+        "https://api.github.com/repos/denoland/deno/releases/latest",
+        accept="application/vnd.github+json",
+    ))
+    tag = data.get("tag_name", "")
+    return tag.removeprefix("v") if tag else None
+
+
 def check_latest_graalpy() -> Optional[str]:
     data = json.loads(_http_get(
         "https://api.github.com/repos/oracle/graalpython/releases/latest",
@@ -214,6 +237,7 @@ def check_latest_pypy() -> Optional[str]:
 LATEST_CHECKERS = {
     "go-toolchain": check_latest_go,
     "bun": check_latest_bun,
+    "deno": check_latest_deno,
     "graalpy": check_latest_graalpy,
     "rust-musl": check_latest_rust,
     "portable-pypy": check_latest_pypy,

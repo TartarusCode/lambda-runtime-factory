@@ -1,0 +1,18 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: "Deno Runtime SAM Example"
+
+Parameters:
+  DenoLayerArn:
+    Type: String
+    Description: ARN of the published Deno Lambda layer for your region/account
+
+Resources:
+  DenoExample:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      CodeUri: hello/
+      Handler: hello.handler
+      Runtime: provided.al2023
+      Layers:
+        - !Ref DenoLayerArn

@@ -1,0 +1,15 @@
+service: hello-deno28
+
+
+provider:
+  name: aws
+  region: eu-central-1
+
+functions:
+  hello-deno28:
+    handler: hello.handler
+    runtime: provided.al2023
+    # Set DENO_LAYER_ARN before deploy, for example:
+    # DENO_LAYER_ARN=$(aws lambda list-layer-versions --layer-name deno28 --query "LayerVersions[0].LayerVersionArn" --output text --region eu-central-1)
+    layers:
+      - ${env:DENO_LAYER_ARN}

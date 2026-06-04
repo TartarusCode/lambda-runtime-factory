@@ -1,1 +1,8 @@
-text=auto eol=lf
+* text=auto eol=lf
+
+*.sh text eol=lf
+Makefile text eol=lf
+**/Makefile text eol=lf
+**/bootstrap text eol=lf
+**/bootstrap.py3 text eol=lf
+tools/bin/* text eol=lf

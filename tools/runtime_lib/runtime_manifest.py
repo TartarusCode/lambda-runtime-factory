@@ -75,6 +75,28 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "helper_install_dir": "bun/lib",
         },
     },
+    "deno": {
+        "arch_map": {
+            "x86_64": "x86_64-unknown-linux-gnu",
+            "arm64": "aarch64-unknown-linux-gnu",
+        },
+        "artifact": {
+            "archive_name": "deno-{arch_slug}.zip",
+            "archive_url": "https://github.com/denoland/deno/releases/download/v{distribution_version}/deno-{arch_slug}.zip",
+            "archive_root_dir": "deno",
+            "binary_name": "deno",
+            "runtime_dir_name": "deno",
+            "package_name": "deno-v{distribution_version}-{arch}.zip",
+            "checksum_file": "checksums/deno.sha256",
+            "checksum_name": "deno-{arch_slug}.zip",
+        },
+        "layout": {
+            "bootstrap": "bootstrap/bootstrap",
+            "bootstrap_output": "bootstrap",
+            "helper_source": "helpers/lambda_runtime_deno",
+            "helper_install_dir": "deno/lib",
+        },
+    },
     "graalpy": {
         "arch_map": {
             "x86_64": "linux-amd64",
@@ -354,6 +376,7 @@ def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> Dict[str, str]:
         "CHECKSUM_FILE": str(_absolute(runtime_id, data["artifact"]["checksum_file"])),
         "CHECKSUM_NAME": data["artifact"]["checksum_name"],
         "ARCHIVE_ROOT_DIR": data["artifact"]["archive_root_dir"],
+        "BINARY_NAME": data["artifact"].get("binary_name", ""),
         "RUNTIME_DIR_NAME": data["artifact"]["runtime_dir_name"],
         "PACKAGE_NAME": data["artifact"]["package_name"],
         "ARTIFACT_DIR": str(build_dir / "artifacts"),

@@ -29,9 +29,14 @@ tools/
 
 ## Supported Runtimes
 
-Current implemented runtime:
+Implemented runtimes:
 
-- `pypy311`
+- `pypy311` — PyPy 3.11 (portable Linux builds from python.org)
+- `graalpy312` — GraalPython
+- `bun13` — Bun 1.x
+- `deno28` — Deno 2.x (`provided.al2023` layer; bootstrap runs `deno` with sandbox flags for the Runtime API)
+- `go126` — Go toolchain layer
+- `rust194` — Rust musl toolchain layer
 
 The shared tooling is intentionally runtime-agnostic so additional runtimes can be added without reworking the root build and release flow.
 
@@ -66,6 +71,7 @@ Build a specific runtime:
 
 ```bash
 make build RUNTIME=pypy311
+make build RUNTIME=deno28
 ```
 
 Audit a built runtime:

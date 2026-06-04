@@ -57,7 +57,12 @@ case "${ARCHIVE_NAME}" in
         exit 1
         ;;
 esac
-mv "${WORK_DIR}/${ARCHIVE_ROOT_DIR}" "${LAYER_ROOT}/${RUNTIME_DIR_NAME}"
+if [[ -n "${BINARY_NAME:-}" && -f "${WORK_DIR}/${BINARY_NAME}" ]]; then
+    mkdir -p "${LAYER_ROOT}/${RUNTIME_DIR_NAME}"
+    mv "${WORK_DIR}/${BINARY_NAME}" "${LAYER_ROOT}/${RUNTIME_DIR_NAME}/${BINARY_NAME}"
+else
+    mv "${WORK_DIR}/${ARCHIVE_ROOT_DIR}" "${LAYER_ROOT}/${RUNTIME_DIR_NAME}"
+fi
 
 mkdir -p "${LAYER_ROOT}/${HELPER_INSTALL_DIR}"
 cp -R "${HELPER_SOURCE}" "${LAYER_ROOT}/${HELPER_INSTALL_DIR}/"
