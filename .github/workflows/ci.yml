@@ -6,8 +6,15 @@ on:
       - main
   pull_request:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
+
+env:
+  GRYPE_VERSION: v0.98.0
 
 jobs:
   prepare-matrix:
@@ -23,9 +30,29 @@ jobs:
       - id: matrix
         run: echo "matrix=$(python3 tools/runtime_lib/runtime_manifest.py matrix)" >> "$GITHUB_OUTPUT"
 
+  repo-checks:
+    if: ${{ !(github.event_name == 'pull_request' && github.actor == 'dependabot[bot]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Validate manifests
+        run: bash tools/bin/validate-runtimes
+      - name: Validate shell scripts
+        run: bash -n tools/bin/*.sh
+      - name: Validate Python sources
+        run: |
+          for runtime in $(python3 tools/runtime_lib/runtime_manifest.py list); do
+            bash tools/bin/check-runtime "${runtime}" x86_64
+          done
+
   runtime-checks:
     if: ${{ !(github.event_name == 'pull_request' && github.actor == 'dependabot[bot]') }}
-    needs: prepare-matrix
+    needs:
+      - prepare-matrix
+      - repo-checks
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -35,35 +62,54 @@ jobs:
       BUILD_BEST_EFFORT_AUDIT: "0"
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-      - name: Install SAM CLI
-        run: pip install --quiet aws-sam-cli
       - name: Prepare cache directories
         run: |
           echo "DOWNLOAD_CACHE_DIR=${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads" >> "$GITHUB_ENV"
+          echo "GRYPE_INSTALL_DIR=${RUNNER_TEMP}/grype/bin" >> "$GITHUB_ENV"
           mkdir -p "${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads"
+          mkdir -p "${RUNNER_TEMP}/grype/bin"
       - name: Cache runtime downloads
         uses: actions/cache@v5
         with:
           path: ${{ env.DOWNLOAD_CACHE_DIR }}
           key: downloads-${{ runner.os }}-${{ matrix.runtime }}-${{ matrix.arch }}-${{ hashFiles(format('runtimes/{0}/runtime.json', matrix.runtime), format('runtimes/{0}/checksums/**', matrix.runtime)) }}
-      - name: Install shell tooling
-        run: sudo apt-get update && sudo apt-get install -y shellcheck zip unzip
+      - name: Cache Grype binary
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.GRYPE_INSTALL_DIR }}
+          key: grype-binary-${{ env.GRYPE_VERSION }}
+      - name: Cache Grype database
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/grype
+          key: grype-db-${{ runner.os }}-${{ env.GRYPE_VERSION }}
+          restore-keys: |
+            grype-db-${{ runner.os }}-
       - name: Install Grype
-        run: curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
-      - name: Validate manifests
-        run: bash tools/bin/validate-runtimes
-      - name: Validate shell scripts
         run: |
-          bash -n tools/bin/*.sh
-      - name: Validate Python sources
-        run: bash tools/bin/check-runtime "${{ matrix.runtime }}" "${{ matrix.arch }}"
+          if [[ ! -x "${GRYPE_INSTALL_DIR}/grype" ]]; then
+            curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b "${GRYPE_INSTALL_DIR}" "${GRYPE_VERSION}"
+          fi
+          echo "${GRYPE_INSTALL_DIR}" >> "$GITHUB_PATH"
+      - name: Install archive tooling
+        run: sudo apt-get update && sudo apt-get install -y zip unzip
       - name: Build runtime package
         run: make build RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Audit runtime package
         run: bash tools/bin/audit-runtime "${{ matrix.runtime }}" "${{ matrix.arch }}"
+      - name: Install SAM CLI
+        if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+      - name: Install SAM CLI dependencies
+        if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke
+        run: pip install -r requirements-ci.txt
+      - name: Warm SAM build image
+        if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke
+        run: docker pull public.ecr.aws/sam/build-provided.al2023:latest
       - name: Build local SAM example
         if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke
         run: make local-build RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
@@ -71,7 +117,9 @@ jobs:
         if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke
         run: make local-invoke RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Upload runtime artifact
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.runtime }}-${{ matrix.arch }}-artifact
           path: ${{ runner.temp }}/lambda-runtime-monorepo/${{ matrix.runtime }}/${{ matrix.arch }}/artifacts/*.zip
+          retention-days: 7
