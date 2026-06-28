@@ -110,17 +110,17 @@ jobs:
           mkdir -p "${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads"
           mkdir -p "${RUNNER_TEMP}/grype/bin"
       - name: Cache runtime downloads
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ env.DOWNLOAD_CACHE_DIR }}
           key: downloads-${{ runner.os }}-${{ matrix.runtime }}-${{ matrix.arch }}-${{ hashFiles(format('runtimes/{0}/runtime.json', matrix.runtime), format('runtimes/{0}/checksums/**', matrix.runtime)) }}
       - name: Cache Grype binary
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ${{ env.GRYPE_INSTALL_DIR }}
           key: grype-binary-${{ env.GRYPE_VERSION }}
       - name: Cache Grype database
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/grype
           key: grype-db-${{ runner.os }}-${{ env.GRYPE_VERSION }}
