@@ -24,7 +24,7 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - id: matrix
@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
       - name: Validate manifests
@@ -99,7 +99,7 @@ jobs:
         run: bash tools/bin/audit-runtime "${{ matrix.runtime }}" "${{ matrix.arch }}"
       - name: Install SAM CLI
         if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
           cache: pip
