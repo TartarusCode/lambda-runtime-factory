@@ -21,6 +21,18 @@ Family defaults live in `tools/runtime_lib/runtime_manifest.py` (`RUNTIME_FAMILY
 
 Official downloads from `downloads.python.org/pypy` (portable Linux builds; the `portable-pypy` family name is historical).
 
+## GraalPy (`graalpy312`, `graalpy313`, family `graalpy`)
+
+- **Python version in assets**: Release archives embed the Python version in the name — `graalpy3.12-{ver}-{arch}.tar.gz` (3.12), `graalpy3.13-{ver}-{arch}.tar.gz` (3.13). Pre-25.1 releases used `graalpy-{ver}-{arch}.tar.gz` (Python 3.12). The 3.12 line ends at `25.2.4`; 3.13 is separate.
+- **Manifest**: each runtime stores its `python_version` (e.g. `"3.13"`); the `graalpy` family uses `{python_version}` in `archive_name`, `archive_url`, `archive_root_dir`, `checksum_name`, `package_name`, and `helper_install_dir` (`graalpy/lib/python{python_version}/site-packages`).
+- **Bumping**: `bump_version.py` resolves archive/checksum names with the runtime's `python_version`. `check-latest-graalpy(python_version)` lists GitHub releases (`/releases?per_page=100`) and filters to assets matching that Python version, so a 3.12 runtime never bumps to a 3.13 release.
+- **Bootstrap**: both runtimes set `/opt/graalpy/lib/python{python_version}/site-packages` on `sys.path`.
+
+## Test infrastructure
+
+- `tools/runtime_lib/tests/` holds pytest behavior tests (imports via `conftest.py` sys.path shim). Run with `make test` / `python3 -m pytest tools/runtime_lib/tests -q`.
+- `ci.yml` `repo-checks` installs `pytest pytest-mock` and runs the suite.
+
 ## CI / audit
 
 - **Workflow layout** (`ci.yml`): `repo-checks` runs validate/bash-n/check once; `runtime-checks` matrix builds and audits per runtime×arch. Release workflow mirrors download + Grype caches only.

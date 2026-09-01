@@ -1,0 +1,4 @@
+# GraalPy ships its documentation source tree with Ruby/Jekyll dependencies.
+# These are doc-build artifacts, not runtime components.
+exclude:
+  - "**/graalpy/docs/**"

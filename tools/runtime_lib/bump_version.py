@@ -113,16 +113,22 @@ CHECKSUM_FETCHERS = {
 }
 
 
-def resolve_archive_name(runtime_family: str, version: str, arch: str) -> str:
+def resolve_archive_name(
+    runtime_family: str, version: str, arch: str, python_version: str = ""
+) -> str:
     """Build the archive filename for a given family, version, and architecture."""
     family = RUNTIME_FAMILY_DEFAULTS[runtime_family]
     arch_slug = family["arch_map"][arch]
     template = family["artifact"]["checksum_name"]
-    return template.format(distribution_version=version, arch_slug=arch_slug)
+    return template.format(
+        distribution_version=version,
+        arch_slug=arch_slug,
+        python_version=python_version,
+    )
 
 
 def fetch_checksums(
-    runtime_family: str, version: str
+    runtime_family: str, version: str, python_version: str = ""
 ) -> List[Tuple[str, str]]:
     """Fetch checksums for all architectures. Returns [(hash, archive_name), ...]."""
     fetcher = CHECKSUM_FETCHERS.get(runtime_family)
@@ -131,7 +137,9 @@ def fetch_checksums(
 
     results = []
     for arch in SUPPORTED_ARCHS:
-        archive_name = resolve_archive_name(runtime_family, version, arch)
+        archive_name = resolve_archive_name(
+            runtime_family, version, arch, python_version=python_version
+        )
         print(f"  Fetching checksum for {archive_name} ...")
         sha = fetcher(version, archive_name)
         results.append((sha, archive_name))
@@ -147,13 +155,16 @@ def bump_runtime(runtime_id: str, new_version: str, *, dry_run: bool = False) ->
     raw = json.loads(manifest_path.read_text(encoding="utf-8"))
     old_version = raw["distribution_version"]
     runtime_family = raw["runtime_family"]
+    python_version = raw.get("python_version", "")
 
     if old_version == new_version:
         print(f"{runtime_id}: already at version {new_version}")
         return
 
     print(f"{runtime_id}: {old_version} -> {new_version}")
-    checksums = fetch_checksums(runtime_family, new_version)
+    checksums = fetch_checksums(
+        runtime_family, new_version, python_version=python_version
+    )
 
     if dry_run:
         print("  (dry run — no files modified)")
@@ -201,13 +212,43 @@ def check_latest_deno() -> Optional[str]:
     return tag.removeprefix("v") if tag else None
 
 
-def check_latest_graalpy() -> Optional[str]:
+def _graalpy_python_version(asset_names: List[str]) -> Optional[str]:
+    """Infer the GraalPy Python version from release asset names."""
+    for name in asset_names:
+        if name.startswith("graalpy3."):
+            return name[len("graalpy") :].split("-", 1)[0]
+        if name.startswith("graalpy-"):
+            return "3.12"
+    return None
+
+
+def _graalpy_is_newer(version: str, latest: str) -> bool:
+    """Return whether version is newer than latest using numeric comparison."""
+    try:
+        version_parts = tuple(int(p) for p in version.split("."))
+        latest_parts = tuple(int(p) for p in latest.split("."))
+    except ValueError:
+        return False
+    return version_parts > latest_parts
+
+
+def check_latest_graalpy(python_version: str) -> Optional[str]:
     data = json.loads(_http_get(
-        "https://api.github.com/repos/oracle/graalpython/releases/latest",
+        "https://api.github.com/repos/oracle/graalpython/releases?per_page=100",
         accept="application/vnd.github+json",
     ))
-    tag = data.get("tag_name", "")
-    return tag.removeprefix("graal-") if tag else None
+    latest: Optional[str] = None
+    for release in data:
+        tag = release.get("tag_name", "")
+        if not tag.startswith("graal-"):
+            continue
+        asset_names = [asset.get("name", "") for asset in release.get("assets", [])]
+        if _graalpy_python_version(asset_names) != python_version:
+            continue
+        version = tag.removeprefix("graal-")
+        if latest is None or _graalpy_is_newer(version, latest):
+            latest = version
+    return latest
 
 
 def check_latest_rust() -> Optional[str]:
@@ -263,7 +304,10 @@ def check_updates(runtime_ids: Optional[List[str]] = None) -> Dict[str, Tuple[st
 
         print(f"{runtime_id}: checking for updates (current: {current}) ...")
         try:
-            latest = checker()
+            if family == "graalpy":
+                latest = check_latest_graalpy(raw.get("python_version", ""))
+            else:
+                latest = checker()
         except Exception as exc:
             print(f"  Failed to check: {exc}")
             continue

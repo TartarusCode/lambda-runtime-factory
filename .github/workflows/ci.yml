@@ -47,6 +47,10 @@ jobs:
           for runtime in $(python3 tools/runtime_lib/runtime_manifest.py list); do
             bash tools/bin/check-runtime "${runtime}" x86_64
           done
+      - name: Run runtime_lib tests
+        run: |
+          pip install pytest pytest-mock
+          python3 -m pytest tools/runtime_lib/tests -q
 
   runtime-checks:
     if: ${{ !(github.event_name == 'pull_request' && github.actor == 'dependabot[bot]') }}

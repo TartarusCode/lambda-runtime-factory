@@ -1,9 +1,9 @@
 {
-  "runtime_id": "graalpy312",
+  "runtime_id": "graalpy313",
   "runtime_family": "graalpy",
-  "display_name": "GraalPy 3.12",
-  "distribution_version": "25.2.4",
-  "python_version": "3.12",
+  "display_name": "GraalPy 3.13",
+  "distribution_version": "25.3.4.1",
+  "python_version": "3.13",
   "artifact": {
     "checksum_file": "checksums/graalpy.sha256"
   },

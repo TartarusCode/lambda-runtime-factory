@@ -1,6 +1,7 @@
 build/
 dist/
 .aws-sam/
+.venv-test/
 template.local.yaml
 template.local.yml
 event.json

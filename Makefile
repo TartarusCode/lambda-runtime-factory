@@ -9,13 +9,16 @@ DEV_BUILD_ENV := BUILD_BEST_EFFORT_AUDIT=0
 
 all: validate-runtimes build
 
-.PHONY: all list-runtimes validate-runtimes check build build-all build-all-arches audit audit-all upload upload-all publish publish-all publicize publicize-all latest latest-all unpublish create-buckets local-build local-invoke clean shell check-updates bump bump-latest
+.PHONY: all list-runtimes validate-runtimes check build build-all build-all-arches audit audit-all upload upload-all publish publish-all publicize publicize-all latest latest-all unpublish create-buckets local-build local-invoke clean shell check-updates bump bump-latest test
 
 list-runtimes:
 	python3 tools/runtime_lib/runtime_manifest.py list
 
 validate-runtimes:
 	bash tools/bin/validate-runtimes
+
+test:
+	python3 -m pytest tools/runtime_lib/tests -q
 
 check:
 	bash tools/bin/check-runtime "$(RUNTIME)" "$(ARCH)"

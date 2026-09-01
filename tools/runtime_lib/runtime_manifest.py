@@ -103,19 +103,19 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "arm64": "linux-aarch64",
         },
         "artifact": {
-            "archive_name": "graalpy-{distribution_version}-{arch_slug}.tar.gz",
-            "archive_url": "https://github.com/oracle/graalpython/releases/download/graal-{distribution_version}/graalpy-{distribution_version}-{arch_slug}.tar.gz",
-            "archive_root_dir": "graalpy-{distribution_version}-{arch_slug}",
+            "archive_name": "graalpy{python_version}-{distribution_version}-{arch_slug}.tar.gz",
+            "archive_url": "https://github.com/oracle/graalpython/releases/download/graal-{distribution_version}/graalpy{python_version}-{distribution_version}-{arch_slug}.tar.gz",
+            "archive_root_dir": "graalpy{python_version}-{distribution_version}-{arch_slug}",
             "runtime_dir_name": "graalpy",
-            "package_name": "graalpy-{distribution_version}-{arch}.zip",
+            "package_name": "graalpy{python_version}-{distribution_version}-{arch}.zip",
             "checksum_file": "checksums/graalpy.sha256",
-            "checksum_name": "graalpy-{distribution_version}-{arch_slug}.tar.gz",
+            "checksum_name": "graalpy{python_version}-{distribution_version}-{arch_slug}.tar.gz",
         },
         "layout": {
             "bootstrap": "bootstrap/bootstrap.py3",
             "bootstrap_output": "bootstrap",
             "helper_source": "helpers/lambda_runtime_graalpy",
-            "helper_install_dir": "graalpy/lib/python3.12/site-packages",
+            "helper_install_dir": "graalpy/lib/python{python_version}/site-packages",
         },
     },
     "go-toolchain": {
@@ -238,6 +238,7 @@ def _apply_defaults(runtime_id: str, data: Dict[str, Any], arch: str = DEFAULT_A
         "runtime_id": runtime_id,
         "distribution_version": merged.get("distribution_version", ""),
         "display_name": merged.get("display_name", runtime_id),
+        "python_version": merged.get("python_version", ""),
         "arch": arch,
         "arch_slug": arch_slug,
     }
