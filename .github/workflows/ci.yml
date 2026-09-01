@@ -81,7 +81,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ${{ env.GRYPE_INSTALL_DIR }}
-          key: grype-binary-${{ env.GRYPE_VERSION }}
+          key: grype-binary-${{ runner.os }}-${{ matrix.runner }}-${{ env.GRYPE_VERSION }}
       - name: Cache Grype database
         uses: actions/cache@v6
         with:

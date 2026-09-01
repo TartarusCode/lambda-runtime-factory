@@ -2,7 +2,7 @@
   "runtime_id": "go126",
   "runtime_family": "go-toolchain",
   "display_name": "Go 1.x",
-  "distribution_version": "1.26.4",
+  "distribution_version": "1.26.7",
   "version_line": "1.26",
   "artifact": {
     "checksum_file": "checksums/go.sha256"
