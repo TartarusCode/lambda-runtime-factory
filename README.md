@@ -32,11 +32,17 @@ tools/
 Implemented runtimes:
 
 - `pypy311` — PyPy 3.11 (portable Linux builds from python.org)
-- `graalpy312` — GraalPython
-- `bun13` — Bun 1.x
-- `deno28` — Deno 2.x (`provided.al2023` layer; bootstrap runs `deno` with sandbox flags for the Runtime API)
-- `go126` — Go toolchain layer
-- `rust194` — Rust musl toolchain layer
+- `graalpy312` — GraalPy 3.12
+- `graalpy313` — GraalPy 3.13
+- `bun13` — Bun 1.3.x
+- `bun14` — Bun 1.4.x
+- `deno29` — Deno 2.9.x (`provided.al2023` layer; bootstrap runs `deno` with sandbox flags for the Runtime API)
+- `go126` — Go 1.26.x toolchain layer
+- `go127` — Go 1.27.x toolchain layer
+- `rust194` — Rust 1.96.x musl toolchain layer
+- `rust198` — Rust 1.98.x musl toolchain layer
+
+Runtimes for line-based frameworks (bun/deno/go/rust) are named `<framework><major><minor>` and each tracks a single `version_line` (e.g. `go126` tracks `1.26`). Minor-line updates create a new runtime rather than mutating an existing one; patch updates stay on the same runtime.
 
 The shared tooling is intentionally runtime-agnostic so additional runtimes can be added without reworking the root build and release flow.
 
@@ -71,7 +77,7 @@ Build a specific runtime:
 
 ```bash
 make build RUNTIME=pypy311
-make build RUNTIME=deno28
+make build RUNTIME=deno29
 ```
 
 Audit a built runtime:
@@ -164,6 +170,24 @@ make build RUNTIME=<runtime-id>
 
 5. Add or adapt runtime-specific examples under `runtimes/<runtime-id>/examples/`.
 6. Add or update CI expectations if the runtime needs extra validation steps beyond the shared defaults.
+
+## Auto-adding new version lines
+
+For `bun`/`deno`/`go`/`rust`, when an upstream release lands on a version line newer than
+any tracked runtime, the `check` command reports it in its `new_lines` output and
+`bump-latest` automatically creates the new runtime directory:
+
+```bash
+python3 tools/runtime_lib/bump_version.py check --json
+# {"outdated": {...}, "new_lines": {"go-toolchain": {"id": "go127", "line": "1.27", "version": "1.27.0"}}}
+
+python3 tools/runtime_lib/bump_version.py bump-latest
+```
+
+The new runtime is cloned from the newest existing runtime of the same family, its
+`runtime.json` is rewritten for the new `version_line`, and checksums are fetched from
+upstream. The weekly `/check-runtime-updates` workflow opens a single PR covering both
+same-line patch bumps and new-line additions.
 
 ## PyPy Notes
 

@@ -1,4 +1,4 @@
-RUNTIME := deno28
+RUNTIME := deno29
 
 package:
 	sam package \

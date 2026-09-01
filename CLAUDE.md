@@ -8,13 +8,21 @@ Monorepo of AWS Lambda **layer** packages for `provided.al2023`. Each runtime un
 
 Family defaults live in `tools/runtime_lib/runtime_manifest.py` (`RUNTIME_FAMILY_DEFAULTS`). Version bumps: `python3 tools/runtime_lib/bump_version.py bump <runtime> <version>` or weekly `check` / `bump-latest` workflow.
 
-## Deno (`deno28`, family `deno`)
+## Version lines (bun / deno / go / rust)
+
+- Runtimes track a `version_line` (major.minor) in `runtime.json`; ids are `<framework><major><minor>` (e.g. `go126` = line `1.26`).
+- Same-line patch bumps happen in place; **new minor lines create a new runtime dir** instead of mutating an existing one.
+- `bump_version.py`: `LINE_FAMILIES` maps family → id prefix; `check_latest_*(version_line)` filter to a line; `detect_new_lines()` finds untracked upstream lines; `add_runtime_line(family, version)` clones the newest same-family dir and rewrites `runtime.json` + example files + checksums.
+- `check --json` emits `{"outdated": {...}, "new_lines": {...}}`; `bump-latest` bumps `outdated` then auto-adds `new_lines`. Weekly `check-updates.yml` opens one PR for both.
+- `rust` family channel is TOML: only the `[pkg.rust]` section has the real version (arch/components sub-sections appear later and may contain `version = ""`).
+
+## Deno (`deno29`, family `deno`)
 
 - **Upstream**: GitHub `denoland/deno` release zips `deno-{arch}-unknown-linux-gnu.zip` (flat zip: single `deno` binary at root, not a directory like Bun).
 - **Build**: `artifact.binary_name` in the `deno` family triggers flat-binary layout in `tools/bin/build-runtime` — binary lands at `deno/deno` under the layer so `deno/lib` can hold the helper.
 - **Bootstrap**: `deno run --allow-net --allow-env --allow-read="${LAMBDA_TASK_ROOT},/opt/deno/lib"` then `runtime.ts` (Runtime API loop, same contract as Bun).
 - **Handler import**: Deno requires a file extension; `runtime.ts` resolves `hello.handler` to `${LAMBDA_TASK_ROOT}/hello.ts` (Bun does not need this).
-- **Runtime id**: `deno28` = Deno 2.8.x line; bump `distribution_version` without `v` prefix (URLs use `v{distribution_version}`).
+- **Runtime id**: `deno29` = Deno 2.9.x line; bump `distribution_version` without `v` prefix (URLs use `v{distribution_version}`).
 - **Checksums**: per-arch `{archive}.zip.sha256sum` on the release page; fetcher in `bump_version.py` (`_fetch_checksum_deno`).
 
 ## PyPy

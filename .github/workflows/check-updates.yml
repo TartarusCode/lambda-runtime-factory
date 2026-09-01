@@ -40,19 +40,21 @@ jobs:
           lines = text.splitlines()
           start = next((i for i, l in enumerate(lines) if l.strip().startswith("{")), None)
           end = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].strip().startswith("}")), None)
+          data = {}
           if start is not None and end is not None:
               data = json.loads("\n".join(lines[start:end + 1]))
-          else:
-              data = {}
+          outdated = data.get("outdated", {})
+          new_lines = data.get("new_lines", {})
           output = open(os.environ["GITHUB_OUTPUT"], "a")
-          if data:
-              json.dump(data, open(os.environ["RUNNER_TEMP"] + "/updates.json", "w"))
+          if outdated or new_lines:
+              json.dump({"outdated": outdated, "new_lines": new_lines},
+                        open(os.environ["RUNNER_TEMP"] + "/updates.json", "w"))
               output.write("outdated=true\n")
           else:
               output.write("outdated=false\n")
           PYCHECK
 
-      - name: Bump outdated runtimes
+      - name: Bump outdated runtimes and add new lines
         if: steps.check.outputs.outdated == 'true'
         run: |
           args=(bump-latest)
@@ -70,8 +72,14 @@ jobs:
           updates = json.load(open(tmp + "/updates.json"))
           lines = ["## Runtime Version Bumps", "",
                    "The following runtimes were updated to their latest upstream versions:", ""]
-          for rid, info in sorted(updates.items()):
-              lines.append(f"- **{rid}**: {info['current']} \u2192 {info['latest']}")
+          for rid, info in sorted(updates.get("outdated", {}).items()):
+              lines.append(f"- **{rid}**: {info['current']} → {info['latest']}")
+          new_lines = updates.get("new_lines", {})
+          if new_lines:
+              lines += ["", "## New Runtime Lines", "",
+                        "New runtime packages were created for newly available version lines:", ""]
+              for family, info in sorted(new_lines.items()):
+                  lines.append(f"- **{info['id']}**: new {family} line {info['line']} at version {info['version']}")
           lines += ["", "Checksums were fetched from the official upstream release channels.",
                     "", "## Test Plan",
                     "- [ ] CI validates manifests and checksums",
@@ -85,9 +93,9 @@ jobs:
         uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "chore: bump runtime distribution versions"
+          commit-message: "chore: bump runtime distribution versions and add new lines"
           branch: automated/bump-runtime-versions
           delete-branch: true
-          title: "chore: bump runtime distribution versions"
+          title: "chore: bump runtime distribution versions and add new lines"
           body-path: ${{ runner.temp }}/pr_body.txt
           labels: dependencies,automated

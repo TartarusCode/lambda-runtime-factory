@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
 import sys
 import tempfile
 import urllib.request
@@ -186,30 +187,209 @@ def bump_runtime(runtime_id: str, new_version: str, *, dry_run: bool = False) ->
     print(f"  Updated {checksum_path}")
 
 
-def check_latest_go() -> Optional[str]:
+def _version_tuple(version: str) -> Optional[List[int]]:
+    """Parse a dotted version string into ints, or None if malformed."""
+    parts = version.split(".")
+    if not parts or any(not part.isdigit() for part in parts):
+        return None
+    return [int(part) for part in parts]
+
+
+def _same_line(version: str, line: str) -> bool:
+    """Return whether version belongs to the major.minor line."""
+    version_parts = _version_tuple(version)
+    line_parts = _version_tuple(line)
+    if version_parts is None or line_parts is None:
+        return False
+    return version_parts[0:2] == line_parts[0:2]
+
+
+def _version_line_of(version: str) -> str:
+    """Return the major.minor line for a dotted version, or '' if malformed."""
+    parts = _version_tuple(version)
+    if parts is None or len(parts) < 2:
+        return ""
+    return f"{parts[0]}.{parts[1]}"
+
+
+LINE_FAMILIES: Dict[str, str] = {
+    "bun": "bun",
+    "deno": "deno",
+    "go-toolchain": "go",
+    "rust-musl": "rust",
+}
+
+
+def _new_line_id(family: str, version: str) -> str:
+    """Derive a runtime id for a new version line, e.g. ('go', '1.27.0') -> 'go127'."""
+    prefix = LINE_FAMILIES[family]
+    line = _version_line_of(version)
+    if not line:
+        raise ValueError(f"Cannot derive line id from version '{version}' for family '{family}'")
+    return f"{prefix}{line.replace('.', '')}"
+
+
+def _new_display_name(family: str, version: str) -> str:
+    """Derive a display name for a new version line, e.g. ('go-toolchain', '1.27.0') -> 'Go 1.27'."""
+    prefix = LINE_FAMILIES[family]
+    label = "Go" if prefix == "go" else prefix.capitalize()
+    line = _version_line_of(version)
+    if not line:
+        raise ValueError(f"Cannot derive display name from version '{version}' for family '{family}'")
+    return f"{label} {line}"
+
+
+def detect_new_lines() -> Dict[str, Dict[str, str]]:
+    """Return new version lines available upstream but not tracked by any runtime.
+
+    Returns {runtime_family: {'id', 'line', 'version'}}. Only line-based families
+    (bun/deno/go/rust) are considered; graalpy and pypy use their own schemes.
+    """
+    existing_lines = {
+        (raw["runtime_family"], raw.get("version_line", ""))
+        for runtime_id in list_runtime_ids()
+        for raw in [json.loads(runtime_manifest_path(runtime_id).read_text(encoding="utf-8"))]
+        if raw.get("version_line")
+    }
+
+    new_lines: Dict[str, Dict[str, str]] = {}
+    for family in LINE_FAMILIES:
+        checker = LATEST_CHECKERS.get(family)
+        if checker is None:
+            continue
+        try:
+            latest = checker("")
+        except Exception as exc:
+            print(f"{family}: failed to check latest: {exc}")
+            continue
+        if not latest:
+            continue
+        line = _version_line_of(latest)
+        if not line or (family, line) in existing_lines:
+            continue
+        new_lines[family] = {
+            "id": _new_line_id(family, latest),
+            "line": line,
+            "version": latest,
+        }
+    return new_lines
+
+
+def add_runtime_line(family: str, version: str, *, dry_run: bool = False) -> str:
+    """Create a runtime directory for a new version line by cloning the newest same-family runtime."""
+    new_id = _new_line_id(family, version)
+    dest = runtimes_root() / new_id
+    if dest.exists():
+        print(f"{new_id}: already exists")
+        return new_id
+
+    if dry_run:
+        print(f"  (dry run) would create {new_id} at version {version} (line {_version_line_of(version)})")
+        return new_id
+
+    family_runtimes = [
+        (runtime_id, json.loads(runtime_manifest_path(runtime_id).read_text(encoding="utf-8")))
+        for runtime_id in list_runtime_ids()
+        if json.loads(runtime_manifest_path(runtime_id).read_text(encoding="utf-8")).get("runtime_family") == family
+    ]
+    if not family_runtimes:
+        raise ValueError(f"No existing runtime for family '{family}' to clone from")
+
+    source_id = max(family_runtimes, key=lambda item: _version_tuple(item[1]["distribution_version"]) or [0])[0]
+
+    shutil.copytree(runtimes_root() / source_id, dest)
+    print(f"{source_id} -> {new_id}: cloned runtime directory")
+
+    manifest_path = dest / "runtime.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["runtime_id"] = new_id
+    manifest["distribution_version"] = version
+    manifest["version_line"] = _version_line_of(version)
+    manifest["display_name"] = _new_display_name(family, version)
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    for rel in ("examples/sam/Makefile", "examples/sls/serverless.yml"):
+        path = dest / rel
+        if path.exists():
+            text = path.read_text(encoding="utf-8").replace(source_id, new_id)
+            path.write_text(text, encoding="utf-8")
+
+    checksums = fetch_checksums(family, version)
+    checksum_rel = manifest.get("artifact", {}).get("checksum_file", "")
+    if not checksum_rel:
+        raise ValueError(f"Manifest for {new_id} has no artifact.checksum_file")
+    checksum_path = dest / checksum_rel
+    checksum_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [f"{sha}  {name}\n" for sha, name in checksums]
+    checksum_path.write_text("".join(lines), encoding="utf-8")
+
+    print(f"  Created {new_id} at version {version} (line {_version_line_of(version)})")
+    return new_id
+
+
+def check_latest_go(version_line: str = "") -> Optional[str]:
     data = json.loads(_http_get_text("https://go.dev/dl/?mode=json"))
+    recent: Optional[str] = None
+    recent_tuple: Optional[List[int]] = None
     for release in data:
-        if release["stable"]:
-            return release["version"].removeprefix("go")
-    return None
+        if not release["stable"]:
+            continue
+        version = release["version"].removeprefix("go")
+        version_parts = _version_tuple(version)
+        if version_parts is None:
+            continue
+        if version_line and not _same_line(version, version_line):
+            continue
+        if recent_tuple is None or version_parts > recent_tuple:
+            recent = version
+            recent_tuple = version_parts
+    return recent
 
 
-def check_latest_bun() -> Optional[str]:
+def check_latest_bun(version_line: str = "") -> Optional[str]:
     data = json.loads(_http_get(
-        "https://api.github.com/repos/oven-sh/bun/releases/latest",
+        "https://api.github.com/repos/oven-sh/bun/releases?per_page=100",
         accept="application/vnd.github+json",
     ))
-    tag = data.get("tag_name", "")
-    return tag.removeprefix("bun-v") if tag else None
+    recent: Optional[str] = None
+    recent_tuple: Optional[List[int]] = None
+    for release in data:
+        tag = release.get("tag_name", "")
+        if not tag.startswith("bun-v"):
+            continue
+        version = tag.removeprefix("bun-v")
+        version_parts = _version_tuple(version)
+        if version_parts is None:
+            continue
+        if version_line and not _same_line(version, version_line):
+            continue
+        if recent_tuple is None or version_parts > recent_tuple:
+            recent = version
+            recent_tuple = version_parts
+    return recent
 
 
-def check_latest_deno() -> Optional[str]:
+def check_latest_deno(version_line: str = "") -> Optional[str]:
     data = json.loads(_http_get(
-        "https://api.github.com/repos/denoland/deno/releases/latest",
+        "https://api.github.com/repos/denoland/deno/releases?per_page=100",
         accept="application/vnd.github+json",
     ))
-    tag = data.get("tag_name", "")
-    return tag.removeprefix("v") if tag else None
+    recent: Optional[str] = None
+    recent_tuple: Optional[List[int]] = None
+    for release in data:
+        tag = release.get("tag_name", "")
+        if not tag.startswith("v"):
+            continue
+        version = tag.removeprefix("v")
+        version_parts = _version_tuple(version)
+        if version_parts is None:
+            continue
+        if version_line and not _same_line(version, version_line):
+            continue
+        if recent_tuple is None or version_parts > recent_tuple:
+            recent = version
+            recent_tuple = version_parts
+    return recent
 
 
 def _graalpy_python_version(asset_names: List[str]) -> Optional[str]:
@@ -251,20 +431,31 @@ def check_latest_graalpy(python_version: str) -> Optional[str]:
     return latest
 
 
-def check_latest_rust() -> Optional[str]:
+def check_latest_rust(version_line: str = "") -> Optional[str]:
     channel = _http_get_text("https://static.rust-lang.org/dist/channel-rust-stable.toml")
-    in_pkg_rust = False
-    for line in channel.splitlines():
-        stripped = line.strip()
-        if stripped == "[pkg.rust]":
-            in_pkg_rust = True
+    latest: Optional[str] = None
+    latest_tuple: Optional[List[int]] = None
+    in_rust = False
+    for raw_line in channel.splitlines():
+        line = raw_line.strip()
+        if line == "[pkg.rust]":
+            in_rust = True
             continue
-        if in_pkg_rust and stripped.startswith("version"):
-            raw = stripped.split("=", 1)[1].strip().strip('"')
-            return raw.split()[0]
-        if stripped.startswith("[") and in_pkg_rust:
-            break
-    return None
+        if line.startswith("[pkg.rust.") or line.startswith("[[pkg.rust."):
+            in_rust = False
+            continue
+        if in_rust and line.startswith("version"):
+            raw = line.split("=", 1)[1].strip().strip('"')
+            version = raw.split()[0]
+            version_parts = _version_tuple(version)
+            if version_parts is None:
+                continue
+            if version_line and not _same_line(version, version_line):
+                continue
+            if latest_tuple is None or version_parts > latest_tuple:
+                latest = version
+                latest_tuple = version_parts
+    return latest
 
 
 def check_latest_pypy() -> Optional[str]:
@@ -304,16 +495,25 @@ def check_updates(runtime_ids: Optional[List[str]] = None) -> Dict[str, Tuple[st
 
         print(f"{runtime_id}: checking for updates (current: {current}) ...")
         try:
+            version_line = raw.get("version_line", "")
             if family == "graalpy":
                 latest = check_latest_graalpy(raw.get("python_version", ""))
-            else:
+            elif family == "portable-pypy":
                 latest = checker()
+            else:
+                latest = checker(version_line)
         except Exception as exc:
             print(f"  Failed to check: {exc}")
             continue
 
         if latest is None:
-            print(f"  Could not determine latest version")
+            if version_line:
+                print(
+                    f"  No newer version on line {version_line} "
+                    f"(current: {current}) — new major/minor requires a new runtime"
+                )
+            else:
+                print(f"  Could not determine latest version")
             continue
 
         if latest == current:
@@ -323,6 +523,35 @@ def check_updates(runtime_ids: Optional[List[str]] = None) -> Dict[str, Tuple[st
             outdated[runtime_id] = (current, latest)
 
     return outdated
+
+
+def check_and_report_new_lines(
+    runtime_ids: Optional[List[str]] = None,
+) -> Tuple[Dict[str, Tuple[str, str]], Dict[str, Dict[str, str]]]:
+    """Return (outdated, new_lines) for the given runtimes."""
+    outdated = check_updates(runtime_ids)
+    if runtime_ids is not None:
+        new_lines: Dict[str, Dict[str, str]] = {}
+    else:
+        new_lines = detect_new_lines()
+    return outdated, new_lines
+
+
+def bump_latest_all(runtime_ids: Optional[List[str]] = None, *, dry_run: bool = False) -> None:
+    """Bump all outdated runtimes and add any new version lines."""
+    outdated, new_lines = check_and_report_new_lines(runtime_ids)
+
+    if not outdated and not new_lines:
+        print("\nNothing to bump.")
+        return
+
+    for runtime_id, (current, latest) in outdated.items():
+        print(f"\nBumping {runtime_id} ...")
+        bump_runtime(runtime_id, latest, dry_run=dry_run)
+
+    for family, info in new_lines.items():
+        print(f"\nAdding new line {info['id']} ({family} {info['line']}) ...")
+        add_runtime_line(family, info["version"], dry_run=dry_run)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -357,27 +586,30 @@ def main() -> None:
 
     if args.command == "check":
         runtime_ids = [args.runtime] if args.runtime else None
-        outdated = check_updates(runtime_ids)
+        outdated, new_lines = check_and_report_new_lines(runtime_ids)
         if args.json:
             print(json.dumps(
-                {rid: {"current": cur, "latest": lat} for rid, (cur, lat) in outdated.items()},
+                {
+                    "outdated": {
+                        rid: {"current": cur, "latest": lat}
+                        for rid, (cur, lat) in outdated.items()
+                    },
+                    "new_lines": new_lines,
+                },
                 indent=2,
             ))
-        if not outdated:
+        if not outdated and not new_lines:
             print("\nAll runtimes are up to date.")
         else:
-            print(f"\n{len(outdated)} runtime(s) have updates available.")
+            if outdated:
+                print(f"\n{len(outdated)} runtime(s) have updates available.")
+            if new_lines:
+                print(f"\n{len(new_lines)} new runtime line(s) available.")
         return
 
     if args.command == "bump-latest":
         runtime_ids = [args.runtime] if args.runtime else None
-        outdated = check_updates(runtime_ids)
-        if not outdated:
-            print("\nNothing to bump.")
-            return
-        for runtime_id, (current, latest) in outdated.items():
-            print(f"\nBumping {runtime_id} ...")
-            bump_runtime(runtime_id, latest, dry_run=args.dry_run)
+        bump_latest_all(runtime_ids, dry_run=args.dry_run)
         return
 
     parser.error("Unhandled command")

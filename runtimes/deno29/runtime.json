@@ -1,8 +1,9 @@
 {
-  "runtime_id": "deno28",
+  "runtime_id": "deno29",
   "runtime_family": "deno",
-  "display_name": "Deno 2.x",
-  "distribution_version": "2.9.0",
+  "display_name": "Deno 2.9",
+  "distribution_version": "2.9.6",
+  "version_line": "2.9",
   "artifact": {
     "checksum_file": "checksums/deno.sha256"
   },
