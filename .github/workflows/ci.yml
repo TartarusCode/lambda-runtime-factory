@@ -51,6 +51,10 @@ jobs:
           for runtime in $(python3 tools/runtime_lib/runtime_manifest.py list); do
             bash tools/bin/check-runtime "${runtime}" x86_64
           done
+      - name: Validate upstream archive URLs
+        # A stale derived field (e.g. release_tag) resolves to a 404 the build
+        # only hits minutes later, per matrix cell. Catch it here instead.
+        run: python3 tools/runtime_lib/runtime_manifest.py validate --online
       - name: Run runtime_lib tests
         run: |
           pip install pytest pytest-mock

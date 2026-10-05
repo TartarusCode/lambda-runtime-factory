@@ -4,7 +4,6 @@
   "display_name": "GraalPy 3.13",
   "distribution_version": "25.4.4",
   "python_version": "3.13",
-  "release_tag": "25.3.4",
   "artifact": {
     "checksum_file": "checksums/graalpy.sha256"
   },

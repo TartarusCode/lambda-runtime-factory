@@ -260,6 +260,38 @@ def test_manifest_matrix_excludes_deprecated(fake_root: Path) -> None:
     assert runtime_manifest.list_runtime_ids() == ["bun13", "bun14"]
 
 
+def test_validate_archive_urls_reports_only_missing(
+    mocker: pytest.MockFixture, fake_root: Path
+) -> None:
+    """404/410 are failures; transient errors and 200s are not."""
+    _write_manifest(fake_root, "bun13", "bun", "1.3.14", version_line="1.3")
+    _write_manifest(fake_root, "bun14", "bun", "1.4.2", version_line="1.4")
+
+    mocker.patch.object(
+        runtime_manifest,
+        "_head_status",
+        side_effect=lambda url: 404 if "1.3.14" in url else (None if "1.4.2" in url else 200),
+    )
+
+    problems = runtime_manifest.validate_archive_urls(["bun13", "bun14"])
+
+    # One problem per architecture for the missing runtime; the 200/None ones pass.
+    assert len(problems) == 2
+    assert all("bun13/" in problem and "404" in problem for problem in problems)
+    assert {problem.split("/")[1].split(":")[0] for problem in problems} == {"x86_64", "arm64"}
+
+
+def test_validate_archive_urls_skips_deprecated_by_default(
+    mocker: pytest.MockFixture, fake_root: Path
+) -> None:
+    _write_manifest(fake_root, "bun13", "bun", "1.3.14", version_line="1.3", deprecated=True)
+    _write_manifest(fake_root, "bun14", "bun", "1.4.2", version_line="1.4")
+    mocker.patch.object(runtime_manifest, "_head_status", return_value=200)
+
+    # Deprecated runtimes are not built, so they must not red the online check.
+    assert runtime_manifest.validate_archive_urls() == []
+
+
 def test_check_updates_skips_deprecated_unless_named(
     mocker: pytest.MockFixture, fake_root: Path
 ) -> None:

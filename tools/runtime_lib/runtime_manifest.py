@@ -8,6 +8,8 @@ import os
 import shlex
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -455,6 +457,43 @@ def validate_runtime(runtime_id: str, arch: str = DEFAULT_ARCH) -> None:
             raise FileNotFoundError(f"Referenced path does not exist: {file_path}")
 
 
+def _head_status(url: str, timeout: int = 30) -> int | None:
+    """Return the HTTP status for a HEAD request, or None when unreachable."""
+    request = urllib.request.Request(
+        url, method="HEAD", headers={"User-Agent": "lambda-runtime-validate/1.0"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+    except Exception:
+        return None
+
+
+def validate_archive_urls(runtime_ids: Iterable[str] | None = None) -> List[str]:
+    """HEAD each runtime's archive_url and return definitive "missing" problems.
+
+    Only 404/410 count as failures — they prove the URL the build will request
+    does not exist (e.g. a derived field such as `release_tag` left stale). Any
+    other error is ignored so a transient network blip cannot flake the check.
+    """
+    ids = list(runtime_ids) if runtime_ids is not None else list_active_runtime_ids()
+    problems: List[str] = []
+    for runtime_id in ids:
+        for arch in SUPPORTED_ARCHS:
+            try:
+                data = load_runtime(runtime_id, arch=arch)
+            except Exception as exc:  # noqa: BLE001 - report, keep checking others
+                problems.append(f"{runtime_id}/{arch}: manifest invalid: {exc}")
+                continue
+            url = data["artifact"]["archive_url"]
+            status = _head_status(url)
+            if status in (404, 410):
+                problems.append(f"{runtime_id}/{arch}: {url} -> HTTP {status}")
+    return problems
+
+
 def compile_runtime_python(runtime_id: str) -> None:
     runtime_dir = runtimes_root() / runtime_id
     python_files = sorted(path for path in runtime_dir.rglob("*.py") if path.is_file())
@@ -514,6 +553,11 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("--runtime")
     validate_parser.add_argument("--arch", default=DEFAULT_ARCH)
+    validate_parser.add_argument(
+        "--online",
+        action="store_true",
+        help="Also HEAD each runtime's archive_url and fail on 404/410",
+    )
 
     env_parser = subparsers.add_parser("env")
     env_parser.add_argument("--runtime", required=True)
@@ -547,6 +591,12 @@ def main() -> None:
         for runtime_id in runtime_ids:
             for arch in SUPPORTED_ARCHS:
                 validate_runtime(runtime_id, arch=arch)
+        if args.online:
+            problems = validate_archive_urls(runtime_ids)
+            for problem in problems:
+                print(f"archive URL check failed: {problem}", file=sys.stderr)
+            if problems:
+                raise SystemExit(1)
         return
 
     if args.command == "env":
