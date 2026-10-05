@@ -37,6 +37,7 @@ Official downloads from `downloads.python.org/pypy` (portable Linux builds; the 
 
 - `bump-latest` isolates each runtime: a failure is printed, collected, and skipped rather than aborting the run. `bump_latest_all` returns `[(runtime_id, message), …]`; `main` exits non-zero when non-empty and writes them to `--failures-json <path>` when asked.
 - All upstream writes happen only after checksums resolve — no partial `runtime.json`/checksum writes, and `add_runtime_line` removes a half-created directory on failure.
+- `tools/bin/build-runtime` retries archive downloads with `--retry-all-errors` (HTTP/2 stream resets otherwise abort a build), and falls back to the archive's single top-level directory when `archive_root_dir` does not match what upstream extracted.
 - `check-updates.yml` runs the bump with `continue-on-error`, adds a **Skipped Runtimes** section to the PR body, then fails the job so skips are visible.
 - GitHub API calls (bun/deno/graalpy) authenticate with `GITHUB_TOKEN`/`GH_TOKEN` and paginate; `check-updates.yml` exports `GITHUB_TOKEN` to the job.
 
@@ -44,6 +45,10 @@ Official downloads from `downloads.python.org/pypy` (portable Linux builds; the 
 
 - **Python version in assets**: Release archives embed the Python version in the name — `graalpy3.12-{ver}-{arch}.tar.gz` (3.12), `graalpy3.13-{ver}-{arch}.tar.gz` (3.13). Pre-25.1 releases used `graalpy-{ver}-{arch}.tar.gz` (Python 3.12). The 3.12 line ends at `25.2.4`; 3.13 is separate.
 - **Manifest**: each runtime stores its `python_version` (e.g. `"3.13"`); the `graalpy` family uses `{python_version}` in `archive_name`, `archive_url`, `archive_root_dir`, `checksum_name`, `package_name`, and `helper_install_dir` (`graalpy/lib/python{python_version}/site-packages`).
+- **Three different version identifiers**: the release **tag**, the **asset filename** version, and the **extracted directory** version can all differ. e.g. tag `graal-25.3.4` → asset `graalpy3.13-25.3.4.1-linux-amd64.tar.gz`; tag `graal-25.4.4` → asset `graalpy3.13-25.4.4-linux-amd64.tar.gz` which extracts to `graalpy3.13-25.4.4.1.1-linux-amd64`.
+  - `distribution_version` is the **asset** version. `bump_version.py` derives it from asset names (`_graalpy_asset_version`), not the tag.
+  - `archive_url` uses `{release_tag}` (defaults to `distribution_version`); a bump records `release_tag` in `runtime.json` only when it differs, and clears a stale one.
+  - `archive_root_dir` cannot be known from the index; `tools/bin/build-runtime` falls back to the single top-level directory when the manifest's name is absent, and fails loudly if the archive has more than one.
 - **Bumping**: `bump_version.py` resolves archive/checksum names with the runtime's `python_version`. `check-latest-graalpy(python_version)` lists GitHub releases (`/releases?per_page=100`) and filters to assets matching that Python version, so a 3.12 runtime never bumps to a 3.13 release.
 - **Bootstrap**: both runtimes set `/opt/graalpy/lib/python{python_version}/site-packages` on `sys.path`.
 
@@ -54,8 +59,9 @@ Official downloads from `downloads.python.org/pypy` (portable Linux builds; the 
 
 ## CI / audit
 
-- **Workflow layout** (`ci.yml`): `repo-checks` runs validate/bash-n/check once; `runtime-checks` matrix builds and audits per runtime×arch. Release workflow mirrors download + Grype caches only.
-- **Grype**: `bash tools/bin/audit-runtime` with `--fail-on high --only-fixed` — pin upstream when CVEs have fixed releases (e.g. Go 1.26.3 → 1.26.4). CI/release install `v0.98.0` to `${RUNNER_TEMP}/grype/bin` with Actions cache on binary and `~/.cache/grype`.
+- **Workflow layout** (`ci.yml`): `repo-checks` runs validate/bash-n/check once; `grype-db` primes and caches the vulnerability database once; `runtime-checks` matrix (needs all three) builds and audits per runtime×arch. Release workflow mirrors download + Grype caches only.
+- **Grype**: `bash tools/bin/audit-runtime` with `--fail-on high --only-fixed` — pin upstream when CVEs have fixed releases (e.g. Go 1.26.3 → 1.26.4). CI/release install `v0.98.0` to `${RUNNER_TEMP}/grype/bin` with Actions cache on binary and `~/.cache/grype`. **Measure first**: the database is ~2.8GB and a cold `grype db update` takes ~58s, while the scan itself is ~0.6s and a warm cache restore is ~10s. The `grype-db` job primes and caches the database once so the 21 matrix cells share it; its key is week-stamped and deliberately **excludes** `GRYPE_VERSION`, since the database is independent of the binary and a tool bump must not invalidate 2.8GB of cache.
+- **Shell syntax**: `repo-checks` runs `bash -n` over every file in `tools/bin/`, which are extension-less — a `*.sh` glob matches only `_common.sh` and silently skips the rest.
 - **SAM in CI**: x86 matrix cells with local invoke install from `requirements-ci.txt`, warm Docker image, then `make local-build` / `local-invoke`.
 - **Artifacts**: GitHub Actions zips only on push to `main` (7-day retention); PRs rely on CI logs, not stored artifacts.
 - Builds require Linux/WSL (`bash`, `curl`, `zip`, `unzip`, `make`).

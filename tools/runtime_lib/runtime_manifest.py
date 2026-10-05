@@ -106,9 +106,13 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "x86_64": "linux-amd64",
             "arm64": "linux-aarch64",
         },
+        # The GitHub release tag is not always the distribution version: release
+        # `graal-25.3.4` ships assets named `graalpy3.13-25.3.4.1-*`. `release_tag`
+        # holds the tag; empty means "same as distribution_version".
+        "release_tag": "",
         "artifact": {
             "archive_name": "graalpy{python_version}-{distribution_version}-{arch_slug}.tar.gz",
-            "archive_url": "https://github.com/oracle/graalpython/releases/download/graal-{distribution_version}/graalpy{python_version}-{distribution_version}-{arch_slug}.tar.gz",
+            "archive_url": "https://github.com/oracle/graalpython/releases/download/graal-{release_tag}/graalpy{python_version}-{distribution_version}-{arch_slug}.tar.gz",
             "archive_root_dir": "graalpy{python_version}-{distribution_version}-{arch_slug}",
             "runtime_dir_name": "graalpy",
             "package_name": "graalpy{python_version}-{distribution_version}-{arch}.zip",
@@ -244,6 +248,8 @@ def _apply_defaults(runtime_id: str, data: Dict[str, Any], arch: str = DEFAULT_A
         "display_name": merged.get("display_name", runtime_id),
         "python_version": merged.get("python_version", ""),
         "archive_ext": merged.get("archive_ext", ""),
+        # Upstream release tag, defaulting to the distribution version.
+        "release_tag": merged.get("release_tag") or merged.get("distribution_version", ""),
         "arch": arch,
         "arch_slug": arch_slug,
     }

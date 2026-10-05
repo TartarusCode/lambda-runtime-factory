@@ -37,7 +37,10 @@ cp "${BOOTSTRAP_SOURCE}" "${LAYER_ROOT}/${BOOTSTRAP_OUTPUT}"
 chmod +x "${LAYER_ROOT}/${BOOTSTRAP_OUTPUT}"
 
 if [[ ! -f "${ARCHIVE_PATH}" ]]; then
-    curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --output "${ARCHIVE_PATH}" "${ARCHIVE_URL}"
+    curl --fail --location --proto '=https' --tlsv1.2 \
+        --retry 5 --retry-all-errors --retry-delay 2 --retry-connrefused \
+        --connect-timeout 30 \
+        --output "${ARCHIVE_PATH}" "${ARCHIVE_URL}"
 fi
 
 verify_sha256 "${ARCHIVE_PATH}"
@@ -61,7 +64,26 @@ if [[ -n "${BINARY_NAME:-}" && -f "${WORK_DIR}/${BINARY_NAME}" ]]; then
     mkdir -p "${LAYER_ROOT}/${RUNTIME_DIR_NAME}"
     mv "${WORK_DIR}/${BINARY_NAME}" "${LAYER_ROOT}/${RUNTIME_DIR_NAME}/${BINARY_NAME}"
 else
-    mv "${WORK_DIR}/${ARCHIVE_ROOT_DIR}" "${LAYER_ROOT}/${RUNTIME_DIR_NAME}"
+    source_dir="${WORK_DIR}/${ARCHIVE_ROOT_DIR}"
+    if [[ ! -d "${source_dir}" ]]; then
+        # Upstream archives occasionally extract into a directory whose name
+        # differs from the manifest's archive_root_dir (GraalPy asset
+        # graalpy3.13-25.4.4-linux-amd64.tar.gz extracts to
+        # graalpy3.13-25.4.4.1.1-linux-amd64). Fall back to the single
+        # top-level directory when it is unambiguous.
+        candidates=()
+        for entry in "${WORK_DIR}"/*/; do
+            [[ -d "${entry}" ]] && candidates+=("$(basename "${entry}")")
+        done
+        if [[ ${#candidates[@]} -eq 1 ]]; then
+            echo "archive_root_dir '${ARCHIVE_ROOT_DIR}' not found; using extracted dir '${candidates[0]}'" >&2
+            source_dir="${WORK_DIR}/${candidates[0]}"
+        else
+            echo "Expected extracted runtime at ${source_dir}; found ${#candidates[@]} top-level dir(s): ${candidates[*]:-none}" >&2
+            exit 1
+        fi
+    fi
+    mv "${source_dir}" "${LAYER_ROOT}/${RUNTIME_DIR_NAME}"
 fi
 
 mkdir -p "${LAYER_ROOT}/${HELPER_INSTALL_DIR}"

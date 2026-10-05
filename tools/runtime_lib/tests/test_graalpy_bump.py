@@ -121,6 +121,10 @@ def test_bump_runtime_writes_python_versioned_checksum_names(
             ("bb11bb22cc33dd44ee55ff66778899aabbccddeeff0011223344", "graalpy3.12-25.2.4-linux-aarch64.tar.gz"),
         ],
     )
+    # Release-tag resolution is a live API call; stub it (tag == version here).
+    monkeypatch.setattr(
+        bump_version, "RELEASE_TAG_RESOLVERS", {"graalpy": lambda version, archive: version}
+    )
 
     bump_version.bump_runtime("graalpy312", "25.2.4")
 

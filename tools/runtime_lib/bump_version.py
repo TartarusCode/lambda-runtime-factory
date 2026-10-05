@@ -80,6 +80,82 @@ def _github_releases(repo: str, *, max_pages: int = 5) -> List[dict]:
     return releases
 
 
+def _graalpy_releases() -> List[dict]:
+    """Return the GraalPy release list (authoritative tag + asset index)."""
+    return _github_releases("oracle/graalpython")
+
+
+def _graalpy_asset_version(asset_names: List[str], python_version: str) -> Optional[str]:
+    """Extract the distribution version from GraalPy asset names for a Python line.
+
+    Asset names carry the real distribution version, which can differ from the
+    release tag (tag `graal-25.3.4` ships `graalpy3.13-25.3.4.1-*`).
+    """
+    prefixes = [f"graalpy{python_version}-"] if python_version else []
+    if python_version == "3.12":
+        # Pre-25.1 releases used a bare `graalpy-` prefix and were all Python 3.12.
+        prefixes.append("graalpy-")
+    versions = []
+    for name in asset_names:
+        if not name.endswith(".tar.gz") or "-community-" in name or "-jvm-" in name:
+            continue
+        for prefix in prefixes:
+            if not name.startswith(prefix):
+                continue
+            version = name[len(prefix):].split("-", 1)[0]
+            if version and all(part.isdigit() for part in version.split(".")):
+                versions.append(version)
+            break
+    if not versions:
+        return None
+    return max(versions, key=lambda v: _version_tuple(v) or [])
+
+
+def _graalpy_release_asset(
+    version: str, arch: str, python_version: str = ""
+) -> Optional[Tuple[str, str]]:
+    """Return (release tag, asset filename) for a GraalPy version and arch."""
+    arch_slug = RUNTIME_FAMILY_DEFAULTS["graalpy"]["arch_map"][arch]
+    for release in _graalpy_releases():
+        tag = str(release.get("tag_name", ""))
+        if not tag.startswith("graal-"):
+            continue
+        for asset in release.get("assets", []):
+            name = asset.get("name", "")
+            if not name.endswith(".tar.gz") or "-community-" in name or "-jvm-" in name:
+                continue
+            if not name.endswith(f"-{version}-{arch_slug}.tar.gz"):
+                continue
+            if python_version and f"graalpy{python_version}-" not in name and not name.startswith("graalpy-"):
+                continue
+            return tag.removeprefix("graal-"), name
+    return None
+
+
+def _resolve_graalpy_archive_name(version: str, arch: str, python_version: str = "") -> str:
+    """Resolve the exact GraalPy asset filename for a version and arch."""
+    found = _graalpy_release_asset(version, arch, python_version)
+    if found is None:
+        raise ValueError(f"GraalPy archive not found for {version} {arch}")
+    return found[1]
+
+
+def _resolve_graalpy_release_tag(version: str, archive_name: str) -> str:
+    """Resolve the GitHub release tag that hosts a GraalPy asset.
+
+    The tag is not always the distribution version (`graal-25.3.4` hosts
+    `graalpy3.13-25.3.4.1-*`), so the download URL must use the real tag.
+    """
+    for release in _graalpy_releases():
+        tag = str(release.get("tag_name", ""))
+        if not tag.startswith("graal-"):
+            continue
+        names = {asset.get("name", "") for asset in release.get("assets", [])}
+        if archive_name in names or f"{archive_name}.sha256" in names:
+            return tag.removeprefix("graal-")
+    raise ValueError(f"No GraalPy release contains asset {archive_name}")
+
+
 def _sha256_from_download(url: str) -> str:
     """Download a file and compute its SHA-256 hash."""
     sha = hashlib.sha256()
@@ -134,9 +210,11 @@ def _fetch_checksum_deno(version: str, archive_name: str) -> str:
 
 
 def _fetch_checksum_graalpy(version: str, archive_name: str) -> str:
+    # The release tag can differ from the distribution version, so resolve it.
+    tag = _resolve_graalpy_release_tag(version, archive_name)
     sha_url = (
         f"https://github.com/oracle/graalpython/releases/download/"
-        f"graal-{version}/{archive_name}.sha256"
+        f"graal-{tag}/{archive_name}.sha256"
     )
     content = _http_get_text(sha_url)
     return content.split()[0]
@@ -226,7 +304,16 @@ CHECKSUM_FETCHERS: Dict[str, Callable[[str, str], str]] = {
 # must be resolved from upstream metadata.
 ARCHIVE_NAME_RESOLVERS: Dict[str, Callable[[str, str, str], str]] = {
     "portable-pypy": _resolve_pypy_archive_name,
+    "graalpy": _resolve_graalpy_archive_name,
 }
+
+# Families whose upstream release tag differs from the distribution version.
+RELEASE_TAG_RESOLVERS: Dict[str, Callable[[str, str], str]] = {
+    "graalpy": _resolve_graalpy_release_tag,
+}
+
+# Families whose archive extension varies between upstream releases.
+ARCHIVE_EXT_FAMILIES = {"portable-pypy"}
 
 
 def resolve_archive_name(
@@ -295,11 +382,22 @@ def bump_runtime(runtime_id: str, new_version: str, *, dry_run: bool = False) ->
 
     # Families whose archive extension varies between releases (PyPy) must record
     # the resolved extension so the build downloads the real upstream filename.
-    if runtime_family in ARCHIVE_NAME_RESOLVERS:
+    if runtime_family in ARCHIVE_EXT_FAMILIES:
         resolved_ext = _archive_extension(checksums[0][1]) if checksums else ""
         if resolved_ext and raw.get("archive_ext") != resolved_ext:
             print(f"  Archive extension: {resolved_ext}")
             raw["archive_ext"] = resolved_ext
+
+    # Families whose release tag differs from the distribution version (GraalPy)
+    # must record the tag so the build constructs a working download URL.
+    tag_resolver = RELEASE_TAG_RESOLVERS.get(runtime_family)
+    if tag_resolver is not None and checksums:
+        release_tag = tag_resolver(new_version, checksums[0][1])
+        if release_tag and release_tag != new_version:
+            print(f"  Release tag: {release_tag}")
+            raw["release_tag"] = release_tag
+        else:
+            raw.pop("release_tag", None)
 
     manifest_path.write_text(
         json.dumps(raw, indent=2, ensure_ascii=False) + "\n",
@@ -541,16 +639,20 @@ def _graalpy_is_newer(version: str, latest: str) -> bool:
 
 
 def check_latest_graalpy(python_version: str) -> Optional[str]:
-    data = _github_releases("oracle/graalpython")
+    """Return the newest GraalPy distribution version for a Python line.
+
+    The version is read from the asset names rather than the release tag, because
+    the two differ (tag `graal-25.3.4` ships `graalpy3.13-25.3.4.1-*`).
+    """
     latest: Optional[str] = None
-    for release in data:
-        tag = release.get("tag_name", "")
+    for release in _graalpy_releases():
+        tag = str(release.get("tag_name", ""))
         if not tag.startswith("graal-"):
             continue
         asset_names = [asset.get("name", "") for asset in release.get("assets", [])]
-        if _graalpy_python_version(asset_names) != python_version:
+        version = _graalpy_asset_version(asset_names, python_version)
+        if version is None:
             continue
-        version = tag.removeprefix("graal-")
         if latest is None or _graalpy_is_newer(version, latest):
             latest = version
     return latest

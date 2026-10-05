@@ -41,7 +41,11 @@ jobs:
       - name: Validate manifests
         run: bash tools/bin/validate-runtimes
       - name: Validate shell scripts
-        run: bash -n tools/bin/*.sh
+        run: |
+          for script in tools/bin/*; do
+            [[ -f "${script}" ]] || continue
+            bash -n "${script}"
+          done
       - name: Validate Python sources
         run: |
           for runtime in $(python3 tools/runtime_lib/runtime_manifest.py list); do
@@ -52,11 +56,42 @@ jobs:
           pip install pytest pytest-mock
           python3 -m pytest tools/runtime_lib/tests -q
 
+  # The Grype vulnerability database is ~2.8GB and identical for every matrix
+  # cell. Downloading it once here (and caching it) avoids paying ~60s per cell;
+  # a warm restore is ~10s and the scan itself is ~1s.
+  grype-db:
+    if: ${{ !(github.event_name == 'pull_request' && github.actor == 'dependabot[bot]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compute database cache key
+        id: dbkey
+        # The database is independent of the Grype binary version, so key it on
+        # the week only — a tool bump must not invalidate 2.8GB of cache.
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+      - name: Restore Grype database
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/grype
+          key: grype-db-${{ runner.os }}-${{ steps.dbkey.outputs.week }}
+          restore-keys: |
+            grype-db-${{ runner.os }}-
+      - name: Install Grype
+        run: |
+          mkdir -p "${RUNNER_TEMP}/grype/bin"
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sh -s -- -b "${RUNNER_TEMP}/grype/bin" "${GRYPE_VERSION}"
+      - name: Update vulnerability database
+        # Best effort: a failed refresh must not block the matrix, which falls
+        # back to a previous week's database or a cold download.
+        continue-on-error: true
+        run: "${RUNNER_TEMP}/grype/bin/grype db update"
+
   runtime-checks:
     if: ${{ !(github.event_name == 'pull_request' && github.actor == 'dependabot[bot]') }}
     needs:
       - prepare-matrix
       - repo-checks
+      - grype-db
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -72,6 +107,10 @@ jobs:
           echo "GRYPE_INSTALL_DIR=${RUNNER_TEMP}/grype/bin" >> "$GITHUB_ENV"
           mkdir -p "${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads"
           mkdir -p "${RUNNER_TEMP}/grype/bin"
+      - name: Compute database cache key
+        id: dbkey
+        # Must match the key produced by the grype-db job.
+        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
       - name: Cache runtime downloads
         uses: actions/cache@v6
         with:
@@ -86,7 +125,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/grype
-          key: grype-db-${{ runner.os }}-${{ env.GRYPE_VERSION }}
+          key: grype-db-${{ runner.os }}-${{ steps.dbkey.outputs.week }}
           restore-keys: |
             grype-db-${{ runner.os }}-
       - name: Install Grype
@@ -96,7 +135,11 @@ jobs:
           fi
           echo "${GRYPE_INSTALL_DIR}" >> "$GITHUB_PATH"
       - name: Install archive tooling
-        run: sudo apt-get update && sudo apt-get install -y zip unzip
+        # ubuntu runners ship zip/unzip; only install when actually missing.
+        run: |
+          if ! command -v zip >/dev/null || ! command -v unzip >/dev/null; then
+            sudo apt-get update && sudo apt-get install -y zip unzip
+          fi
       - name: Build runtime package
         run: make build RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Audit runtime package
