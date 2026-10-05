@@ -2,7 +2,7 @@
   "runtime_id": "deno29",
   "runtime_family": "deno",
   "display_name": "Deno 2.9",
-  "distribution_version": "2.9.6",
+  "distribution_version": "2.9.7",
   "version_line": "2.9",
   "artifact": {
     "checksum_file": "checksums/deno.sha256"
