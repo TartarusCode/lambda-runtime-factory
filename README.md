@@ -189,6 +189,43 @@ The new runtime is cloned from the newest existing runtime of the same family, i
 upstream. The weekly `/check-runtime-updates` workflow opens a single PR covering both
 same-line patch bumps and new-line additions.
 
+## Update failures and fault tolerance
+
+`bump-latest` treats every runtime independently. If one runtime cannot be updated —
+an upstream archive was renamed or removed, a transient network error, an unexpected
+tag format — that runtime is skipped and reported, and the remaining runtimes are still
+bumped and committed:
+
+```
+pypy311: pypy3.11-v7.3.23 -> pypy3.11-v8.0.0
+  !! Failed to bump pypy311: RuntimeError: GET ... failed: HTTP 404 Not Found
+...
+1 runtime(s) could not be updated:
+  - pypy311: RuntimeError: GET https://downloads.python.org/pypy/pypy3.11-v8.0.0-linux64.tar.bz2 failed: HTTP 404 Not Found
+```
+
+The command exits non-zero when any runtime failed, so CI is red; the weekly workflow
+still opens the PR for the runtimes that succeeded and lists the skipped ones under
+**Skipped Runtimes** in the PR body. Pass `--failures-json <path>` to write a
+machine-readable report of the failures.
+
+No partial state is written: a runtime's checksums are resolved from upstream *before*
+its `runtime.json` or checksum file is touched, and a new runtime directory is removed
+again if any step fails.
+
+### Version source notes
+
+- `bun` / `deno` / `graalpy` use the GitHub releases API, authenticated with
+  `GITHUB_TOKEN`/`GH_TOKEN` when present (avoids the unauthenticated 60 req/h limit)
+  and paginated so a tracked line's newest patch is not missed behind pre-release tags.
+- `go` uses `go.dev/dl/?mode=json`; `rust` uses `channel-rust-stable.toml`.
+- `pypy` uses `downloads.python.org/pypy/versions.json`. The newest release is chosen
+  by numeric version (not list order), and the archive **filename** — including its
+  extension — is read from that index, because PyPy has changed it between releases
+  (`.tar.bz2` → `.tar.gz` at 8.0.0). The resolved extension is persisted as
+  `archive_ext` in the runtime manifest so the build downloads the real upstream file.
+  PyPy publishes no checksum index, so the archive is downloaded once and hashed.
+
 ## PyPy Notes
 
 The first runtime package, `pypy311`, still ships the hardened Lambda Runtime API implementation and the helper package for:

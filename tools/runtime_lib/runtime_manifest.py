@@ -38,14 +38,18 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "x86_64": "linux64",
             "arm64": "aarch64",
         },
+        # PyPy changed its archive extension across releases (.tar.bz2 -> .tar.gz
+        # at 8.0.0). The extension lives in the manifest so a bump can persist the
+        # exact upstream filename instead of relying on a hardcoded template.
+        "archive_ext": ".tar.bz2",
         "artifact": {
-            "archive_name": "{distribution_version}-{arch_slug}.tar.bz2",
-            "archive_url": "https://downloads.python.org/pypy/{distribution_version}-{arch_slug}.tar.bz2",
+            "archive_name": "{distribution_version}-{arch_slug}{archive_ext}",
+            "archive_url": "https://downloads.python.org/pypy/{distribution_version}-{arch_slug}{archive_ext}",
             "archive_root_dir": "{distribution_version}-{arch_slug}",
             "runtime_dir_name": "pypy",
             "package_name": "{distribution_version}-{arch}.zip",
             "checksum_file": "checksums/pypy.sha256",
-            "checksum_name": "{distribution_version}-{arch_slug}.tar.bz2",
+            "checksum_name": "{distribution_version}-{arch_slug}{archive_ext}",
         },
         "layout": {
             "bootstrap": "bootstrap/bootstrap.py3",
@@ -239,6 +243,7 @@ def _apply_defaults(runtime_id: str, data: Dict[str, Any], arch: str = DEFAULT_A
         "distribution_version": merged.get("distribution_version", ""),
         "display_name": merged.get("display_name", runtime_id),
         "python_version": merged.get("python_version", ""),
+        "archive_ext": merged.get("archive_ext", ""),
         "arch": arch,
         "arch_slug": arch_slug,
     }

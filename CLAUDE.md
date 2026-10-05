@@ -29,6 +29,17 @@ Family defaults live in `tools/runtime_lib/runtime_manifest.py` (`RUNTIME_FAMILY
 
 Official downloads from `downloads.python.org/pypy` (portable Linux builds; the `portable-pypy` family name is historical).
 
+- **Archive filename is dynamic**: PyPy changed its archive extension (`.tar.bz2` → `.tar.gz` at 8.0.0), so the `portable-pypy` family templates use `{archive_ext}` and `bump_version.py` reads the real filename from `versions.json` (via `ARCHIVE_NAME_RESOLVERS`). Bumps persist the resolved value as `archive_ext` in `runtime.json`; the family default is `.tar.bz2` so existing runtimes are unchanged.
+- **Latest selection** is by numeric `pypy_version` (not `versions.json` order) and filters on `stable` + the Python version parsed from the distribution string (`pypy3.11-v…`).
+- PyPy publishes no checksum index, so the archive is downloaded once and hashed (`_fetch_checksum_pypy`).
+
+## Fault tolerance
+
+- `bump-latest` isolates each runtime: a failure is printed, collected, and skipped rather than aborting the run. `bump_latest_all` returns `[(runtime_id, message), …]`; `main` exits non-zero when non-empty and writes them to `--failures-json <path>` when asked.
+- All upstream writes happen only after checksums resolve — no partial `runtime.json`/checksum writes, and `add_runtime_line` removes a half-created directory on failure.
+- `check-updates.yml` runs the bump with `continue-on-error`, adds a **Skipped Runtimes** section to the PR body, then fails the job so skips are visible.
+- GitHub API calls (bun/deno/graalpy) authenticate with `GITHUB_TOKEN`/`GH_TOKEN` and paginate; `check-updates.yml` exports `GITHUB_TOKEN` to the job.
+
 ## GraalPy (`graalpy312`, `graalpy313`, family `graalpy`)
 
 - **Python version in assets**: Release archives embed the Python version in the name — `graalpy3.12-{ver}-{arch}.tar.gz` (3.12), `graalpy3.13-{ver}-{arch}.tar.gz` (3.13). Pre-25.1 releases used `graalpy-{ver}-{arch}.tar.gz` (Python 3.12). The 3.12 line ends at `25.2.4`; 3.13 is separate.

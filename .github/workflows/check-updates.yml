@@ -17,6 +17,10 @@ permissions:
 jobs:
   check-and-bump:
     runs-on: ubuntu-latest
+    env:
+      # Authenticated GitHub API calls avoid the unauthenticated 60 req/h limit
+      # that makes version checks fail intermittently.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -55,9 +59,13 @@ jobs:
           PYCHECK
 
       - name: Bump outdated runtimes and add new lines
+        id: bump
         if: steps.check.outputs.outdated == 'true'
+        # A runtime that cannot be updated (upstream archive renamed, transient
+        # network error) must not discard the bumps that already succeeded.
+        continue-on-error: true
         run: |
-          args=(bump-latest)
+          args=(bump-latest --failures-json "${RUNNER_TEMP}/bump_failures.json")
           if [[ -n "${{ github.event.inputs.runtime }}" ]]; then
             args+=(--runtime "${{ github.event.inputs.runtime }}")
           fi
@@ -80,8 +88,19 @@ jobs:
                         "New runtime packages were created for newly available version lines:", ""]
               for family, info in sorted(new_lines.items()):
                   lines.append(f"- **{info['id']}**: new {family} line {info['line']} at version {info['version']}")
-          lines += ["", "Checksums were fetched from the official upstream release channels.",
-                    "", "## Test Plan",
+          lines += ["", "Checksums were fetched from the official upstream release channels."]
+
+          failures = []
+          if os.path.exists(tmp + "/bump_failures.json"):
+              failures = json.load(open(tmp + "/bump_failures.json")).get("failures", [])
+          if failures:
+              lines += ["", "## Skipped Runtimes", "",
+                        "These runtimes could not be updated and were left untouched:", ""]
+              for item in failures:
+                  lines.append(f"- **{item['runtime']}**: {item['message']}")
+              lines += ["", "_Resolve these upstream and re-run the workflow to pick them up._"]
+
+          lines += ["", "## Test Plan",
                     "- [ ] CI validates manifests and checksums",
                     "- [ ] CI builds all updated runtime packages",
                     "- [ ] CI audits updated packages with Grype"]
@@ -99,3 +118,14 @@ jobs:
           title: "chore: bump runtime distribution versions and add new lines"
           body-path: ${{ runner.temp }}/pr_body.txt
           labels: dependencies,automated
+
+      - name: Report skipped runtimes
+        # Run after the PR exists, then fail the job so skipped runtimes are
+        # visible as a red run rather than being silently dropped.
+        if: steps.check.outputs.outdated == 'true' && steps.bump.outcome == 'failure'
+        run: |
+          echo "::error::Some runtimes could not be updated — see the PR's 'Skipped Runtimes' section."
+          if [[ -f "${RUNNER_TEMP}/bump_failures.json" ]]; then
+            cat "${RUNNER_TEMP}/bump_failures.json"
+          fi
+          exit 1

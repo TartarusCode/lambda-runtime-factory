@@ -5,12 +5,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import re
 import shutil
 import sys
 import tempfile
+import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from runtime_manifest import (
     DEFAULT_ARCH,
@@ -24,26 +27,74 @@ from runtime_manifest import (
 )
 
 
-def _http_get(url: str, *, accept: str = "*/*") -> bytes:
-    request = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": "lambda-runtime-bump/1.0"})
-    with urllib.request.urlopen(request, timeout=60) as response:
-        return response.read()
+GITHUB_API = "https://api.github.com"
+
+
+def _github_headers(accept: str = "application/vnd.github+json") -> Dict[str, str]:
+    """Headers for GitHub API requests, authenticated when a token is available.
+
+    Authenticating lifts the unauthenticated 60 req/h rate limit, which is the
+    main cause of intermittent check failures in CI (where GITHUB_TOKEN exists).
+    """
+    headers = {"Accept": accept, "User-Agent": "lambda-runtime-bump/1.0"}
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def _http_get(url: str, *, accept: str = "*/*", headers: Optional[Dict[str, str]] = None) -> bytes:
+    request = urllib.request.Request(
+        url,
+        headers=headers or {"Accept": accept, "User-Agent": "lambda-runtime-bump/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"GET {url} failed: HTTP {exc.code} {exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"GET {url} failed: {exc.reason}") from exc
 
 
 def _http_get_text(url: str) -> str:
     return _http_get(url).decode("utf-8").strip()
 
 
+def _github_releases(repo: str, *, max_pages: int = 5) -> List[dict]:
+    """Fetch releases for a repo, following pagination.
+
+    A single page (100 entries) can be exhausted by pre-release/canary tags
+    before a tracked line's newest patch appears, so walk pages until a short
+    page is returned or the page cap is hit.
+    """
+    releases: List[dict] = []
+    for page in range(1, max_pages + 1):
+        url = f"{GITHUB_API}/repos/{repo}/releases?per_page=100&page={page}"
+        payload = json.loads(_http_get(url, headers=_github_headers()))
+        if not isinstance(payload, list) or not payload:
+            break
+        releases.extend(payload)
+        if len(payload) < 100:
+            break
+    return releases
+
+
 def _sha256_from_download(url: str) -> str:
     """Download a file and compute its SHA-256 hash."""
     sha = hashlib.sha256()
     request = urllib.request.Request(url, headers={"User-Agent": "lambda-runtime-bump/1.0"})
-    with urllib.request.urlopen(request, timeout=300) as response:
-        while True:
-            chunk = response.read(1 << 20)
-            if not chunk:
-                break
-            sha.update(chunk)
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            while True:
+                chunk = response.read(1 << 20)
+                if not chunk:
+                    break
+                sha.update(chunk)
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"GET {url} failed: HTTP {exc.code} {exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"GET {url} failed: {exc.reason}") from exc
     return sha.hexdigest()
 
 
@@ -97,6 +148,64 @@ def _fetch_checksum_rust(version: str, archive_name: str) -> str:
     return content.split()[0]
 
 
+def _pypy_versions() -> List[dict]:
+    """Return the PyPy release index (authoritative list of files per release)."""
+    data = json.loads(_http_get_text("https://downloads.python.org/pypy/versions.json"))
+    if not isinstance(data, list):
+        raise RuntimeError("PyPy versions.json did not return a release list")
+    return data
+
+
+def _pypy_version_number(version: str) -> str:
+    """Extract the PyPy version from a distribution string: 'pypy3.11-v8.0.0' -> '8.0.0'."""
+    match = re.search(r"-v(.+)$", version)
+    return match.group(1) if match else version
+
+
+def _pypy_python_version(version: str) -> str:
+    """Extract the Python version from a PyPy distribution string: 'pypy3.11-v8.0.0' -> '3.11'."""
+    match = re.match(r"pypy(\d+\.\d+)-v", version)
+    return match.group(1) if match else ""
+
+
+def _pypy_release(version: str) -> Optional[dict]:
+    """Find the versions.json entry matching a PyPy distribution version."""
+    number = _pypy_version_number(version)
+    python_version = _pypy_python_version(version)
+    for release in _pypy_versions():
+        if release.get("pypy_version") != number:
+            continue
+        if python_version and not str(release.get("python_version", "")).startswith(python_version):
+            continue
+        return release
+    return None
+
+
+def _resolve_pypy_archive_name(version: str, arch: str, python_version: str = "") -> str:
+    """Resolve the exact upstream archive filename for a PyPy release and arch.
+
+    PyPy renames its archives between releases (e.g. `.tar.bz2` -> `.tar.gz` at
+    8.0.0), so the filename is read from versions.json rather than templated.
+    """
+    arch_slug = RUNTIME_FAMILY_DEFAULTS["portable-pypy"]["arch_map"][arch]
+    release = _pypy_release(version)
+    if release is None:
+        raise ValueError(f"PyPy {version} not found in versions.json")
+    for entry in release.get("files", []):
+        name = entry.get("filename", "")
+        if entry.get("platform") == "linux" and f"-{arch_slug}." in name:
+            return name
+    raise ValueError(f"No linux/{arch_slug} archive for PyPy {version}")
+
+
+def _archive_extension(filename: str) -> str:
+    """Return the compound archive extension (e.g. '.tar.bz2', '.tar.gz')."""
+    for ext in (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip"):
+        if filename.endswith(ext):
+            return ext
+    return Path(filename).suffix
+
+
 def _fetch_checksum_pypy(version: str, archive_name: str) -> str:
     """Download the PyPy archive and compute its SHA-256 (no central checksum index)."""
     url = f"https://downloads.python.org/pypy/{archive_name}"
@@ -104,7 +213,7 @@ def _fetch_checksum_pypy(version: str, archive_name: str) -> str:
     return _sha256_from_download(url)
 
 
-CHECKSUM_FETCHERS = {
+CHECKSUM_FETCHERS: Dict[str, Callable[[str, str], str]] = {
     "go-toolchain": _fetch_checksum_go,
     "bun": _fetch_checksum_bun,
     "deno": _fetch_checksum_deno,
@@ -113,11 +222,21 @@ CHECKSUM_FETCHERS = {
     "portable-pypy": _fetch_checksum_pypy,
 }
 
+# Families whose archive filename cannot be derived from a static template and
+# must be resolved from upstream metadata.
+ARCHIVE_NAME_RESOLVERS: Dict[str, Callable[[str, str, str], str]] = {
+    "portable-pypy": _resolve_pypy_archive_name,
+}
+
 
 def resolve_archive_name(
     runtime_family: str, version: str, arch: str, python_version: str = ""
 ) -> str:
     """Build the archive filename for a given family, version, and architecture."""
+    resolver = ARCHIVE_NAME_RESOLVERS.get(runtime_family)
+    if resolver is not None:
+        return resolver(version, arch, python_version)
+
     family = RUNTIME_FAMILY_DEFAULTS[runtime_family]
     arch_slug = family["arch_map"][arch]
     template = family["artifact"]["checksum_name"]
@@ -125,6 +244,7 @@ def resolve_archive_name(
         distribution_version=version,
         arch_slug=arch_slug,
         python_version=python_version,
+        archive_ext=family.get("archive_ext", ""),
     )
 
 
@@ -172,6 +292,15 @@ def bump_runtime(runtime_id: str, new_version: str, *, dry_run: bool = False) ->
         return
 
     raw["distribution_version"] = new_version
+
+    # Families whose archive extension varies between releases (PyPy) must record
+    # the resolved extension so the build downloads the real upstream filename.
+    if runtime_family in ARCHIVE_NAME_RESOLVERS:
+        resolved_ext = _archive_extension(checksums[0][1]) if checksums else ""
+        if resolved_ext and raw.get("archive_ext") != resolved_ext:
+            print(f"  Archive extension: {resolved_ext}")
+            raw["archive_ext"] = resolved_ext
+
     manifest_path.write_text(
         json.dumps(raw, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -297,31 +426,36 @@ def add_runtime_line(family: str, version: str, *, dry_run: bool = False) -> str
 
     source_id = max(family_runtimes, key=lambda item: _version_tuple(item[1]["distribution_version"]) or [0])[0]
 
-    shutil.copytree(runtimes_root() / source_id, dest)
-    print(f"{source_id} -> {new_id}: cloned runtime directory")
-
-    manifest_path = dest / "runtime.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    manifest["runtime_id"] = new_id
-    manifest["distribution_version"] = version
-    manifest["version_line"] = _version_line_of(version)
-    manifest["display_name"] = _new_display_name(family, version)
-    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
-    for rel in ("examples/sam/Makefile", "examples/sls/serverless.yml"):
-        path = dest / rel
-        if path.exists():
-            text = path.read_text(encoding="utf-8").replace(source_id, new_id)
-            path.write_text(text, encoding="utf-8")
-
+    # Resolve checksums before touching the tree so a fetch failure leaves no
+    # half-created runtime directory behind.
     checksums = fetch_checksums(family, version)
-    checksum_rel = manifest.get("artifact", {}).get("checksum_file", "")
-    if not checksum_rel:
-        raise ValueError(f"Manifest for {new_id} has no artifact.checksum_file")
-    checksum_path = dest / checksum_rel
-    checksum_path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [f"{sha}  {name}\n" for sha, name in checksums]
-    checksum_path.write_text("".join(lines), encoding="utf-8")
+
+    try:
+        shutil.copytree(runtimes_root() / source_id, dest)
+        print(f"{source_id} -> {new_id}: cloned runtime directory")
+
+        manifest_path = dest / "runtime.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["runtime_id"] = new_id
+        manifest["distribution_version"] = version
+        manifest["version_line"] = _version_line_of(version)
+        manifest["display_name"] = _new_display_name(family, version)
+        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+        for rel in ("examples/sam/Makefile", "examples/sls/serverless.yml"):
+            path = dest / rel
+            if path.exists():
+                text = path.read_text(encoding="utf-8").replace(source_id, new_id)
+                path.write_text(text, encoding="utf-8")
+
+        checksum_rel = _apply_defaults(new_id, manifest)["artifact"]["checksum_file"]
+        checksum_path = dest / checksum_rel
+        checksum_path.parent.mkdir(parents=True, exist_ok=True)
+        lines = [f"{sha}  {name}\n" for sha, name in checksums]
+        checksum_path.write_text("".join(lines), encoding="utf-8")
+    except Exception:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
 
     print(f"  Created {new_id} at version {version} (line {_version_line_of(version)})")
     return new_id
@@ -347,10 +481,7 @@ def check_latest_go(version_line: str = "") -> Optional[str]:
 
 
 def check_latest_bun(version_line: str = "") -> Optional[str]:
-    data = json.loads(_http_get(
-        "https://api.github.com/repos/oven-sh/bun/releases?per_page=100",
-        accept="application/vnd.github+json",
-    ))
+    data = _github_releases("oven-sh/bun")
     recent: Optional[str] = None
     recent_tuple: Optional[List[int]] = None
     for release in data:
@@ -370,10 +501,7 @@ def check_latest_bun(version_line: str = "") -> Optional[str]:
 
 
 def check_latest_deno(version_line: str = "") -> Optional[str]:
-    data = json.loads(_http_get(
-        "https://api.github.com/repos/denoland/deno/releases?per_page=100",
-        accept="application/vnd.github+json",
-    ))
+    data = _github_releases("denoland/deno")
     recent: Optional[str] = None
     recent_tuple: Optional[List[int]] = None
     for release in data:
@@ -413,10 +541,7 @@ def _graalpy_is_newer(version: str, latest: str) -> bool:
 
 
 def check_latest_graalpy(python_version: str) -> Optional[str]:
-    data = json.loads(_http_get(
-        "https://api.github.com/repos/oracle/graalpython/releases?per_page=100",
-        accept="application/vnd.github+json",
-    ))
+    data = _github_releases("oracle/graalpython")
     latest: Optional[str] = None
     for release in data:
         tag = release.get("tag_name", "")
@@ -458,12 +583,32 @@ def check_latest_rust(version_line: str = "") -> Optional[str]:
     return latest
 
 
+def _pypy_version_key(version: str) -> Tuple[int, ...]:
+    """Numeric sort key for a PyPy version string, e.g. '7.3.23' -> (7, 3, 23)."""
+    parts = []
+    for part in str(version).split("."):
+        parts.append(int(part) if part.isdigit() else 0)
+    return tuple(parts)
+
+
 def check_latest_pypy() -> Optional[str]:
-    data = json.loads(_http_get_text("https://downloads.python.org/pypy/versions.json"))
-    for release in data:
-        if release.get("stable") and release.get("python_version", "").startswith("3.11"):
-            return f"pypy3.11-v{release['pypy_version']}"
-    return None
+    """Return the newest stable PyPy release for Python 3.11.
+
+    Selection is by numeric version (not list order), so the result is stable
+    even if upstream reorders versions.json.
+    """
+    latest: Optional[str] = None
+    for release in _pypy_versions():
+        if not release.get("stable"):
+            continue
+        if not str(release.get("python_version", "")).startswith("3.11"):
+            continue
+        version = str(release.get("pypy_version", ""))
+        if not version:
+            continue
+        if latest is None or _pypy_version_key(version) > _pypy_version_key(latest):
+            latest = version
+    return f"pypy3.11-v{latest}" if latest else None
 
 
 LATEST_CHECKERS = {
@@ -537,21 +682,45 @@ def check_and_report_new_lines(
     return outdated, new_lines
 
 
-def bump_latest_all(runtime_ids: Optional[List[str]] = None, *, dry_run: bool = False) -> None:
-    """Bump all outdated runtimes and add any new version lines."""
+def bump_latest_all(
+    runtime_ids: Optional[List[str]] = None, *, dry_run: bool = False
+) -> List[Tuple[str, str]]:
+    """Bump all outdated runtimes and add any new version lines.
+
+    Each runtime is isolated: a failure to bump one (upstream archive missing,
+    network error, unexpected rename) is reported and skipped rather than
+    aborting the whole run. Returns a list of (runtime_id, message) failures.
+    """
     outdated, new_lines = check_and_report_new_lines(runtime_ids)
 
     if not outdated and not new_lines:
         print("\nNothing to bump.")
-        return
+        return []
+
+    failures: List[Tuple[str, str]] = []
 
     for runtime_id, (current, latest) in outdated.items():
         print(f"\nBumping {runtime_id} ...")
-        bump_runtime(runtime_id, latest, dry_run=dry_run)
+        try:
+            bump_runtime(runtime_id, latest, dry_run=dry_run)
+        except Exception as exc:  # noqa: BLE001 - isolate per-runtime failures
+            failures.append((runtime_id, f"{type(exc).__name__}: {exc}"))
+            print(f"  !! Failed to bump {runtime_id}: {exc}")
 
     for family, info in new_lines.items():
         print(f"\nAdding new line {info['id']} ({family} {info['line']}) ...")
-        add_runtime_line(family, info["version"], dry_run=dry_run)
+        try:
+            add_runtime_line(family, info["version"], dry_run=dry_run)
+        except Exception as exc:  # noqa: BLE001 - isolate per-runtime failures
+            failures.append((info["id"], f"{type(exc).__name__}: {exc}"))
+            print(f"  !! Failed to add {info['id']}: {exc}")
+
+    if failures:
+        print(f"\n{len(failures)} runtime(s) could not be updated:")
+        for name, message in failures:
+            print(f"  - {name}: {message}")
+
+    return failures
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -572,6 +741,10 @@ def build_parser() -> argparse.ArgumentParser:
     bump_all_parser = subparsers.add_parser("bump-latest", help="Bump all outdated runtimes to latest")
     bump_all_parser.add_argument("--runtime", help="Only bump a specific runtime")
     bump_all_parser.add_argument("--dry-run", action="store_true", help="Show what would change without writing")
+    bump_all_parser.add_argument(
+        "--failures-json",
+        help="Write a JSON report of runtimes that could not be updated to this path",
+    )
 
     return parser
 
@@ -609,7 +782,20 @@ def main() -> None:
 
     if args.command == "bump-latest":
         runtime_ids = [args.runtime] if args.runtime else None
-        bump_latest_all(runtime_ids, dry_run=args.dry_run)
+        failures = bump_latest_all(runtime_ids, dry_run=args.dry_run)
+
+        if args.failures_json:
+            Path(args.failures_json).write_text(
+                json.dumps(
+                    {"failures": [{"runtime": name, "message": message} for name, message in failures]},
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+        if failures:
+            sys.exit(1)
         return
 
     parser.error("Unhandled command")
