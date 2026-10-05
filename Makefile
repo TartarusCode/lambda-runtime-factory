@@ -9,7 +9,7 @@ DEV_BUILD_ENV := BUILD_BEST_EFFORT_AUDIT=0
 
 all: validate-runtimes build
 
-.PHONY: all list-runtimes validate-runtimes check build build-all build-all-arches audit audit-all upload upload-all publish publish-all publicize publicize-all latest latest-all unpublish create-buckets local-build local-invoke clean shell check-updates bump bump-latest test
+.PHONY: all list-runtimes validate-runtimes check build build-all build-all-arches audit audit-all upload upload-all publish publish-all publicize publicize-all latest latest-all unpublish create-buckets local-build local-invoke clean shell check-updates bump bump-latest roll-off test
 
 list-runtimes:
 	python3 tools/runtime_lib/runtime_manifest.py list
@@ -98,6 +98,9 @@ bump:
 
 bump-latest:
 	bash tools/bin/bump-runtime bump-latest
+
+roll-off:
+	bash tools/bin/bump-runtime roll-off $(ARGS)
 
 clean:
 	bash tools/bin/clean-runtime "$(RUNTIME)"

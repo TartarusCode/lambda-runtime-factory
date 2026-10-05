@@ -13,6 +13,8 @@ Family defaults live in `tools/runtime_lib/runtime_manifest.py` (`RUNTIME_FAMILY
 - Runtimes track a `version_line` (major.minor) in `runtime.json`; ids are `<framework><major><minor>` (e.g. `go126` = line `1.26`).
 - Same-line patch bumps happen in place; **new minor lines create a new runtime dir** instead of mutating an existing one.
 - `bump_version.py`: `LINE_FAMILIES` maps family → id prefix; `check_latest_*(version_line)` filter to a line; `detect_new_lines()` finds untracked upstream lines; `add_runtime_line(family, version)` clones the newest same-family dir and rewrites `runtime.json` + example files + checksums.
+- `PYTHON_LINE_FAMILIES` (`portable-pypy`) are keyed on the **Python** version, not the PyPy version: `pypy311` = PyPy on Python 3.11, `check_latest_pypy(python_version)` filters to that line, and `detect_new_lines()` proposes a new `pypyNNN` when upstream adds a Python line **newer than the newest tracked one** (never back-fills 2.7/3.6–3.10). GraalPy is per-Python in its id already and has no line scheme.
+- **Roll-off** bounds the matrix: `roll-off [--keep N] [--apply] [--prune]` (default keep 2, report-only) marks runtimes on lines older than the newest N per family with `"deprecated": true`. `manifest_matrix()` excludes them, `check_updates()` skips them unless named, and `--prune` (requires `--apply`) deletes their directories — refusing ever to empty a family.
 - `check --json` emits `{"outdated": {...}, "new_lines": {...}}`; `bump-latest` bumps `outdated` then auto-adds `new_lines`. Weekly `check-updates.yml` opens one PR for both.
 - `rust` family channel is TOML: only the `[pkg.rust]` section has the real version (arch/components sub-sections appear later and may contain `version = ""`).
 
@@ -30,8 +32,9 @@ Family defaults live in `tools/runtime_lib/runtime_manifest.py` (`RUNTIME_FAMILY
 Official downloads from `downloads.python.org/pypy` (portable Linux builds; the `portable-pypy` family name is historical).
 
 - **Archive filename is dynamic**: PyPy changed its archive extension (`.tar.bz2` → `.tar.gz` at 8.0.0), so the `portable-pypy` family templates use `{archive_ext}` and `bump_version.py` reads the real filename from `versions.json` (via `ARCHIVE_NAME_RESOLVERS`). Bumps persist the resolved value as `archive_ext` in `runtime.json`; the family default is `.tar.bz2` so existing runtimes are unchanged.
-- **Latest selection** is by numeric `pypy_version` (not `versions.json` order) and filters on `stable` + the Python version parsed from the distribution string (`pypy3.11-v…`).
+- **Latest selection** is by numeric `pypy_version` (not `versions.json` order) and filters on `stable` + the Python line (`python_version` in the manifest, else parsed from `pypy3.11-v…`).
 - PyPy publishes no checksum index, so the archive is downloaded once and hashed (`_fetch_checksum_pypy`).
+- A new Python line is a **new runtime** (`pypy312`), auto-added by `bump-latest`; same-line PyPy bumps happen in place.
 
 ## Fault tolerance
 

@@ -194,6 +194,20 @@ def list_runtime_ids() -> List[str]:
     )
 
 
+def is_deprecated(runtime_id: str) -> bool:
+    """Return whether a runtime is marked deprecated (rolled off the build matrix)."""
+    manifest_path = runtime_manifest_path(runtime_id)
+    if not manifest_path.exists():
+        return False
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return bool(data.get("deprecated"))
+
+
+def list_active_runtime_ids() -> List[str]:
+    """Runtime ids that still participate in the build matrix."""
+    return [runtime_id for runtime_id in list_runtime_ids() if not is_deprecated(runtime_id)]
+
+
 def _require_keys(data: Dict[str, Any], keys: Iterable[str], context: str) -> None:
     missing = [key for key in keys if key not in data]
     if missing:
@@ -464,6 +478,10 @@ def manifest_matrix() -> Dict[str, Any]:
     entries = []
     for runtime_id in list_runtime_ids():
         data = json.loads(runtime_manifest_path(runtime_id).read_text(encoding="utf-8"))
+        # Deprecated runtimes are rolled off the matrix so it cannot grow without
+        # bound; they remain buildable on demand via `make build RUNTIME=...`.
+        if data.get("deprecated"):
+            continue
         skip_local = data.get("local_testing", {}).get("skip_local_invoke", False)
         for arch in SUPPORTED_ARCHS:
             entries.append({
@@ -486,6 +504,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_parser = subparsers.add_parser("list")
     list_parser.add_argument("--json", action="store_true")
+    list_parser.add_argument(
+        "--active", action="store_true", help="Only runtimes in the build matrix (not deprecated)"
+    )
 
     matrix_parser = subparsers.add_parser("matrix")
     matrix_parser.add_argument("--json", action="store_true", default=True)
@@ -510,7 +531,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.command == "list":
-        runtimes = list_runtime_ids()
+        runtimes = list_active_runtime_ids() if args.active else list_runtime_ids()
         if args.json:
             print(json.dumps(runtimes))
         else:

@@ -20,6 +20,7 @@ from runtime_manifest import (
     RUNTIME_FAMILY_DEFAULTS,
     SUPPORTED_ARCHS,
     _apply_defaults,
+    is_deprecated,
     list_runtime_ids,
     load_runtime,
     runtime_manifest_path,
@@ -284,6 +285,58 @@ def _archive_extension(filename: str) -> str:
     return Path(filename).suffix
 
 
+def _pypy_python_lines() -> Dict[str, str]:
+    """Map each upstream Python line to its newest stable PyPy distribution version.
+
+    e.g. {'3.11': 'pypy3.11-v8.0.0', '3.12': 'pypy3.12-v8.0.0'}
+    """
+    lines: Dict[str, str] = {}
+    for release in _pypy_versions():
+        if not release.get("stable"):
+            continue
+        python_version = str(release.get("python_version", ""))
+        pypy_version = str(release.get("pypy_version", ""))
+        if not python_version or not pypy_version:
+            continue
+        # versions.json lists per patch release (3.11.15, 3.11.16, ...); the line
+        # is the major.minor and the newest PyPy build on it wins.
+        line = ".".join(python_version.split(".")[:2])
+        current = lines.get(line)
+        if current is None or _pypy_version_key(pypy_version) > _pypy_version_key(_pypy_version_number(current)):
+            lines[line] = f"pypy{line}-v{pypy_version}"
+    return lines
+
+
+def _python_version_key(python_version: str) -> Tuple[int, ...]:
+    """Numeric sort key for a Python version, e.g. '3.12' -> (3, 12)."""
+    return tuple(int(part) if part.isdigit() else 0 for part in str(python_version).split("."))
+
+
+def _apply_upstream_overrides(
+    runtime_family: str, version: str, checksums: List[Tuple[str, str]], raw: Dict[str, object]
+) -> None:
+    """Record the upstream identifiers a family needs to build (in place).
+
+    PyPy varies its archive extension between releases and GraalPy's release tag
+    is not always its distribution version, so neither can be derived from the
+    version string alone.
+    """
+    if runtime_family in ARCHIVE_EXT_FAMILIES:
+        resolved_ext = _archive_extension(checksums[0][1]) if checksums else ""
+        if resolved_ext and raw.get("archive_ext") != resolved_ext:
+            print(f"  Archive extension: {resolved_ext}")
+            raw["archive_ext"] = resolved_ext
+
+    tag_resolver = RELEASE_TAG_RESOLVERS.get(runtime_family)
+    if tag_resolver is not None and checksums:
+        release_tag = tag_resolver(version, checksums[0][1])
+        if release_tag and release_tag != version:
+            print(f"  Release tag: {release_tag}")
+            raw["release_tag"] = release_tag
+        else:
+            raw.pop("release_tag", None)
+
+
 def _fetch_checksum_pypy(version: str, archive_name: str) -> str:
     """Download the PyPy archive and compute its SHA-256 (no central checksum index)."""
     url = f"https://downloads.python.org/pypy/{archive_name}"
@@ -380,24 +433,9 @@ def bump_runtime(runtime_id: str, new_version: str, *, dry_run: bool = False) ->
 
     raw["distribution_version"] = new_version
 
-    # Families whose archive extension varies between releases (PyPy) must record
-    # the resolved extension so the build downloads the real upstream filename.
-    if runtime_family in ARCHIVE_EXT_FAMILIES:
-        resolved_ext = _archive_extension(checksums[0][1]) if checksums else ""
-        if resolved_ext and raw.get("archive_ext") != resolved_ext:
-            print(f"  Archive extension: {resolved_ext}")
-            raw["archive_ext"] = resolved_ext
-
-    # Families whose release tag differs from the distribution version (GraalPy)
-    # must record the tag so the build constructs a working download URL.
-    tag_resolver = RELEASE_TAG_RESOLVERS.get(runtime_family)
-    if tag_resolver is not None and checksums:
-        release_tag = tag_resolver(new_version, checksums[0][1])
-        if release_tag and release_tag != new_version:
-            print(f"  Release tag: {release_tag}")
-            raw["release_tag"] = release_tag
-        else:
-            raw.pop("release_tag", None)
+    # Families whose upstream identifiers vary between releases (PyPy archive
+    # extension, GraalPy release tag) must record them so the build works.
+    _apply_upstream_overrides(runtime_family, new_version, checksums, raw)
 
     manifest_path.write_text(
         json.dumps(raw, indent=2, ensure_ascii=False) + "\n",
@@ -446,11 +484,36 @@ LINE_FAMILIES: Dict[str, str] = {
     "rust-musl": "rust",
 }
 
+# Families whose "line" is the Python version rather than the package version.
+# PyPy ships several Python lines concurrently (pypy311 = PyPy on Python 3.11),
+# so a new Python line is a new runtime, not a patch bump.
+PYTHON_LINE_FAMILIES: Dict[str, str] = {
+    "portable-pypy": "pypy",
+}
+
+
+def _line_for(family: str, version: str) -> str:
+    """Return the line a runtime tracks: the Python version for PyPy."""
+    if family in PYTHON_LINE_FAMILIES:
+        return _pypy_python_version(version)
+    return _version_line_of(version)
+
+
+def _distribution_sort_key(family: str, version: str) -> Tuple[int, ...]:
+    """Order versions within a family, newest last."""
+    if family in PYTHON_LINE_FAMILIES:
+        return _python_version_key(_pypy_python_version(version)) + _pypy_version_key(
+            _pypy_version_number(version)
+        )
+    return tuple(_version_tuple(version) or [0])
+
 
 def _new_line_id(family: str, version: str) -> str:
     """Derive a runtime id for a new version line, e.g. ('go', '1.27.0') -> 'go127'."""
-    prefix = LINE_FAMILIES[family]
-    line = _version_line_of(version)
+    prefix = LINE_FAMILIES.get(family) or PYTHON_LINE_FAMILIES.get(family)
+    if prefix is None:
+        raise ValueError(f"No line id scheme for family '{family}'")
+    line = _line_for(family, version)
     if not line:
         raise ValueError(f"Cannot derive line id from version '{version}' for family '{family}'")
     return f"{prefix}{line.replace('.', '')}"
@@ -458,24 +521,31 @@ def _new_line_id(family: str, version: str) -> str:
 
 def _new_display_name(family: str, version: str) -> str:
     """Derive a display name for a new version line, e.g. ('go-toolchain', '1.27.0') -> 'Go 1.27'."""
-    prefix = LINE_FAMILIES[family]
-    label = "Go" if prefix == "go" else prefix.capitalize()
-    line = _version_line_of(version)
+    line = _line_for(family, version)
     if not line:
         raise ValueError(f"Cannot derive display name from version '{version}' for family '{family}'")
+    if family in PYTHON_LINE_FAMILIES:
+        return f"PyPy {line}"
+    prefix = LINE_FAMILIES[family]
+    label = "Go" if prefix == "go" else prefix.capitalize()
     return f"{label} {line}"
 
 
 def detect_new_lines() -> Dict[str, Dict[str, str]]:
     """Return new version lines available upstream but not tracked by any runtime.
 
-    Returns {runtime_family: {'id', 'line', 'version'}}. Only line-based families
-    (bun/deno/go/rust) are considered; graalpy and pypy use their own schemes.
+    Returns {runtime_family: {'id', 'line', 'version'}}. Covers the semver-line
+    families (bun/deno/go/rust) and PyPy, whose line is the Python version.
+    GraalPy has no line scheme (its versions are already per-Python in the id).
     """
+    manifests = {
+        runtime_id: json.loads(runtime_manifest_path(runtime_id).read_text(encoding="utf-8"))
+        for runtime_id in list_runtime_ids()
+    }
+
     existing_lines = {
         (raw["runtime_family"], raw.get("version_line", ""))
-        for runtime_id in list_runtime_ids()
-        for raw in [json.loads(runtime_manifest_path(runtime_id).read_text(encoding="utf-8"))]
+        for raw in manifests.values()
         if raw.get("version_line")
     }
 
@@ -499,6 +569,35 @@ def detect_new_lines() -> Dict[str, Dict[str, str]]:
             "line": line,
             "version": latest,
         }
+
+    # PyPy keeps many Python lines alive at once (2.7, 3.6-3.12), so only lines
+    # newer than the newest tracked one are proposed — never back-filled.
+    pypy_tracked = {
+        str(raw.get("python_version") or raw.get("version_line") or "")
+        for raw in manifests.values()
+        if raw.get("runtime_family") == "portable-pypy"
+    }
+    pypy_tracked.discard("")
+    if pypy_tracked:
+        try:
+            upstream_lines = _pypy_python_lines()
+        except Exception as exc:
+            print(f"portable-pypy: failed to check latest: {exc}")
+            upstream_lines = {}
+        newest_tracked = max(pypy_tracked, key=_python_version_key)
+        candidates = [
+            (line, version)
+            for line, version in upstream_lines.items()
+            if line not in pypy_tracked and _python_version_key(line) > _python_version_key(newest_tracked)
+        ]
+        if candidates:
+            line, version = max(candidates, key=lambda item: _python_version_key(item[0]))
+            new_lines["portable-pypy"] = {
+                "id": _new_line_id("portable-pypy", version),
+                "line": line,
+                "version": version,
+            }
+
     return new_lines
 
 
@@ -511,7 +610,7 @@ def add_runtime_line(family: str, version: str, *, dry_run: bool = False) -> str
         return new_id
 
     if dry_run:
-        print(f"  (dry run) would create {new_id} at version {version} (line {_version_line_of(version)})")
+        print(f"  (dry run) would create {new_id} at version {version} (line {_line_for(family, version)})")
         return new_id
 
     family_runtimes = [
@@ -522,7 +621,10 @@ def add_runtime_line(family: str, version: str, *, dry_run: bool = False) -> str
     if not family_runtimes:
         raise ValueError(f"No existing runtime for family '{family}' to clone from")
 
-    source_id = max(family_runtimes, key=lambda item: _version_tuple(item[1]["distribution_version"]) or [0])[0]
+    source_id = max(
+        family_runtimes,
+        key=lambda item: _distribution_sort_key(family, item[1]["distribution_version"]),
+    )[0]
 
     # Resolve checksums before touching the tree so a fetch failure leaves no
     # half-created runtime directory behind.
@@ -536,8 +638,11 @@ def add_runtime_line(family: str, version: str, *, dry_run: bool = False) -> str
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["runtime_id"] = new_id
         manifest["distribution_version"] = version
-        manifest["version_line"] = _version_line_of(version)
+        manifest["version_line"] = _line_for(family, version)
         manifest["display_name"] = _new_display_name(family, version)
+        if family in PYTHON_LINE_FAMILIES:
+            manifest["python_version"] = _line_for(family, version)
+        _apply_upstream_overrides(family, version, checksums, manifest)
         manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
         for rel in ("examples/sam/Makefile", "examples/sls/serverless.yml"):
@@ -555,7 +660,7 @@ def add_runtime_line(family: str, version: str, *, dry_run: bool = False) -> str
         shutil.rmtree(dest, ignore_errors=True)
         raise
 
-    print(f"  Created {new_id} at version {version} (line {_version_line_of(version)})")
+    print(f"  Created {new_id} at version {version} (line {_line_for(family, version)})")
     return new_id
 
 
@@ -693,8 +798,8 @@ def _pypy_version_key(version: str) -> Tuple[int, ...]:
     return tuple(parts)
 
 
-def check_latest_pypy() -> Optional[str]:
-    """Return the newest stable PyPy release for Python 3.11.
+def check_latest_pypy(python_version: str = "3.11") -> Optional[str]:
+    """Return the newest stable PyPy release on a Python line (default 3.11).
 
     Selection is by numeric version (not list order), so the result is stable
     even if upstream reorders versions.json.
@@ -703,14 +808,14 @@ def check_latest_pypy() -> Optional[str]:
     for release in _pypy_versions():
         if not release.get("stable"):
             continue
-        if not str(release.get("python_version", "")).startswith("3.11"):
+        if not str(release.get("python_version", "")).startswith(python_version):
             continue
         version = str(release.get("pypy_version", ""))
         if not version:
             continue
         if latest is None or _pypy_version_key(version) > _pypy_version_key(latest):
             latest = version
-    return f"pypy3.11-v{latest}" if latest else None
+    return f"pypy{python_version}-v{latest}" if latest else None
 
 
 LATEST_CHECKERS = {
@@ -724,9 +829,13 @@ LATEST_CHECKERS = {
 
 
 def check_updates(runtime_ids: Optional[List[str]] = None) -> Dict[str, Tuple[str, str]]:
-    """Check for available updates. Returns {runtime_id: (current, latest)} for outdated runtimes."""
+    """Check for available updates. Returns {runtime_id: (current, latest)} for outdated runtimes.
+
+    Deprecated runtimes are skipped when checking everything, since they have
+    been rolled off the build matrix; pass an explicit id to check one anyway.
+    """
     if runtime_ids is None:
-        runtime_ids = list_runtime_ids()
+        runtime_ids = [rid for rid in list_runtime_ids() if not is_deprecated(rid)]
 
     outdated: Dict[str, Tuple[str, str]] = {}
     for runtime_id in runtime_ids:
@@ -746,7 +855,7 @@ def check_updates(runtime_ids: Optional[List[str]] = None) -> Dict[str, Tuple[st
             if family == "graalpy":
                 latest = check_latest_graalpy(raw.get("python_version", ""))
             elif family == "portable-pypy":
-                latest = checker()
+                latest = check_latest_pypy(raw.get("python_version") or version_line or "3.11")
             else:
                 latest = checker(version_line)
         except Exception as exc:
@@ -825,6 +934,107 @@ def bump_latest_all(
     return failures
 
 
+DEFAULT_KEEP_LINES = 2
+
+
+def _manifest_line(raw: Dict[str, object]) -> str:
+    """Return the line a manifest tracks.
+
+    Line families record `version_line`; GraalPy and PyPy key off the Python
+    version instead (GraalPy has no version_line at all).
+    """
+    return str(raw.get("version_line") or raw.get("python_version") or "")
+
+
+def plan_roll_off(keep: int = DEFAULT_KEEP_LINES) -> Dict[str, str]:
+    """Return {runtime_id: reason} for runtimes on unsupported lines.
+
+    Within each family the newest `keep` lines are retained and older lines are
+    rolled off, so the build matrix cannot grow without bound. Already-deprecated
+    runtimes are not reconsidered.
+    """
+    if keep < 1:
+        raise ValueError("keep must be at least 1")
+
+    by_family: Dict[str, List[Tuple[str, str]]] = {}
+    for runtime_id in list_runtime_ids():
+        if is_deprecated(runtime_id):
+            continue
+        raw = json.loads(runtime_manifest_path(runtime_id).read_text(encoding="utf-8"))
+        line = _manifest_line(raw)
+        if not line:
+            continue
+        by_family.setdefault(str(raw.get("runtime_family", "")), []).append((runtime_id, line))
+
+    candidates: Dict[str, str] = {}
+    for family, entries in sorted(by_family.items()):
+        lines = sorted({line for _, line in entries}, key=lambda l: tuple(_version_tuple(l) or [0]), reverse=True)
+        if len(lines) <= keep:
+            continue
+        retained = lines[:keep]
+        for runtime_id, line in entries:
+            if line not in retained:
+                candidates[runtime_id] = f"{family} line {line} (keeping newest {keep}: {', '.join(retained)})"
+    return candidates
+
+
+def roll_off(
+    keep: int = DEFAULT_KEEP_LINES, *, apply: bool = False, prune: bool = False
+) -> Dict[str, str]:
+    """Mark (and optionally delete) runtimes on lines older than the newest `keep`.
+
+    Marking is what removes a runtime from the build matrix; `prune` additionally
+    deletes every deprecated runtime directory and is refused when it would empty
+    a whole family.
+    """
+    if prune and not apply:
+        raise ValueError("prune requires apply (marking and deleting are separate steps)")
+
+    candidates = plan_roll_off(keep)
+    if candidates:
+        print(f"{len(candidates)} runtime(s) on unsupported lines:")
+        for runtime_id, reason in sorted(candidates.items()):
+            print(f"  - {runtime_id}: {reason}")
+        if not apply:
+            print("\n(dry run — pass --apply to mark these deprecated)")
+            return candidates
+        for runtime_id in sorted(candidates):
+            manifest_path = runtime_manifest_path(runtime_id)
+            raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+            raw["deprecated"] = True
+            manifest_path.write_text(json.dumps(raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            print(f"  marked deprecated: {runtime_id}")
+    elif not prune:
+        print(f"No runtimes to roll off (keeping the newest {keep} line(s) per family).")
+        return {}
+
+    if not prune:
+        print("\nDeprecated runtimes are excluded from the build matrix; files kept.")
+        return candidates
+
+    # Prune every deprecated runtime, including ones marked on an earlier run.
+    deprecated = [runtime_id for runtime_id in list_runtime_ids() if is_deprecated(runtime_id)]
+    if not deprecated:
+        print("No deprecated runtimes to prune.")
+        return candidates
+
+    for runtime_id in sorted(deprecated):
+        raw = json.loads(runtime_manifest_path(runtime_id).read_text(encoding="utf-8"))
+        family = str(raw.get("runtime_family", ""))
+        siblings = [
+            rid
+            for rid in list_runtime_ids()
+            if rid != runtime_id
+            and json.loads(runtime_manifest_path(rid).read_text(encoding="utf-8")).get("runtime_family") == family
+        ]
+        if not siblings:
+            print(f"  refusing to prune {runtime_id}: last remaining runtime in family '{family}'")
+            continue
+        shutil.rmtree(runtimes_root() / runtime_id)
+        print(f"  pruned: {runtime_id}")
+    return candidates
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Bump runtime distribution versions and refresh checksums."
@@ -847,6 +1057,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--failures-json",
         help="Write a JSON report of runtimes that could not be updated to this path",
     )
+
+    roll_off_parser = subparsers.add_parser(
+        "roll-off", help="Mark runtimes on lines older than the newest N as deprecated"
+    )
+    roll_off_parser.add_argument(
+        "--keep", type=int, default=DEFAULT_KEEP_LINES, help="Newest lines to retain per family (default 2)"
+    )
+    roll_off_parser.add_argument(
+        "--apply", action="store_true", help="Write the deprecated marker (default: report only)"
+    )
+    roll_off_parser.add_argument(
+        "--prune", action="store_true", help="With --apply, also delete the rolled-off directories"
+    )
+    roll_off_parser.add_argument("--json", action="store_true", help="Output the plan as JSON")
 
     return parser
 
@@ -898,6 +1122,14 @@ def main() -> None:
 
         if failures:
             sys.exit(1)
+        return
+
+    if args.command == "roll-off":
+        if args.prune and not args.apply:
+            parser.error("--prune requires --apply")
+        plan = roll_off(args.keep, apply=args.apply, prune=args.prune)
+        if args.json:
+            print(json.dumps(plan, indent=2))
         return
 
     parser.error("Unhandled command")

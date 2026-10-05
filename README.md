@@ -189,7 +189,34 @@ The new runtime is cloned from the newest existing runtime of the same family, i
 upstream. The weekly `/check-runtime-updates` workflow opens a single PR covering both
 same-line patch bumps and new-line additions.
 
-## Update failures and fault tolerance
+PyPy works the same way but its line is the **Python** version, so a new Python line is a
+new runtime (`pypy311` → `pypy312`):
+
+```bash
+python3 tools/runtime_lib/bump_version.py check --json
+# "new_lines": {"portable-pypy": {"id": "pypy312", "line": "3.12", "version": "pypy3.12-v8.0.0"}}
+```
+
+Only Python lines newer than the newest tracked one are proposed — upstream's older lines
+(2.7, 3.6–3.10) are never back-filled.
+
+## Rolling off old lines
+
+Without a bound the build matrix grows one cell per new line forever. `roll-off` keeps the
+newest N lines per family and marks the rest deprecated:
+
+```bash
+make roll-off                  # report only (default: keep the newest 2 lines per family)
+make roll-off ARGS="--keep 1"  # see what a tighter policy would roll off
+make roll-off ARGS="--apply"   # write "deprecated": true
+make roll-off ARGS="--apply --prune"   # also delete the rolled-off directories
+```
+
+Deprecated runtimes are dropped from `manifest_matrix()` (so CI stops building them) and
+from `check`/`bump-latest`, but their files stay until `--prune` and they can still be
+built on demand with `make build RUNTIME=<id>`. Pruning refuses to empty a whole family.
+
+## Fault tolerance
 
 `bump-latest` treats every runtime independently. If one runtime cannot be updated —
 an upstream archive was renamed or removed, a transient network error, an unexpected

@@ -3,6 +3,7 @@
   "runtime_family": "portable-pypy",
   "display_name": "PyPy 3.11",
   "distribution_version": "pypy3.11-v8.0.0",
+  "python_version": "3.11",
   "artifact": {
     "checksum_file": "checksums/pypy.sha256"
   },
