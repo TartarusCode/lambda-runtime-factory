@@ -16,7 +16,8 @@ permissions:
 
 jobs:
   check-and-bump:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
     env:
       # Authenticated GitHub API calls avoid the unauthenticated 60 req/h limit
       # that makes version checks fail intermittently.

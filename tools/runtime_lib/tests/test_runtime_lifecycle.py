@@ -292,6 +292,33 @@ def test_validate_archive_urls_skips_deprecated_by_default(
     assert runtime_manifest.validate_archive_urls() == []
 
 
+def test_manifest_matrix_filters_runtime_and_arch(fake_root: Path) -> None:
+    _write_manifest(fake_root, "bun13", "bun", "1.3.14", version_line="1.3")
+    _write_manifest(fake_root, "deno29", "deno", "2.9.7", version_line="2.9")
+
+    matrix = runtime_manifest.manifest_matrix(["deno29"], ["arm64"])
+    entries = matrix["include"]
+
+    assert len(entries) == 1
+    assert entries[0]["runtime"] == "deno29" and entries[0]["arch"] == "arm64"
+
+
+def test_manifest_matrix_can_include_deprecated(fake_root: Path) -> None:
+    _write_manifest(fake_root, "bun13", "bun", "1.3.14", version_line="1.3", deprecated=True)
+
+    assert runtime_manifest.manifest_matrix()["include"] == []
+    assert len(runtime_manifest.manifest_matrix(include_deprecated=True)["include"]) == 2
+
+
+def test_runner_labels_are_pinned_not_floating() -> None:
+    """`ubuntu-latest` migrates OS releases on GitHub's schedule; never float."""
+    labels = set(runtime_manifest.ARCH_RUNNERS.values()) | {runtime_manifest.DEFAULT_RUNNER}
+
+    assert labels, "runner labels must be defined"
+    assert all(label.startswith("ubuntu-") for label in labels)
+    assert not any("latest" in label for label in labels)
+
+
 def test_check_updates_skips_deprecated_unless_named(
     mocker: pytest.MockFixture, fake_root: Path
 ) -> None:

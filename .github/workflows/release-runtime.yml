@@ -17,6 +17,13 @@ on:
         default: false
         type: boolean
 
+# Publishing mutates S3 and creates Lambda layer versions, so runs are queued
+# rather than cancelled: a second dispatch waits instead of killing a publish
+# mid-flight.
+concurrency:
+  group: release-runtime
+  cancel-in-progress: false
+
 permissions:
   contents: read
   id-token: write
@@ -26,7 +33,8 @@ env:
 
 jobs:
   prepare-matrix:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
@@ -38,60 +46,18 @@ jobs:
         env:
           INPUT_RUNTIME: ${{ github.event.inputs.runtime }}
           INPUT_ARCH: ${{ github.event.inputs.arch }}
+        # Same generator CI uses, so the runner labels and the deprecated-runtime
+        # filter cannot drift from the rest of the pipeline.
         run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import subprocess
-          import sys
-          from pathlib import Path
-
-          root = Path.cwd()
-          runtimes = json.loads(
-              subprocess.check_output(
-                  [sys.executable, "tools/runtime_lib/runtime_manifest.py", "list", "--json"],
-                  cwd=root,
-                  text=True,
-              )
-          )
-
-          selected = os.environ["INPUT_RUNTIME"].strip()
-          if selected and selected != "all":
-              if selected not in runtimes:
-                  raise SystemExit(f"Unknown runtime '{selected}'. Available: {', '.join(runtimes)}")
-              runtimes = [selected]
-
-          all_archs = ["x86_64", "arm64"]
-          selected_arch = os.environ.get("INPUT_ARCH", "all").strip()
-          if selected_arch and selected_arch != "all":
-              if selected_arch not in all_archs:
-                  raise SystemExit(f"Unknown arch '{selected_arch}'. Available: {', '.join(all_archs)}")
-              archs = [selected_arch]
-          else:
-              archs = all_archs
-
-          arch_runners = {
-              "x86_64": "ubuntu-latest",
-              "arm64": "ubuntu-24.04-arm",
-          }
-          matrix = json.dumps({
-              "include": [
-                  {
-                      "runtime": runtime,
-                      "arch": arch,
-                      "runner": arch_runners.get(arch, "ubuntu-latest"),
-                  }
-                  for runtime in runtimes
-                  for arch in archs
-              ]
-          })
-          output_path = Path(os.environ["GITHUB_OUTPUT"])
-          output_path.write_text(f"matrix={matrix}\n", encoding="utf-8")
-          PY
+          echo "matrix=$(python3 tools/runtime_lib/runtime_manifest.py matrix --runtime "${INPUT_RUNTIME:-all}" --arch "${INPUT_ARCH:-all}")" >> "$GITHUB_OUTPUT"
 
   publish:
     needs: prepare-matrix
+    # Gating on a repository environment lets required reviewers approve a
+    # production publish; add them under Settings -> Environments -> release.
+    environment: release
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
@@ -103,41 +69,17 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
-      - name: Prepare cache directories
-        run: |
-          echo "DOWNLOAD_CACHE_DIR=${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads" >> "$GITHUB_ENV"
-          echo "GRYPE_INSTALL_DIR=${RUNNER_TEMP}/grype/bin" >> "$GITHUB_ENV"
-          mkdir -p "${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads"
-          mkdir -p "${RUNNER_TEMP}/grype/bin"
-      - name: Cache runtime downloads
-        uses: actions/cache@v6
+      - uses: ./.github/actions/runtime-build-env
         with:
-          path: ${{ env.DOWNLOAD_CACHE_DIR }}
-          key: downloads-${{ runner.os }}-${{ matrix.runtime }}-${{ matrix.arch }}-${{ hashFiles(format('runtimes/{0}/runtime.json', matrix.runtime), format('runtimes/{0}/checksums/**', matrix.runtime)) }}
-      - name: Cache Grype binary
-        uses: actions/cache@v6
-        with:
-          path: ${{ env.GRYPE_INSTALL_DIR }}
-          key: grype-binary-${{ runner.os }}-${{ matrix.runner }}-${{ env.GRYPE_VERSION }}
-      - name: Cache Grype database
-        uses: actions/cache@v6
-        with:
-          path: ~/.cache/grype
-          key: grype-db-${{ runner.os }}-${{ env.GRYPE_VERSION }}
-          restore-keys: |
-            grype-db-${{ runner.os }}-
-      - name: Install Grype
-        run: |
-          if [[ ! -x "${GRYPE_INSTALL_DIR}/grype" ]]; then
-            curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b "${GRYPE_INSTALL_DIR}" "${GRYPE_VERSION}"
-          fi
-          echo "${GRYPE_INSTALL_DIR}" >> "$GITHUB_PATH"
+          runtime: ${{ matrix.runtime }}
+          arch: ${{ matrix.arch }}
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_RELEASE_ROLE_ARN }}
           aws-region: us-east-1
       - name: Build runtime package
+        timeout-minutes: 20
         run: make build RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Audit runtime package
         run: bash tools/bin/audit-runtime "${{ matrix.runtime }}" "${{ matrix.arch }}"

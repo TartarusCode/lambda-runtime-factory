@@ -4,7 +4,11 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - "**.md"
   pull_request:
+    paths-ignore:
+      - "**.md"
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -19,7 +23,8 @@ env:
 jobs:
   prepare-matrix:
     if: ${{ !(github.event_name == 'pull_request' && github.actor == 'dependabot[bot]') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
@@ -31,13 +36,17 @@ jobs:
         run: echo "matrix=$(python3 tools/runtime_lib/runtime_manifest.py matrix)" >> "$GITHUB_OUTPUT"
 
   repo-checks:
-    if: ${{ !(github.event_name == 'pull_request' && github.actor == 'dependabot[bot]') }}
-    runs-on: ubuntu-latest
+    # Deliberately runs for dependabot PRs too: it is ~10s and it is the only
+    # thing validating an action bump before it merges.
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
       - name: Validate manifests
         run: bash tools/bin/validate-runtimes
       - name: Validate shell scripts
@@ -57,7 +66,7 @@ jobs:
         run: python3 tools/runtime_lib/runtime_manifest.py validate --online
       - name: Run runtime_lib tests
         run: |
-          pip install pytest pytest-mock
+          pip install -r requirements-dev.txt
           python3 -m pytest tools/runtime_lib/tests -q
 
   # The Grype vulnerability database is ~2.8GB and identical for every matrix
@@ -65,25 +74,13 @@ jobs:
   # a warm restore is ~10s and the scan itself is ~1s.
   grype-db:
     if: ${{ !(github.event_name == 'pull_request' && github.actor == 'dependabot[bot]') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
     steps:
-      - name: Compute database cache key
-        id: dbkey
-        # The database is independent of the Grype binary version, so key it on
-        # the week only — a tool bump must not invalidate 2.8GB of cache.
-        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
-      - name: Restore Grype database
-        uses: actions/cache@v6
-        with:
-          path: ~/.cache/grype
-          key: grype-db-${{ runner.os }}-${{ steps.dbkey.outputs.week }}
-          restore-keys: |
-            grype-db-${{ runner.os }}-
-      - name: Install Grype
-        run: |
-          mkdir -p "${RUNNER_TEMP}/grype/bin"
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
-            | sh -s -- -b "${RUNNER_TEMP}/grype/bin" "${GRYPE_VERSION}"
+      - uses: actions/checkout@v7
+      # Primes ~/.cache/grype with the current week's key so the matrix cells
+      # always restore a fresh database instead of racing to download it.
+      - uses: ./.github/actions/runtime-build-env
       - name: Update vulnerability database
         # Best effort: a failed refresh must not block the matrix, which falls
         # back to a previous week's database or a cold download.
@@ -97,6 +94,7 @@ jobs:
       - repo-checks
       - grype-db
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
@@ -105,39 +103,10 @@ jobs:
       BUILD_BEST_EFFORT_AUDIT: "0"
     steps:
       - uses: actions/checkout@v7
-      - name: Prepare cache directories
-        run: |
-          echo "DOWNLOAD_CACHE_DIR=${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads" >> "$GITHUB_ENV"
-          echo "GRYPE_INSTALL_DIR=${RUNNER_TEMP}/grype/bin" >> "$GITHUB_ENV"
-          mkdir -p "${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads"
-          mkdir -p "${RUNNER_TEMP}/grype/bin"
-      - name: Compute database cache key
-        id: dbkey
-        # Must match the key produced by the grype-db job.
-        run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
-      - name: Cache runtime downloads
-        uses: actions/cache@v6
+      - uses: ./.github/actions/runtime-build-env
         with:
-          path: ${{ env.DOWNLOAD_CACHE_DIR }}
-          key: downloads-${{ runner.os }}-${{ matrix.runtime }}-${{ matrix.arch }}-${{ hashFiles(format('runtimes/{0}/runtime.json', matrix.runtime), format('runtimes/{0}/checksums/**', matrix.runtime)) }}
-      - name: Cache Grype binary
-        uses: actions/cache@v6
-        with:
-          path: ${{ env.GRYPE_INSTALL_DIR }}
-          key: grype-binary-${{ runner.os }}-${{ matrix.runner }}-${{ env.GRYPE_VERSION }}
-      - name: Cache Grype database
-        uses: actions/cache@v6
-        with:
-          path: ~/.cache/grype
-          key: grype-db-${{ runner.os }}-${{ steps.dbkey.outputs.week }}
-          restore-keys: |
-            grype-db-${{ runner.os }}-
-      - name: Install Grype
-        run: |
-          if [[ ! -x "${GRYPE_INSTALL_DIR}/grype" ]]; then
-            curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b "${GRYPE_INSTALL_DIR}" "${GRYPE_VERSION}"
-          fi
-          echo "${GRYPE_INSTALL_DIR}" >> "$GITHUB_PATH"
+          runtime: ${{ matrix.runtime }}
+          arch: ${{ matrix.arch }}
       - name: Install archive tooling
         # ubuntu runners ship zip/unzip; only install when actually missing.
         run: |
@@ -145,6 +114,8 @@ jobs:
             sudo apt-get update && sudo apt-get install -y zip unzip
           fi
       - name: Build runtime package
+        # A pathological upstream download must fail fast, not hang the cell.
+        timeout-minutes: 20
         run: make build RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Audit runtime package
         run: bash tools/bin/audit-runtime "${{ matrix.runtime }}" "${{ matrix.arch }}"

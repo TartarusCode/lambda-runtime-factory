@@ -508,25 +508,40 @@ def compile_runtime_python(runtime_id: str) -> None:
 
 
 ARCH_RUNNERS: Dict[str, str] = {
-    "x86_64": "ubuntu-latest",
-    "arm64": "ubuntu-24.04-arm",
+    "x86_64": "ubuntu-26.04",
+    "arm64": "ubuntu-26.04-arm",
 }
 
+# Pin runner images explicitly: the `ubuntu-latest` label migrates between OS
+# releases on GitHub's schedule (24.04 -> 26.04 rolls out from 2026-10-19), which
+# would silently change the toolchain under a pipeline that builds native
+# runtimes. Bump these deliberately and re-validate the build.
+DEFAULT_RUNNER = "ubuntu-26.04"
 
-def manifest_matrix() -> Dict[str, Any]:
+
+def manifest_matrix(
+    runtime_ids: Iterable[str] | None = None,
+    archs: Iterable[str] | None = None,
+    include_deprecated: bool = False,
+) -> Dict[str, Any]:
+    """Return the CI build matrix, optionally filtered to specific runtimes/arches.
+
+    Deprecated runtimes are excluded (so the matrix cannot grow without bound)
+    unless explicitly requested with include_deprecated.
+    """
+    selected = list(runtime_ids) if runtime_ids is not None else list_runtime_ids()
+    selected_archs = list(archs) if archs is not None else SUPPORTED_ARCHS
     entries = []
-    for runtime_id in list_runtime_ids():
+    for runtime_id in selected:
         data = json.loads(runtime_manifest_path(runtime_id).read_text(encoding="utf-8"))
-        # Deprecated runtimes are rolled off the matrix so it cannot grow without
-        # bound; they remain buildable on demand via `make build RUNTIME=...`.
-        if data.get("deprecated"):
+        if data.get("deprecated") and not include_deprecated:
             continue
         skip_local = data.get("local_testing", {}).get("skip_local_invoke", False)
-        for arch in SUPPORTED_ARCHS:
+        for arch in selected_archs:
             entries.append({
                 "runtime": runtime_id,
                 "arch": arch,
-                "runner": ARCH_RUNNERS.get(arch, "ubuntu-latest"),
+                "runner": ARCH_RUNNERS.get(arch, DEFAULT_RUNNER),
                 "skip_local_invoke": skip_local,
             })
     return {"include": entries}
@@ -549,6 +564,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     matrix_parser = subparsers.add_parser("matrix")
     matrix_parser.add_argument("--json", action="store_true", default=True)
+    matrix_parser.add_argument("--runtime", help="Runtime id, or 'all'")
+    matrix_parser.add_argument("--arch", help="Architecture, or 'all'")
+    matrix_parser.add_argument(
+        "--include-deprecated", action="store_true", help="Also emit deprecated runtimes"
+    )
 
     validate_parser = subparsers.add_parser("validate")
     validate_parser.add_argument("--runtime")
@@ -583,7 +603,24 @@ def main() -> None:
         return
 
     if args.command == "matrix":
-        print(json.dumps(manifest_matrix()))
+        runtime_ids = None
+        if args.runtime and args.runtime != "all":
+            known = list_runtime_ids()
+            if args.runtime not in known:
+                raise SystemExit(
+                    f"Unknown runtime '{args.runtime}'. Available: {', '.join(known)}"
+                )
+            runtime_ids = [args.runtime]
+        archs = None
+        if args.arch and args.arch != "all":
+            if args.arch not in SUPPORTED_ARCHS:
+                raise SystemExit(
+                    f"Unknown arch '{args.arch}'. Available: {', '.join(SUPPORTED_ARCHS)}"
+                )
+            archs = [args.arch]
+        print(json.dumps(manifest_matrix(
+            runtime_ids, archs, include_deprecated=args.include_deprecated
+        )))
         return
 
     if args.command == "validate":

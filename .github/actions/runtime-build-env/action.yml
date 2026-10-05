@@ -1,0 +1,65 @@
+name: Runtime build environment
+description: >-
+  Cache the runtime download, the Grype binary and the Grype vulnerability
+  database, then install Grype. Shared by the CI matrix, the release matrix and
+  the database-prime job so their cache keys cannot drift apart.
+
+inputs:
+  runtime:
+    description: Runtime id whose archive download should be cached (omit to skip)
+    required: false
+    default: ""
+  arch:
+    description: Architecture whose archive download should be cached (omit to skip)
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Prepare cache directories
+      shell: bash
+      run: |
+        echo "DOWNLOAD_CACHE_DIR=${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads" >> "$GITHUB_ENV"
+        echo "GRYPE_INSTALL_DIR=${RUNNER_TEMP}/grype/bin" >> "$GITHUB_ENV"
+        mkdir -p "${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads"
+        mkdir -p "${RUNNER_TEMP}/grype/bin"
+
+    - name: Compute database cache key
+      id: dbkey
+      shell: bash
+      # The database is independent of the Grype binary version, so key it on the
+      # week only — a tool bump must not invalidate 2.8GB of cache.
+      run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+    - name: Cache runtime downloads
+      if: inputs.runtime != ''
+      uses: actions/cache@v6
+      with:
+        path: ${{ env.DOWNLOAD_CACHE_DIR }}
+        key: downloads-${{ runner.os }}-${{ inputs.runtime }}-${{ inputs.arch }}-${{ hashFiles(format('runtimes/{0}/runtime.json', inputs.runtime), format('runtimes/{0}/checksums/**', inputs.runtime)) }}
+
+    - name: Cache Grype binary
+      uses: actions/cache@v6
+      with:
+        path: ${{ env.GRYPE_INSTALL_DIR }}
+        # runner.arch, not the runner label: the binary is the same across OS
+        # releases, so pinning the image must not invalidate this cache.
+        key: grype-binary-${{ runner.os }}-${{ runner.arch }}-${{ env.GRYPE_VERSION }}
+
+    - name: Cache Grype database
+      uses: actions/cache@v6
+      with:
+        path: ~/.cache/grype
+        key: grype-db-${{ runner.os }}-${{ steps.dbkey.outputs.week }}
+        restore-keys: |
+          grype-db-${{ runner.os }}-
+
+    - name: Install Grype
+      shell: bash
+      run: |
+        if [[ ! -x "${GRYPE_INSTALL_DIR}/grype" ]]; then
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+            | sh -s -- -b "${GRYPE_INSTALL_DIR}" "${GRYPE_VERSION}"
+        fi
+        echo "${GRYPE_INSTALL_DIR}" >> "$GITHUB_PATH"
