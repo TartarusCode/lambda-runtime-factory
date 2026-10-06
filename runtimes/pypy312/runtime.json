@@ -1,0 +1,18 @@
+{
+  "runtime_id": "pypy312",
+  "runtime_family": "portable-pypy",
+  "display_name": "PyPy 3.12",
+  "distribution_version": "pypy3.12-v8.0.0",
+  "python_version": "3.12",
+  "artifact": {
+    "checksum_file": "checksums/pypy.sha256"
+  },
+  "release": {
+    "regions": [
+      "eu-central-1",
+      "us-west-1"
+    ]
+  },
+  "archive_ext": ".tar.gz",
+  "version_line": "3.12"
+}
