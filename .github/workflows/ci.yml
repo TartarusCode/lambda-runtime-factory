@@ -81,6 +81,9 @@ jobs:
       # Primes ~/.cache/grype with the current week's key so the matrix cells
       # always restore a fresh database instead of racing to download it.
       - uses: ./.github/actions/runtime-build-env
+        with:
+          # This job exists to refresh the database, so it always prepares it.
+          grype: always
       - name: Update vulnerability database
         # Best effort: a failed refresh must not block the matrix, which falls
         # back to a previous week's database or a cold download.
@@ -104,9 +107,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/runtime-build-env
+        id: build-env
         with:
           runtime: ${{ matrix.runtime }}
           arch: ${{ matrix.arch }}
+          grype: when-changed
       - name: Install archive tooling
         # ubuntu runners ship zip/unzip; only install when actually missing.
         run: |
@@ -118,6 +123,11 @@ jobs:
         timeout-minutes: 20
         run: make build RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Audit runtime package
+        # Skipped when this cell's archive was already cached: the findings come
+        # only from the pinned upstream payload, so an unchanged archive can only
+        # report CVE-database drift that no commit caused. That drift is caught by
+        # the weekly audit-runtimes workflow instead of blocking unrelated PRs.
+        if: steps.build-env.outputs.audit == 'true'
         run: bash tools/bin/audit-runtime "${{ matrix.runtime }}" "${{ matrix.arch }}"
       - name: Install SAM CLI
         if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke

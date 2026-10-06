@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 import bump_version
 import runtime_manifest
@@ -331,3 +332,72 @@ def test_check_updates_skips_deprecated_unless_named(
     assert "bun13" not in bump_version.check_updates()
     # An explicit request still checks a deprecated runtime.
     assert "bun13" in bump_version.check_updates(["bun13"])
+
+
+# --- CI gating contract --------------------------------------------------------
+#
+# The Grype scan is skipped for cells whose pinned payload did not change, so the
+# call sites that MUST always scan cannot rely on a default. These tests encode
+# that invariant so it cannot be lost by editing a workflow.
+
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_BUILD_ENV_ACTION = "./.github/actions/runtime-build-env"
+
+# (workflow file, job) pairs whose entire purpose is the scan.
+_AUDIT_CRITICAL = {
+    ("ci.yml", "grype-db"),
+    ("release-runtime.yml", "publish"),
+    ("audit-runtimes.yml", "audit"),
+}
+
+
+def _build_env_call_sites() -> dict[tuple[str, str], dict]:
+    """Map every (workflow, job) that uses the build-env action to its inputs."""
+    sites: dict[tuple[str, str], dict] = {}
+    for path in sorted((_REPO_ROOT / ".github" / "workflows").glob("*.yml")):
+        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        for job_name, job in (doc.get("jobs") or {}).items():
+            for step in job.get("steps") or []:
+                if step.get("uses") == _BUILD_ENV_ACTION:
+                    sites[(path.name, job_name)] = step.get("with") or {}
+    return sites
+
+
+def test_build_env_defaults_to_the_cheap_path() -> None:
+    """The optimization must not be opt-in via a default that pays 2.8GB."""
+    action = yaml.safe_load(
+        (_REPO_ROOT / ".github/actions/runtime-build-env/action.yml").read_text(encoding="utf-8")
+    )
+
+    assert action["inputs"]["grype"]["default"] == "when-changed"
+
+
+def test_every_build_env_call_site_declares_grype_explicitly() -> None:
+    sites = _build_env_call_sites()
+
+    assert sites, "no workflow uses the build-env action"
+    for site, inputs in sites.items():
+        assert inputs.get("grype") in {"always", "when-changed"}, (
+            f"{site[0]}:{site[1]} must pass `grype:` explicitly"
+        )
+
+
+def test_audit_critical_jobs_always_prepare_grype() -> None:
+    sites = _build_env_call_sites()
+
+    for site in sorted(_AUDIT_CRITICAL):
+        assert sites.get(site, {}).get("grype") == "always", (
+            f"{site[0]}:{site[1]} must always prepare Grype"
+        )
+
+
+def test_ci_matrix_audit_step_is_gated_on_the_decision() -> None:
+    """The gate and the action output must stay wired to each other."""
+    doc = yaml.safe_load((_REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
+    steps = doc["jobs"]["runtime-checks"]["steps"]
+
+    call = next(step for step in steps if step.get("uses") == _BUILD_ENV_ACTION)
+    audit = next(step for step in steps if step.get("name") == "Audit runtime package")
+
+    assert call.get("id") == "build-env"
+    assert audit.get("if") == "steps.build-env.outputs.audit == 'true'"

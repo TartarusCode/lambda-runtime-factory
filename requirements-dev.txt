@@ -1,2 +1,4 @@
 pytest
 pytest-mock
+# The CI contract tests parse the workflow and action YAML.
+pyyaml

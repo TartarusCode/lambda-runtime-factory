@@ -13,6 +13,22 @@ inputs:
     description: Architecture whose archive download should be cached (omit to skip)
     required: false
     default: ""
+  grype:
+    description: >-
+      "when-changed" (the default) prepares the Grype database only when the
+      runtime archive was not already cached, i.e. when the payload actually
+      changed. "always" forces it. Audit-critical call sites (the database prime
+      job, the release publish, the scheduled audit) must pass "always"
+      explicitly; test_audit_gating_contract enforces that.
+    required: false
+    default: "when-changed"
+
+outputs:
+  audit:
+    description: >-
+      "true" when the Grype scan should run for this cell. Consume it as
+      `steps.<id>.outputs.audit == 'true'` on the audit step.
+    value: ${{ steps.decide.outputs.audit }}
 
 runs:
   using: composite
@@ -25,21 +41,39 @@ runs:
         mkdir -p "${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads"
         mkdir -p "${RUNNER_TEMP}/grype/bin"
 
-    - name: Compute database cache key
-      id: dbkey
-      shell: bash
-      # The database is independent of the Grype binary version, so key it on the
-      # week only — a tool bump must not invalidate 2.8GB of cache.
-      run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
-
     - name: Cache runtime downloads
+      id: downloads
       if: inputs.runtime != ''
       uses: actions/cache@v6
       with:
         path: ${{ env.DOWNLOAD_CACHE_DIR }}
         key: downloads-${{ runner.os }}-${{ inputs.runtime }}-${{ inputs.arch }}-${{ hashFiles(format('runtimes/{0}/runtime.json', inputs.runtime), format('runtimes/{0}/checksums/**', inputs.runtime)) }}
 
+    - name: Decide whether to audit
+      id: decide
+      shell: bash
+      # Grype's findings come only from the pinned upstream payload (our helpers
+      # ship no dependency metadata), so re-scanning an already-cached archive can
+      # only report CVE-database drift that no commit caused. That drift is caught
+      # by the scheduled audit-runtimes workflow instead of failing unrelated PRs.
+      # A cold cache (no downloads step, or an evicted entry) conservatively audits.
+      run: |
+        if [[ "${{ inputs.grype }}" == "always" || "${{ steps.downloads.outputs.cache-hit }}" != "true" ]]; then
+          echo "audit=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "audit=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Compute database cache key
+      id: dbkey
+      if: steps.decide.outputs.audit == 'true'
+      shell: bash
+      # The database is independent of the Grype binary version, so key it on the
+      # week only — a tool bump must not invalidate 2.8GB of cache.
+      run: echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
     - name: Cache Grype binary
+      if: steps.decide.outputs.audit == 'true'
       uses: actions/cache@v6
       with:
         path: ${{ env.GRYPE_INSTALL_DIR }}
@@ -48,6 +82,7 @@ runs:
         key: grype-binary-${{ runner.os }}-${{ runner.arch }}-${{ env.GRYPE_VERSION }}
 
     - name: Cache Grype database
+      if: steps.decide.outputs.audit == 'true'
       uses: actions/cache@v6
       with:
         path: ~/.cache/grype
@@ -56,6 +91,7 @@ runs:
           grype-db-${{ runner.os }}-
 
     - name: Install Grype
+      if: steps.decide.outputs.audit == 'true'
       shell: bash
       run: |
         if [[ ! -x "${GRYPE_INSTALL_DIR}/grype" ]]; then

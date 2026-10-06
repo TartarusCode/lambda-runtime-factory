@@ -73,6 +73,8 @@ jobs:
         with:
           runtime: ${{ matrix.runtime }}
           arch: ${{ matrix.arch }}
+          # Publishing must always be gated on a fresh scan.
+          grype: always
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
