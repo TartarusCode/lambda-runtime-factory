@@ -51,8 +51,23 @@ jobs:
         run: |
           echo "matrix=$(python3 tools/runtime_lib/runtime_manifest.py matrix --runtime "${INPUT_RUNTIME:-all}" --arch "${INPUT_ARCH:-all}")" >> "$GITHUB_OUTPUT"
 
+  # The publish cells only restore the database, so they need the entry primed
+  # first: a manual release must not scan against a week-old database just because
+  # no push happened to refresh it. Like the CI primer, this is the only writer.
+  grype-db:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/runtime-build-env
+        with:
+          grype: always
+          db-refresh: "true"
+
   publish:
-    needs: prepare-matrix
+    needs:
+      - prepare-matrix
+      - grype-db
     # Gating on a repository environment lets required reviewers approve a
     # production publish; add them under Settings -> Environments -> release.
     environment: release
@@ -75,6 +90,8 @@ jobs:
           arch: ${{ matrix.arch }}
           # Publishing must always be gated on a fresh scan.
           grype: always
+          # Cells only read the week's database; the grype-db job writes it.
+          db-refresh: "false"
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:

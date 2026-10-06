@@ -22,6 +22,18 @@ inputs:
       explicitly; test_audit_gating_contract enforces that.
     required: false
     default: "when-changed"
+  db-refresh:
+    description: >-
+      "false" (the default) only restores the week's Grype database. "true" makes
+      this call site the week's refresher: it runs `grype db update` and saves the
+      result under the week's key when that entry does not exist yet. Cache
+      entries are immutable, so the refresher must be the only writer — otherwise
+      a job that merely restored the previous week's database would freeze a
+      stale copy under the new week's key for the rest of the week. Exactly one
+      call site per scanning workflow passes "true";
+      test_one_database_refresher_per_scanning_workflow enforces that.
+    required: false
+    default: "false"
 
 outputs:
   audit:
@@ -29,6 +41,13 @@ outputs:
       "true" when the Grype scan should run for this cell. Consume it as
       `steps.<id>.outputs.audit == 'true'` on the audit step.
     value: ${{ steps.decide.outputs.audit }}
+  package-cache-hit:
+    description: >-
+      "true" when the built runtime package for this runtime+arch is already
+      cached, i.e. the archive, bootstrap, helpers and build script are unchanged.
+      Consume it as `steps.<id>.outputs.package-cache-hit != 'true'` on the build
+      step to skip a rebuild whose output is already on disk.
+    value: ${{ steps.package.outputs.cache-hit }}
 
 runs:
   using: composite
@@ -48,6 +67,18 @@ runs:
       with:
         path: ${{ env.DOWNLOAD_CACHE_DIR }}
         key: downloads-${{ runner.os }}-${{ inputs.runtime }}-${{ inputs.arch }}-${{ hashFiles(format('runtimes/{0}/runtime.json', inputs.runtime), format('runtimes/{0}/checksums/**', inputs.runtime)) }}
+
+    - name: Cache built runtime package
+      id: package
+      if: inputs.runtime != ''
+      # Keyed on everything the build reads — the pinned archive, our bootstrap and
+      # helpers, and the layout logic — so a hit can only ever mean "the package
+      # this build would produce is already cached". Deliberately no restore-keys:
+      # a package built from different inputs must never be reused.
+      uses: actions/cache@v6
+      with:
+        path: ${{ runner.temp }}/lambda-runtime-monorepo/${{ inputs.runtime }}/${{ inputs.arch }}/artifacts
+        key: package-${{ runner.os }}-${{ inputs.runtime }}-${{ inputs.arch }}-${{ hashFiles(format('runtimes/{0}/runtime.json', inputs.runtime), format('runtimes/{0}/checksums/**', inputs.runtime), format('runtimes/{0}/bootstrap/**', inputs.runtime), format('runtimes/{0}/helpers/**', inputs.runtime), 'tools/bin/build-runtime', 'tools/runtime_lib/runtime_manifest.py') }}
 
     - name: Decide whether to audit
       id: decide
@@ -81,9 +112,14 @@ runs:
         # releases, so pinning the image must not invalidate this cache.
         key: grype-binary-${{ runner.os }}-${{ runner.arch }}-${{ env.GRYPE_VERSION }}
 
-    - name: Cache Grype database
+    - name: Restore Grype database
+      id: dbcache
       if: steps.decide.outputs.audit == 'true'
-      uses: actions/cache@v6
+      # Restore-only, never the combined action: a key that already exists is
+      # never re-saved, so a combined cache step would make whichever job ran
+      # first the week's writer — freezing the previous week's database under the
+      # new week's key. Only the refresher below may create the entry.
+      uses: actions/cache/restore@v6
       with:
         path: ~/.cache/grype
         key: grype-db-${{ runner.os }}-${{ steps.dbkey.outputs.week }}
@@ -99,3 +135,33 @@ runs:
             | sh -s -- -b "${GRYPE_INSTALL_DIR}" "${GRYPE_VERSION}"
         fi
         echo "${GRYPE_INSTALL_DIR}" >> "$GITHUB_PATH"
+
+    # Skipped when the week's entry already exists: the entry is immutable, so the
+    # refresh would be discarded at the end of the job.
+    - name: Update vulnerability database
+      id: dbupdate
+      if: steps.decide.outputs.audit == 'true' && inputs.db-refresh == 'true' && steps.dbcache.outputs.cache-hit != 'true'
+      shell: bash
+      # Best effort: a failed refresh must not block the matrix, which falls back to
+      # the database that was just restored. The step records whether the refresh
+      # actually happened so the save below cannot cache a stale database.
+      run: |
+        if "${GRYPE_INSTALL_DIR}/grype db update"; then
+          echo "refreshed=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "refreshed=false" >> "$GITHUB_OUTPUT"
+          echo "::warning::grype db update failed; this week's database was not refreshed"
+        fi
+
+    # Only the refresher writes the entry, and only when it actually refreshed: a
+    # failed refresh would otherwise freeze the stale database it fell back to under
+    # the new week's key.
+    - name: Save vulnerability database
+      if: steps.decide.outputs.audit == 'true' && inputs.db-refresh == 'true' && steps.dbcache.outputs.cache-hit != 'true' && steps.dbupdate.outputs.refreshed == 'true'
+      # A concurrent refresher on the same week can win the race to save; the entry
+      # it wrote holds the same week's database, so losing here is harmless.
+      continue-on-error: true
+      uses: actions/cache/save@v6
+      with:
+        path: ~/.cache/grype
+        key: grype-db-${{ runner.os }}-${{ steps.dbkey.outputs.week }}

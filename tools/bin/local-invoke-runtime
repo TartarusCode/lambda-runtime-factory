@@ -6,8 +6,13 @@ source "$(dirname "$0")/_common.sh"
 runtime_id=$(common::require_runtime_id "${1:-}")
 arch=$(common::require_arch "${2:-}")
 
-bash "$(common::repo_root)/tools/bin/local-build-runtime" "${runtime_id}" "${arch}"
 common::load_runtime_env "${runtime_id}" "${arch}"
+
+# `make local-build` normally ran in this same job moments ago; only rebuild when its
+# SAM output is missing (a bare `make local-invoke`).
+if [[ ! -f "${LOCAL_BUILD_TEMPLATE}" ]]; then
+    bash "$(common::repo_root)/tools/bin/local-build-runtime" "${runtime_id}" "${arch}"
+fi
 
 mkdir -p "${LOCAL_INVOKE_DIR}"
 cp -R "${LOCAL_SOURCE_DIR}/." "${LOCAL_INVOKE_DIR}/"
@@ -60,10 +65,35 @@ template_path.write_text(
 )
 PY
 
-invoke_output=$(sam local invoke "${LOCAL_FUNCTION_NAME}" --template-file "${LOCAL_INVOKE_TEMPLATE}" --event "${LOCAL_EVENT}" 2>&1) || true
+set +e
+invoke_output=$(sam local invoke "${LOCAL_FUNCTION_NAME}" --template-file "${LOCAL_INVOKE_TEMPLATE}" --event "${LOCAL_EVENT}" 2>&1)
+invoke_status=$?
+set -e
 echo "${invoke_output}"
 
+# A green run has to mean the handler answered through the layer's bootstrap, so the
+# exit status and the expected response are checked as well: only looking for known
+# failure strings lets a broken invocation (or one that never reached the handler)
+# pass as a success.
+failure=0
+if (( invoke_status != 0 )); then
+    echo "sam local invoke exited ${invoke_status} for ${runtime_id}" >&2
+    failure=1
+fi
 if echo "${invoke_output}" | grep -qE "(Init failed|Invoke failed|Invoke DONE failed|exit status [1-9])"; then
-    echo "Local invoke failed for ${runtime_id}" >&2
+    echo "sam local invoke reported a failure for ${runtime_id}" >&2
+    failure=1
+fi
+if ! echo "${invoke_output}" | grep -qE '"statusCode"[[:space:]]*:[[:space:]]*200'; then
+    echo "sam local invoke returned no 200 response for ${runtime_id}" >&2
+    failure=1
+fi
+# Every example handler returns {"message": "hello world"}.
+if ! echo "${invoke_output}" | grep -q "hello world"; then
+    echo "sam local invoke response did not carry the handler's payload for ${runtime_id}" >&2
+    failure=1
+fi
+
+if (( failure )); then
     exit 1
 fi

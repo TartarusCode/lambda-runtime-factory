@@ -401,3 +401,162 @@ def test_ci_matrix_audit_step_is_gated_on_the_decision() -> None:
 
     assert call.get("id") == "build-env"
     assert audit.get("if") == "steps.build-env.outputs.audit == 'true'"
+
+
+# --- Grype database cache contract --------------------------------------------
+#
+# actions/cache entries are immutable: a restore whose key already exists is never
+# saved back ("Cache hit occurred on the primary key ..., not saving cache"). Two
+# invariants follow, and these tests keep both from being lost by editing a
+# workflow:
+#   1. only the job that refreshed the database may write the week's entry, or the
+#      first restorer would freeze the previous week's database under the new key;
+#   2. the refresh is skipped when the entry exists, because it could only be
+#      discarded at the end of the job.
+
+_BUILD_ENV_ACTION_PATH = _REPO_ROOT / ".github" / "actions" / "runtime-build-env" / "action.yml"
+_DB_CACHE_PATH = "~/.cache/grype"
+
+# (workflow, job that refreshes the database, job that consumes the entry)
+_DATABASE_PRIMERS = {
+    "ci.yml": ("grype-db", "runtime-checks"),
+    "audit-runtimes.yml": ("grype-db", "audit"),
+    "release-runtime.yml": ("grype-db", "publish"),
+}
+
+
+def _build_env_action() -> dict:
+    return yaml.safe_load(_BUILD_ENV_ACTION_PATH.read_text(encoding="utf-8"))
+
+
+def _action_step(name: str) -> dict:
+    return next(
+        step for step in _build_env_action()["runs"]["steps"] if step.get("name") == name
+    )
+
+
+def test_the_database_cache_is_only_written_by_the_refresher() -> None:
+    steps = [s for s in _build_env_action()["runs"]["steps"] if (s.get("with") or {}).get("path") == _DB_CACHE_PATH]
+
+    assert [s["name"] for s in steps] == ["Restore Grype database", "Save vulnerability database"], (
+        "the database cache must be split into a restore and an explicit save; "
+        "the combined action saves whatever ran first"
+    )
+    assert steps[0]["uses"] == "actions/cache/restore@v6"
+    assert steps[1]["uses"] == "actions/cache/save@v6"
+
+
+def test_the_database_refresh_is_skipped_when_the_week_is_already_cached() -> None:
+    """An existing key is never re-saved, so a refresh on a hit is pure waste."""
+    for name in ("Update vulnerability database", "Save vulnerability database"):
+        condition = _action_step(name)["if"]
+        for clause in ("inputs.db-refresh == 'true'", "steps.dbcache.outputs.cache-hit != 'true'"):
+            assert clause in condition, f"{name} must gate on {clause}"
+
+    assert "steps.dbupdate.outputs.refreshed == 'true'" in _action_step("Save vulnerability database")["if"], (
+        "a failed refresh must not be cached: it would freeze the restored database "
+        "under the new week's key"
+    )
+
+
+def test_every_build_env_call_site_declares_its_database_role_explicitly() -> None:
+    sites = _build_env_call_sites()
+
+    for site, inputs in sites.items():
+        assert inputs.get("db-refresh") in {"true", "false"}, (
+            f"{site[0]}:{site[1]} must pass `db-refresh:` explicitly"
+        )
+
+
+def test_one_database_refresher_per_scanning_workflow() -> None:
+    sites = _build_env_call_sites()
+    refreshers = {site for site, inputs in sites.items() if inputs.get("db-refresh") == "true"}
+
+    assert refreshers == {(workflow, primer) for workflow, (primer, _) in _DATABASE_PRIMERS.items()}
+
+    for workflow, (primer, scanner) in _DATABASE_PRIMERS.items():
+        jobs = yaml.safe_load(
+            (_REPO_ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
+        )["jobs"]
+        needs = jobs[scanner].get("needs")
+        needs = needs if isinstance(needs, list) else [needs]
+
+        assert primer in needs, f"{workflow}: {scanner} must wait for the database refresher"
+
+
+def test_no_workflow_refreshes_the_database_outside_the_action() -> None:
+    """The update must stay next to the cache gate that decides whether to save it."""
+    for path in sorted((_REPO_ROOT / ".github" / "workflows").glob("*.yml")):
+        assert "grype db update" not in path.read_text(encoding="utf-8"), (
+            f"{path.name} must let the build-env action gate the database refresh"
+        )
+
+
+# --- Built-package cache contract ---------------------------------------------
+#
+# The package cache may only ever hold the package this build would produce, so its
+# key covers every build input and it must not fall back to a prefix match: a stale
+# package restored from another revision would ship without a rebuild.
+
+_PACKAGE_INPUTS = (
+    "runtime.json",
+    "checksums/**",
+    "bootstrap/**",
+    "helpers/**",
+    "tools/bin/build-runtime",
+    "tools/runtime_lib/runtime_manifest.py",
+)
+
+
+def test_the_package_cache_is_keyed_on_every_build_input() -> None:
+    step = _action_step("Cache built runtime package")
+    key = step["with"]["key"]
+
+    assert step["uses"] == "actions/cache@v6"
+    assert step["with"]["path"].endswith("/artifacts"), step["with"]["path"]
+    for build_input in _PACKAGE_INPUTS:
+        assert build_input in key, f"the package cache key must cover {build_input}"
+    assert step["with"].get("restore-keys") is None, (
+        "a package built from other inputs must never be restored"
+    )
+
+    assert _build_env_action()["outputs"]["package-cache-hit"]["value"] == (
+        "${{ steps.package.outputs.cache-hit }}"
+    )
+
+
+def test_the_sam_image_is_warmed_at_the_tag_sam_resolves() -> None:
+    """Bare `:latest` is a multi-arch list and a different image from the arch tag
+    SAM pulls, so warming it only fetches layers SAM never uses."""
+    doc = yaml.safe_load((_REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
+    steps = doc["jobs"]["runtime-checks"]["steps"]
+
+    warm = next(step for step in steps if step.get("name") == "Warm SAM build image")
+
+    assert "public.ecr.aws/sam/build-provided.al2023:latest-${{ matrix.arch }}" in warm["run"]
+
+
+def test_local_invoke_asserts_the_handler_answered() -> None:
+    """A green verify step must mean the handler ran, not just that no known failure
+    string appeared, and it must not rebuild what the previous step built."""
+    script = (_REPO_ROOT / "tools" / "bin" / "local-invoke-runtime").read_text(encoding="utf-8")
+
+    assert "|| true" not in script, "the sam local invoke exit status must not be discarded"
+    assert "invoke_status" in script, "the exit status must be checked"
+    assert "statusCode" in script and "hello world" in script, (
+        "the response must be asserted, not only the absence of failure text"
+    )
+    assert "LOCAL_BUILD_TEMPLATE" in script, (
+        "the SAM build must be skipped when `make local-build` already produced it"
+    )
+
+
+def test_the_ci_build_is_skipped_when_the_package_is_cached() -> None:
+    doc = yaml.safe_load((_REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
+    steps = doc["jobs"]["runtime-checks"]["steps"]
+
+    hold = next(step for step in steps if step.get("uses") == _BUILD_ENV_ACTION)
+    build = next(step for step in steps if step.get("name") == "Build runtime package")
+
+    assert hold.get("id") == "build-env"
+    assert build.get("if") == "steps.build-env.outputs.package-cache-hit != 'true'"

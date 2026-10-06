@@ -78,17 +78,15 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      # Primes ~/.cache/grype with the current week's key so the matrix cells
-      # always restore a fresh database instead of racing to download it.
+      # This job is the week's only database writer: it refreshes the entry the
+      # matrix cells then restore instead of racing to download it. The refresh
+      # is skipped when the week's entry already exists, since an immutable cache
+      # entry can never be re-saved and the update would be discarded.
       - uses: ./.github/actions/runtime-build-env
         with:
           # This job exists to refresh the database, so it always prepares it.
           grype: always
-      - name: Update vulnerability database
-        # Best effort: a failed refresh must not block the matrix, which falls
-        # back to a previous week's database or a cold download.
-        continue-on-error: true
-        run: "${RUNNER_TEMP}/grype/bin/grype db update"
+          db-refresh: "true"
 
   runtime-checks:
     if: ${{ !(github.event_name == 'pull_request' && github.actor == 'dependabot[bot]') }}
@@ -112,6 +110,8 @@ jobs:
           runtime: ${{ matrix.runtime }}
           arch: ${{ matrix.arch }}
           grype: when-changed
+          # Cells only read the week's database; the grype-db job writes it.
+          db-refresh: "false"
       - name: Install archive tooling
         # ubuntu runners ship zip/unzip; only install when actually missing.
         run: |
@@ -119,6 +119,11 @@ jobs:
             sudo apt-get update && sudo apt-get install -y zip unzip
           fi
       - name: Build runtime package
+        # Skipped when the package cache hit: the pinned archive, our bootstrap and
+        # helpers and the build script are all unchanged, so rebuilding only repeats
+        # the same extraction and zip (up to ~80s for rust). The restored zip still
+        # feeds the SAM example and the artifact upload.
+        if: steps.build-env.outputs.package-cache-hit != 'true'
         # A pathological upstream download must fail fast, not hang the cell.
         timeout-minutes: 20
         run: make build RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
@@ -141,7 +146,11 @@ jobs:
         run: pip install -r requirements-ci.txt
       - name: Warm SAM build image
         if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke
-        run: docker pull public.ecr.aws/sam/build-provided.al2023:latest
+        # SAM resolves an arch-suffixed tag (public.ecr.aws/sam/build-provided.al2023:
+        # latest-<arch>), and that is a different image from the multi-arch `latest`
+        # list: on x86 they share 1 of 15 layers, so pulling bare `:latest` warms
+        # 734MB SAM never uses and leaves it to fetch ~695MB of its own.
+        run: docker pull "public.ecr.aws/sam/build-provided.al2023:latest-${{ matrix.arch }}"
       - name: Build local SAM example
         if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke
         run: make local-build RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}

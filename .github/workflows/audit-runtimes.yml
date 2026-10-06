@@ -41,8 +41,23 @@ jobs:
         run: |
           echo "matrix=$(python3 tools/runtime_lib/runtime_manifest.py matrix --runtime "${INPUT_RUNTIME:-all}")" >> "$GITHUB_OUTPUT"
 
+  # Usually the first run of a new ISO week, so usually the run that refreshes
+  # the cached database; the cells below then restore the fresh entry instead of
+  # scanning with a week-old one. Like the CI primer, this is the only writer.
+  grype-db:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/runtime-build-env
+        with:
+          grype: always
+          db-refresh: "true"
+
   audit:
-    needs: prepare-matrix
+    needs:
+      - prepare-matrix
+      - grype-db
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
@@ -59,6 +74,8 @@ jobs:
           arch: ${{ matrix.arch }}
           # The whole point of this workflow is the scan.
           grype: always
+          # Cells only read the week's database; the grype-db job writes it.
+          db-refresh: "false"
       - name: Install archive tooling
         run: |
           if ! command -v zip >/dev/null || ! command -v unzip >/dev/null; then
