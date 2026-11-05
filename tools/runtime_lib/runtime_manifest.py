@@ -23,7 +23,7 @@ REPO_DEFAULTS: Dict[str, Any] = {
         "compatible_runtimes": ["provided.al2023"],
     },
     "release": {
-        "bucket_base_name": "tartaruscode-custom-runtimes",
+        "bucket_base_name": "tartarus-runtimes",
         "regions": ["eu-central-1", "us-west-1"],
     },
     "local_testing": {

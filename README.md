@@ -11,7 +11,7 @@ Every runtime in the matrix is published as a Lambda layer, per architecture:
 - **Compatible runtime**: `provided.al2023`
 - **Architectures**: `x86_64` and `arm64`
 - **Regions**: `eu-central-1`, `us-west-1`
-- **Uploads** go to `s3://tartaruscode-custom-runtimes-<region>/<runtime-id>/<arch>/<sha256>.zip` —
+- **Uploads** go to `s3://tartarus-runtimes-<region>/<runtime-id>/<arch>/<sha256>.zip` —
   content-addressed, so a layer version always points at the exact bytes it was built from
 - **Layers are public**: `lambda:GetLayerVersion` is granted to `*`
 
