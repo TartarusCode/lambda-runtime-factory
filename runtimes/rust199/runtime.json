@@ -2,7 +2,7 @@
   "runtime_id": "rust199",
   "runtime_family": "rust-musl",
   "display_name": "Rust 1.99",
-  "distribution_version": "1.99.0",
+  "distribution_version": "1.99.1",
   "version_line": "1.99",
   "artifact": {
     "checksum_file": "checksums/rust.sha256"
