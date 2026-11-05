@@ -1,0 +1,57 @@
+name: Build and audit runtime package
+description: >-
+  Install the archive tooling, build a runtime layer package and scan it with
+  Grype. Shared by the CI matrix, the release matrix and the scheduled audit so
+  the build inputs and the scan cannot drift between workflows.
+
+  The build is skipped when the caller's content-keyed package cache hit, and
+  the scan when the caller's decision says the pinned payload did not change.
+  Both are inputs rather than defaults because the gate belongs next to the
+  build-env action that computed it.
+
+inputs:
+  runtime:
+    description: Runtime id to build
+    required: true
+  arch:
+    description: Architecture to build
+    required: true
+  skip-build:
+    description: >-
+      "true" skips the build step. Pass the build-env action's
+      `package-cache-hit` output when a hit means the package on disk is
+      byte-for-byte what this build would produce.
+    required: false
+    default: "false"
+  audit:
+    description: >-
+      "true" runs the Grype scan. Pass the build-env action's `audit` output,
+      or a literal "true" for a call site that must always scan.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Install archive tooling
+      # ubuntu runners ship zip/unzip; only install when actually missing.
+      shell: bash
+      run: |
+        if ! command -v zip >/dev/null || ! command -v unzip >/dev/null; then
+          sudo apt-get update && sudo apt-get install -y zip unzip
+        fi
+
+    - name: Build runtime package
+      if: inputs.skip-build != 'true'
+      shell: bash
+      # A pathological upstream download must fail fast, not hang the cell.
+      # This cannot be a step-level `timeout-minutes`: a composite action's step
+      # schema rejects that key and GitHub then refuses to load the whole action
+      # ("Unexpected value 'timeout-minutes'") before a single command runs.
+      # test_composite_action_steps_only_use_supported_keys keeps it that way.
+      run: timeout 1200 make build RUNTIME="${{ inputs.runtime }}" ARCH="${{ inputs.arch }}"
+
+    - name: Audit runtime package
+      if: inputs.audit == 'true'
+      shell: bash
+      run: bash tools/bin/audit-runtime "${{ inputs.runtime }}" "${{ inputs.arch }}"

@@ -1,0 +1,56 @@
+name: Runtime matrix
+description: >-
+  Emit the runtime build matrix from the runtime manifests, so every workflow
+  shares one generator, one arch-to-runner-label map and one deprecated-runtime
+  filter. A second workflow that hand-rolls this keeps building and publishing
+  things the others deliberately exclude.
+
+  Call sites must run actions/checkout first — a repository-local action is
+  resolved from the workspace, so it cannot populate the workspace itself.
+
+inputs:
+  runtime:
+    description: Runtime id to include, or "all"
+    required: false
+    default: "all"
+  arch:
+    description: Architecture to include, or "all"
+    required: false
+    default: "all"
+  include-deprecated:
+    description: >-
+      "true" also emits deprecated runtimes. Only the roll-off tooling should
+      ever ask for this; the build and publish matrices exclude them.
+    required: false
+    default: "false"
+
+outputs:
+  matrix:
+    description: JSON matrix for the `fromJson` matrix expression
+    value: ${{ steps.matrix.outputs.matrix }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v7
+      with:
+        python-version: "3.11"
+
+    - name: Generate matrix
+      id: matrix
+      shell: bash
+      env:
+        INPUT_RUNTIME: ${{ inputs.runtime }}
+        INPUT_ARCH: ${{ inputs.arch }}
+      # An empty input (a tag-triggered run has no workflow_dispatch inputs)
+      # falls back to "all"; the CLI validates an unknown id and fails loudly.
+      run: |
+        args=()
+        if [[ "${{ inputs.include-deprecated }}" == "true" ]]; then
+          args+=(--include-deprecated)
+        fi
+        matrix=$(python3 tools/runtime_lib/runtime_manifest.py matrix \
+          --runtime "${INPUT_RUNTIME:-all}" \
+          --arch "${INPUT_ARCH:-all}" \
+          "${args[@]}")
+        echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"

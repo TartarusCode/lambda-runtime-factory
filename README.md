@@ -147,11 +147,30 @@ The repo includes:
   - workflow artifacts: built zips upload on **push to `main` only**, `retention-days: 7` (PRs do not upload)
   - superseded PR runs cancel via workflow concurrency
 - `.github/workflows/release-runtime.yml`
-  - manual runtime-scoped release flow
-  - rebuild, audit, upload, and publish steps
-  - same download and Grype caches as CI (no SAM)
+  - two entry points: a `release-YYYY.MM.DD` tag push, or a manual runtime-scoped dispatch
+  - `preflight` validates the tag, the release role and this commit's CI result before any cell starts
+  - build (reused from CI's content-keyed package cache when the inputs are unchanged), audit, upload, and publish steps
+  - same download and Grype caches as CI (no SAM); `record-release` attaches the published layer ARNs to the tag
+- `.github/actions/`
+  - `runtime-matrix`: the build/publish matrix, generated from `tools/runtime_lib/runtime_manifest.py`
+  - `runtime-build-env`: download/package/Grype-binary/Grype-database caches and the Grype install
+  - `build-and-audit-runtime`: archive tooling, `make build`, `tools/bin/audit-runtime`
 
-The release workflow expects an AWS role secret named `AWS_RELEASE_ROLE_ARN`.
+The release workflow expects an AWS role secret named `AWS_RELEASE_ROLE_ARN` and assumes it over
+OIDC (`id-token: write`; there are no static AWS keys). The role's trust policy must allow the
+subject `repo:TartarusCode/lambda-runtime-factory:environment:release` — the preflight job prints
+the subject it presents, so a mismatch is visible in one line of log rather than only as
+"credentials could not be loaded".
+
+To cut a release:
+
+```bash
+git tag release-2026.11.05
+git push origin release-2026.11.05
+```
+
+The workflow never creates the tag itself: a tag pushed with `GITHUB_TOKEN` does not trigger
+workflows, so the tag is always the record of what was published.
 
 CI pins `aws-sam-cli` in `requirements-ci.txt` for reproducible SAM installs.
 

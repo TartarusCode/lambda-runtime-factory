@@ -31,15 +31,10 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
       - id: matrix
-        env:
-          INPUT_RUNTIME: ${{ github.event.inputs.runtime }}
-        # Same generator as CI, so deprecated runtimes are excluded here too.
-        run: |
-          echo "matrix=$(python3 tools/runtime_lib/runtime_manifest.py matrix --runtime "${INPUT_RUNTIME:-all}")" >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/runtime-matrix
+        with:
+          runtime: ${{ github.event.inputs.runtime || 'all' }}
 
   # Usually the first run of a new ISO week, so usually the run that refreshes
   # the cached database; the cells below then restore the fresh entry instead of
@@ -76,11 +71,12 @@ jobs:
           grype: always
           # Cells only read the week's database; the grype-db job writes it.
           db-refresh: "false"
-      - name: Install archive tooling
-        run: |
-          if ! command -v zip >/dev/null || ! command -v unzip >/dev/null; then
-            sudo apt-get update && sudo apt-get install -y zip unzip
-          fi
-      # audit-runtime builds the layer on demand, so no separate build step.
-      - name: Audit runtime package
-        run: bash tools/bin/audit-runtime "${{ matrix.runtime }}" "${{ matrix.arch }}"
+      - name: Build and audit runtime package
+        uses: ./.github/actions/build-and-audit-runtime
+        with:
+          runtime: ${{ matrix.runtime }}
+          arch: ${{ matrix.arch }}
+          # audit-runtime builds the layer on demand, so no separate build step.
+          skip-build: "true"
+          # The whole point of this workflow is the scan.
+          audit: "true"

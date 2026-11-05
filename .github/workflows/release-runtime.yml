@@ -1,5 +1,12 @@
 name: release-runtime
 
+# Two ways in, one pipeline.
+#   * Push a `release-YYYY.MM.DD` tag: the tag is the immutable record of the
+#     commit that was published, and it is what a re-run re-publishes.
+#   * Dispatch: an ad-hoc or partial republish (runtime / arch / publicize).
+# The workflow deliberately never creates the tag itself — a tag pushed with
+# GITHUB_TOKEN does not trigger workflows, so "tag then publish" and "publish
+# then tag" cannot both work. The tag is the input.
 on:
   workflow_dispatch:
     inputs:
@@ -16,6 +23,9 @@ on:
         required: true
         default: false
         type: boolean
+  push:
+    tags:
+      - "release-*"
 
 # Publishing mutates S3 and creates Lambda layer versions, so runs are queued
 # rather than cancelled: a second dispatch waits instead of killing a publish
@@ -26,6 +36,9 @@ concurrency:
 
 permissions:
   contents: read
+  # The preflight asks the API for this commit's CI conclusion.
+  actions: read
+  # Credentials are assumed through OIDC; the repo holds no long-lived AWS keys.
   id-token: write
 
 env:
@@ -39,17 +52,15 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
+      # Same generator CI uses, so the runner labels and the deprecated-runtime
+      # filter cannot drift from the rest of the pipeline. A tag-triggered run
+      # has no workflow_dispatch inputs, so this resolves to every runtime and
+      # architecture.
       - id: matrix
-        env:
-          INPUT_RUNTIME: ${{ github.event.inputs.runtime }}
-          INPUT_ARCH: ${{ github.event.inputs.arch }}
-        # Same generator CI uses, so the runner labels and the deprecated-runtime
-        # filter cannot drift from the rest of the pipeline.
-        run: |
-          echo "matrix=$(python3 tools/runtime_lib/runtime_manifest.py matrix --runtime "${INPUT_RUNTIME:-all}" --arch "${INPUT_ARCH:-all}")" >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/runtime-matrix
+        with:
+          runtime: ${{ github.event.inputs.runtime || 'all' }}
+          arch: ${{ github.event.inputs.arch || 'all' }}
 
   # The publish cells only restore the database, so they need the entry primed
   # first: a manual release must not scan against a week-old database just because
@@ -64,10 +75,69 @@ jobs:
           grype: always
           db-refresh: "true"
 
+  # One job validates everything that would otherwise fail in all 24 cells.
+  # aws-actions/configure-aws-credentials retries credential loading 12 times
+  # (~51s) before giving up, so a role that cannot be assumed is discovered here
+  # in ~1 minute instead of costing ~20 minutes of wall clock across the matrix.
+  preflight:
+    needs:
+      - prepare-matrix
+    # Carrying the environment keeps this job's OIDC subject stable —
+    # repo:<owner>/<repo>:environment:release — whether the run came from a
+    # branch dispatch or a tag.
+    environment: release
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Validate the release tag
+        if: github.ref_type == 'tag'
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [[ ! "${tag}" =~ ^release-[0-9]{4}\.[0-9]{2}\.[0-9]{2}(-[0-9]+)?$ ]]; then
+            echo "::error::Tag '${tag}' is not a release tag. Expected release-YYYY.MM.DD, optionally suffixed -2, -3 for a second release on the same day."
+            exit 1
+          fi
+
+      - name: Validate the release role secret
+        env:
+          AWS_RELEASE_ROLE_ARN: ${{ secrets.AWS_RELEASE_ROLE_ARN }}
+        run: |
+          if [[ -z "${AWS_RELEASE_ROLE_ARN}" ]]; then
+            echo "::error::AWS_RELEASE_ROLE_ARN is not set. Set it to the role that trusts this repository's OIDC provider."
+            exit 1
+          fi
+          # Stating the subject up front is what makes a trust-policy mismatch a
+          # one-line diagnosis: the role must allow this exact sub, or a wildcard.
+          echo "Assuming ${AWS_RELEASE_ROLE_ARN} through OIDC."
+          echo "This job presents the subject repo:${GITHUB_REPOSITORY}:environment:release"
+
+      - name: Require a green CI run for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          conclusion=$(gh run list --commit "${GITHUB_SHA}" --workflow ci.yml \
+            --limit 1 --json conclusion --jq '.[0].conclusion // "none"')
+          if [[ "${conclusion}" != "success" ]]; then
+            echo "::error::ci.yml has not succeeded for ${GITHUB_SHA} (conclusion: ${conclusion}); refusing to publish a revision the build and scan never validated."
+            exit 1
+          fi
+
+      - name: Assume the release role
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_RELEASE_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Confirm the identity
+        run: aws sts get-caller-identity
+
   publish:
     needs:
       - prepare-matrix
       - grype-db
+      - preflight
     # Gating on a repository environment lets required reviewers approve a
     # production publish; add them under Settings -> Environments -> release.
     environment: release
@@ -85,6 +155,7 @@ jobs:
         with:
           python-version: "3.11"
       - uses: ./.github/actions/runtime-build-env
+        id: build-env
         with:
           runtime: ${{ matrix.runtime }}
           arch: ${{ matrix.arch }}
@@ -97,11 +168,17 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_RELEASE_ROLE_ARN }}
           aws-region: us-east-1
-      - name: Build runtime package
-        timeout-minutes: 20
-        run: make build RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
-      - name: Audit runtime package
-        run: bash tools/bin/audit-runtime "${{ matrix.runtime }}" "${{ matrix.arch }}"
+      - name: Build and audit runtime package
+        uses: ./.github/actions/build-and-audit-runtime
+        with:
+          runtime: ${{ matrix.runtime }}
+          arch: ${{ matrix.arch }}
+          # A hit proves the archive, checksums, bootstrap, helpers and build
+          # script are all unchanged, so the cached package is byte-for-byte the
+          # one CI built and validated for this commit. The scan below still runs
+          # unconditionally, because a publish must never skip it.
+          skip-build: ${{ steps.build-env.outputs.package-cache-hit == 'true' }}
+          audit: "true"
       - name: Upload runtime artifact to S3
         run: make upload RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Publish Lambda layer
@@ -116,4 +193,72 @@ jobs:
             echo "### ${{ matrix.runtime }} (${{ matrix.arch }})"
             bash tools/bin/latest-runtime "${{ matrix.runtime }}" "${{ matrix.arch }}"
             echo
-          } >> "$GITHUB_STEP_SUMMARY"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  # The tag is the release record, so this makes the layer versions answerable
+  # from it. It only runs when every cell published.
+  record-release:
+    needs:
+      - prepare-matrix
+      - publish
+    if: ${{ always() && needs.publish.result == 'success' }}
+    environment: release
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    # Job-level permissions replace the workflow-level map, so id-token: write
+    # has to be repeated here for the OIDC role assumption below.
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_RELEASE_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Collect the published layer arns
+        env:
+          MATRIX: ${{ needs.prepare-matrix.outputs.matrix }}
+        run: |
+          python3 - <<'PY' > "${RUNNER_TEMP}/cells.txt"
+          import json
+          import os
+
+          for cell in json.loads(os.environ["MATRIX"])["include"]:
+              print(cell["runtime"], cell["arch"])
+          PY
+          {
+            echo "## Published runtime layers"
+            echo
+            echo "Commit: \`${GITHUB_SHA}\`"
+            echo
+          } > "${RUNNER_TEMP}/release-notes.md"
+          while read -r runtime arch; do
+            {
+              echo "### ${runtime} (${arch})"
+              bash tools/bin/latest-runtime "${runtime}" "${arch}"
+              echo
+            } >> "${RUNNER_TEMP}/release-notes.md"
+          done < "${RUNNER_TEMP}/cells.txt"
+          cat "${RUNNER_TEMP}/release-notes.md" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Attach the record to the release tag
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          notes="${RUNNER_TEMP}/release-notes.md"
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" --notes-file "${notes}"
+          else
+            gh release create "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --notes-file "${notes}"
+          fi
+
+      - name: Report a dispatch with no tag behind it
+        if: github.ref_type == 'branch'
+        run: |
+          echo "::notice::Dispatched publish with no release tag; the layer arns are in this run's summary. Push a release-YYYY.MM.DD tag to record a release."

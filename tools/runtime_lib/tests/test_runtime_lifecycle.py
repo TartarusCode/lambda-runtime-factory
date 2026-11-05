@@ -342,6 +342,20 @@ def test_check_updates_skips_deprecated_unless_named(
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _BUILD_ENV_ACTION = "./.github/actions/runtime-build-env"
+_MATRIX_ACTION = "./.github/actions/runtime-matrix"
+_BUILD_ACTION = "./.github/actions/build-and-audit-runtime"
+
+
+def _workflow(workflow: str) -> dict:
+    """A parsed workflow document, by file name."""
+    return yaml.safe_load(_workflow_text(workflow))
+
+
+def _triggers(workflow: str) -> dict:
+    """The `on:` block. PyYAML reads a bare `on` key as the boolean True."""
+    doc = _workflow(workflow)
+    return doc.get("on") or doc.get(True) or {}
+
 
 # (workflow file, job) pairs whose entire purpose is the scan.
 _AUDIT_CRITICAL = {
@@ -391,16 +405,89 @@ def test_audit_critical_jobs_always_prepare_grype() -> None:
         )
 
 
+def _call_site(workflow: str, job: str, action: str) -> dict:
+    """The `with:` inputs of a job's call to a repository-local action."""
+    steps = _workflow(workflow)["jobs"][job]["steps"]
+    return next(step for step in steps if step.get("uses") == action).get("with") or {}
+
+
+def _workflow_text(workflow: str) -> str:
+    return (_REPO_ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
+
+
+def _action(action_name: str) -> dict:
+    return yaml.safe_load(
+        (_REPO_ROOT / ".github" / "actions" / action_name / "action.yml").read_text(encoding="utf-8")
+    )
+
+
+def _named_step(action_name: str, step_name: str) -> dict:
+    return next(
+        step for step in _action(action_name)["runs"]["steps"] if step.get("name") == step_name
+    )
+
+
+def test_no_workflow_generates_the_matrix_outside_the_action() -> None:
+    """A second hand-rolled generator is exactly how a runner label or the
+    deprecated-runtime filter drifts away from the rest of the pipeline."""
+    for path in sorted((_REPO_ROOT / ".github" / "workflows").glob("*.yml")):
+        assert "runtime_manifest.py matrix" not in path.read_text(encoding="utf-8"), (
+            f"{path.name} must take its matrix from the runtime-matrix action"
+        )
+
+
+def test_no_workflow_builds_or_audits_outside_the_shared_action() -> None:
+    """The build and the scan are one unit of behaviour in every workflow."""
+    for path in sorted((_REPO_ROOT / ".github" / "workflows").glob("*.yml")):
+        text = path.read_text(encoding="utf-8")
+        assert "make build" not in text, f"{path.name} must build via build-and-audit-runtime"
+        assert "bash tools/bin/audit-runtime" not in text, (
+            f"{path.name} must scan via build-and-audit-runtime"
+        )
+
+
+def test_every_matrix_job_checks_out_before_generating_the_matrix() -> None:
+    """A repository-local action is resolved from the workspace, so it cannot
+    check the repo out itself."""
+    for workflow in ("ci.yml", "release-runtime.yml", "audit-runtimes.yml"):
+        steps = _workflow(workflow)["jobs"]["prepare-matrix"]["steps"]
+
+        assert [step.get("uses") for step in steps] == ["actions/checkout@v7", _MATRIX_ACTION], (
+            f"{workflow}:prepare-matrix must check out first, then generate the matrix"
+        )
+        assert steps[1]["id"] == "matrix", "the job output must read steps.matrix.outputs.matrix"
+
+
+def test_the_matrix_action_excludes_deprecated_runtimes_by_default() -> None:
+    action = _action("runtime-matrix")
+
+    assert action["inputs"]["include-deprecated"]["default"] == "false"
+    assert action["outputs"]["matrix"]["value"] == "${{ steps.matrix.outputs.matrix }}"
+
+
 def test_ci_matrix_audit_step_is_gated_on_the_decision() -> None:
     """The gate and the action output must stay wired to each other."""
-    doc = yaml.safe_load((_REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
-    steps = doc["jobs"]["runtime-checks"]["steps"]
+    call = _call_site("ci.yml", "runtime-checks", _BUILD_ACTION)
 
-    call = next(step for step in steps if step.get("uses") == _BUILD_ENV_ACTION)
-    audit = next(step for step in steps if step.get("name") == "Audit runtime package")
+    assert call["audit"] == "${{ steps.build-env.outputs.audit }}"
+    assert _named_step("build-and-audit-runtime", "Audit runtime package")["if"] == (
+        "inputs.audit == 'true'"
+    )
 
-    assert call.get("id") == "build-env"
-    assert audit.get("if") == "steps.build-env.outputs.audit == 'true'"
+
+def test_a_release_publishes_only_something_that_was_scanned() -> None:
+    """Reusing the cached package is allowed; skipping the scan never is."""
+    call = _call_site("release-runtime.yml", "publish", _BUILD_ACTION)
+
+    assert call["audit"] == "true"
+    assert call["skip-build"] == "${{ steps.build-env.outputs.package-cache-hit == 'true' }}"
+
+
+def test_the_scheduled_audit_needs_no_separate_build_step() -> None:
+    call = _call_site("audit-runtimes.yml", "audit", _BUILD_ACTION)
+
+    assert call["audit"] == "true"
+    assert call["skip-build"] == "true", "audit-runtime builds the layer on demand"
 
 
 # --- Grype database cache contract --------------------------------------------
@@ -459,6 +546,32 @@ def test_the_database_refresh_is_skipped_when_the_week_is_already_cached() -> No
     )
 
 
+def test_the_database_refresh_runs_the_binary_not_a_quoted_command() -> None:
+    """`"${GRYPE_INSTALL_DIR}/grype db update"` quotes the arguments into the
+    path, so bash looks for a file named "grype db update", the refresh dies
+    with ENOENT, and the `if` still reports success — the week's database is
+    never written and nothing goes red."""
+    run = _action_step("Update vulnerability database")["run"]
+
+    assert '"${GRYPE_INSTALL_DIR}/grype" db update' in run
+    assert '"${GRYPE_INSTALL_DIR}/grype db update"' not in run
+    assert "::error::" in run, (
+        "a refresh that can never succeed must not be a silent warning"
+    )
+
+
+def test_only_the_default_branch_writes_the_shared_database_entry() -> None:
+    """A cache entry is only readable outside its own ref when it was created on
+    the default branch. A PR run that saves one writes ~458MB that nothing else
+    can restore, and evicts the package cache under the 10GB budget."""
+    default_branch = "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
+
+    for name in ("Update vulnerability database", "Save vulnerability database"):
+        assert default_branch in _action_step(name)["if"], (
+            f"{name} must be limited to the default branch"
+        )
+
+
 def test_every_build_env_call_site_declares_its_database_role_explicitly() -> None:
     sites = _build_env_call_sites()
 
@@ -504,6 +617,9 @@ _PACKAGE_INPUTS = (
     "bootstrap/**",
     "helpers/**",
     "tools/bin/build-runtime",
+    # Sourced by build-runtime; a change here that alters the layer layout would
+    # otherwise reuse a package built by the old helpers.
+    "tools/bin/_common.sh",
     "tools/runtime_lib/runtime_manifest.py",
 )
 
@@ -552,11 +668,159 @@ def test_local_invoke_asserts_the_handler_answered() -> None:
 
 
 def test_the_ci_build_is_skipped_when_the_package_is_cached() -> None:
-    doc = yaml.safe_load((_REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
-    steps = doc["jobs"]["runtime-checks"]["steps"]
+    call = _call_site("ci.yml", "runtime-checks", _BUILD_ACTION)
 
-    hold = next(step for step in steps if step.get("uses") == _BUILD_ENV_ACTION)
-    build = next(step for step in steps if step.get("name") == "Build runtime package")
+    assert call["skip-build"] == "${{ steps.build-env.outputs.package-cache-hit == 'true' }}"
+    build = _named_step("build-and-audit-runtime", "Build runtime package")
+    assert build["if"] == "inputs.skip-build != 'true'"
+    assert build["run"].startswith("timeout "), (
+        "a throttled upstream download must fail fast, and a composite step cannot "
+        "carry timeout-minutes, so the command bounds itself"
+    )
 
-    assert hold.get("id") == "build-env"
-    assert build.get("if") == "steps.build-env.outputs.package-cache-hit != 'true'"
+
+# A composite action's step accepts a much smaller key set than a workflow step.
+# GitHub rejects the whole action manifest on an unknown key ("Unexpected value
+# 'timeout-minutes'") and the job fails before running anything — which is
+# invisible to `bash -n`, to the build, and to actionlint. Keep it static.
+_COMPOSITE_STEP_KEYS = {
+    "name",
+    "id",
+    "if",
+    "uses",
+    "run",
+    "shell",
+    "env",
+    "with",
+    "working-directory",
+    "continue-on-error",
+}
+
+
+def test_composite_action_steps_only_use_supported_keys() -> None:
+    for path in sorted((_REPO_ROOT / ".github" / "actions").glob("*/action.yml")):
+        action = yaml.safe_load(path.read_text(encoding="utf-8"))
+        assert action["runs"]["using"] == "composite", f"{path.parent.name} must stay composite"
+
+        for step in action["runs"]["steps"]:
+            unsupported = sorted(set(step) - _COMPOSITE_STEP_KEYS)
+            assert not unsupported, (
+                f"{path.parent.name}: step '{step.get('name') or step.get('uses')}' uses "
+                f"unsupported key(s) {unsupported}; GitHub will refuse to load the action"
+            )
+            if "run" in step:
+                assert step.get("shell") == "bash", (
+                    f"{path.parent.name}: every run step needs shell: bash"
+                )
+
+
+# --- Release trigger and provenance contract ----------------------------------
+#
+# A release may start from a tag or a dispatch, but the workflow must never push
+# its own tag: a tag pushed with GITHUB_TOKEN does not trigger workflows, so
+# "tag then publish" and "publish then tag" cannot both work. The tag is the
+# input, the OIDC subject must not depend on which entry point was used, and the
+# published layer versions have to stay traceable to the commit that produced
+# them.
+
+_RELEASE_TAG_PATTERN = "^release-[0-9]{4}\\.[0-9]{2}\\.[0-9]{2}(-[0-9]+)?$"
+
+
+def test_the_release_can_be_triggered_by_a_release_tag() -> None:
+    triggers = _triggers("release-runtime.yml")
+
+    assert triggers["push"]["tags"] == ["release-*"]
+    assert "workflow_dispatch" in triggers, "an ad-hoc or partial republish must stay possible"
+
+
+def test_the_release_never_pushes_its_own_tag() -> None:
+    text = _workflow_text("release-runtime.yml")
+
+    assert "git tag" not in text and "git push" not in text, (
+        "a tag pushed with GITHUB_TOKEN cannot trigger a workflow; the tag comes from outside"
+    )
+
+
+def test_the_release_validates_the_tag_before_publishing_anything() -> None:
+    preflight = _workflow("release-runtime.yml")["jobs"]["preflight"]["steps"]
+    step = next(s for s in preflight if s.get("name") == "Validate the release tag")
+
+    assert step["if"] == "github.ref_type == 'tag'"
+    assert _RELEASE_TAG_PATTERN in step["run"], "release-YYYY.MM.DD is the contract"
+
+
+def test_the_release_requires_the_credential_preflight() -> None:
+    """A role that cannot be assumed must fail once, not in all 24 cells: the
+    credentials action retries for ~51s per cell before it gives up."""
+    doc = _workflow("release-runtime.yml")
+    preflight = doc["jobs"]["preflight"]
+
+    assert "preflight" in doc["jobs"]["publish"]["needs"]
+    assert doc["jobs"]["publish"]["environment"] == "release"
+
+    secret_step = next(
+        s for s in preflight["steps"] if s.get("name") == "Validate the release role secret"
+    )
+    assert secret_step["env"]["AWS_RELEASE_ROLE_ARN"] == "${{ secrets.AWS_RELEASE_ROLE_ARN }}"
+    assert "aws-actions/configure-aws-credentials@v6" in [
+        s.get("uses") for s in preflight["steps"]
+    ]
+
+
+def test_every_job_that_assumes_the_role_declares_the_environment() -> None:
+    """The environment is part of the OIDC subject. Leaving it off a cell would
+    make its subject depend on the ref, so a branch dispatch and a tag would
+    present different identities to the same role."""
+    doc = _workflow("release-runtime.yml")
+
+    for job_name, job in doc["jobs"].items():
+        assumes_role = any(
+            step.get("uses") == "aws-actions/configure-aws-credentials@v6"
+            for step in job.get("steps") or []
+        )
+        if assumes_role:
+            assert job.get("environment") == "release", (
+                f"{job_name} must declare the release environment"
+            )
+
+
+def test_the_preflight_states_the_oidc_subject_it_will_present() -> None:
+    """Naming the subject is what turns a trust-policy mismatch into a one-line
+    diagnosis instead of 'credentials could not be loaded'."""
+    assert "repo:${GITHUB_REPOSITORY}:environment:release" in _workflow_text(
+        "release-runtime.yml"
+    )
+
+
+def test_the_release_uses_oidc_and_holds_no_static_aws_keys() -> None:
+    text = _workflow_text("release-runtime.yml")
+
+    assert "${{ secrets.AWS_RELEASE_ROLE_ARN }}" in text
+    assert "aws-access-key-id" not in text and "aws-secret-access-key" not in text
+    assert _workflow("release-runtime.yml")["permissions"]["id-token"] == "write"
+
+
+def test_the_release_can_read_the_commits_ci_conclusion() -> None:
+    """The publish gate reads the Actions API, which needs its own scope."""
+    permissions = _workflow("release-runtime.yml")["permissions"]
+
+    assert permissions["actions"] == "read"
+
+
+def test_the_release_records_what_it_published() -> None:
+    record = _workflow("release-runtime.yml")["jobs"]["record-release"]
+
+    assert record["needs"] == ["prepare-matrix", "publish"]
+    assert record["if"] == "${{ always() && needs.publish.result == 'success' }}"
+    # Job-level permissions replace the workflow-level map, so the OIDC scope has
+    # to be repeated or the credential step in this job fails.
+    assert record["permissions"] == {"contents": "write", "id-token": "write"}
+
+
+def test_every_job_has_a_timeout() -> None:
+    """The default is six hours: a hung download would bill the wall clock."""
+    for path in sorted((_REPO_ROOT / ".github" / "workflows").glob("*.yml")):
+        jobs = yaml.safe_load(path.read_text(encoding="utf-8")).get("jobs") or {}
+
+        for job_name, job in jobs.items():
+            assert job.get("timeout-minutes"), f"{path.name}:{job_name} needs timeout-minutes"
