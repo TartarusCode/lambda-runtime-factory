@@ -18,32 +18,72 @@ common::ensure_runtime_built "${runtime_id}" "${arch}"
 sha256sum_value=$(common::sha256_file "${PACKAGE_PATH}")
 s3_key="${S3_KEY_PREFIX}/${ARCH}/${sha256sum_value}.zip"
 
+# Publishing a layer version is not idempotent: a re-run of a release (a retried
+# tag, a re-dispatched cell) used to mint another version for bytes that had
+# already been published. The layer's own content hash identifies those bytes, so
+# reuse the version that already carries them. The S3 object is content-addressed
+# on the same hash, so the reused version points at exactly what this build wrote.
+#
+# Only the newest page of versions (50) is examined: the match for a re-run is
+# always the most recent version, and paging back through years of history to
+# find an older one is not worth the calls. Set PUBLISH_FORCE_NEW_VERSION=1 to
+# publish unconditionally.
+common::reuse_version_for_region() {
+    local region=$1
+    local version
+    version=$(aws lambda list-layer-versions \
+        --layer-name "${LAYER_NAME}" \
+        --query "LayerVersions[?Content.CodeSha256=='${sha256sum_value}']|[0].Version" \
+        --output text \
+        --region "${region}" 2>/dev/null) || true
+
+    if [[ -n "${version}" && "${version}" != "None" ]]; then
+        printf '%s' "${version}"
+    fi
+}
+
 for region in ${RELEASE_REGIONS}; do
     bucket_name="${BUCKET_BASE_NAME}-${region}"
 
-    echo "Publishing Lambda Layer ${LAYER_NAME} (${ARCH}) in region ${region}..."
-    version=$(aws lambda publish-layer-version \
-        --layer-name "${LAYER_NAME}" \
-        --description "${LAYER_DESCRIPTION}" \
-        --content "S3Bucket=${bucket_name},S3Key=${s3_key}" \
-        --compatible-runtimes ${COMPATIBLE_RUNTIMES} \
-        --compatible-architectures "${LAMBDA_ARCH}" \
-        --license-info "Apache-2.0" \
-        --output text \
-        --query Version \
-        --region "${region}")
-    echo "Published Lambda Layer ${LAYER_NAME} (${ARCH}) in region ${region} version ${version}"
+    version=""
+    if [[ "${PUBLISH_FORCE_NEW_VERSION:-0}" != "1" ]]; then
+        version=$(common::reuse_version_for_region "${region}")
+    fi
+
+    if [[ -n "${version}" ]]; then
+        echo "Lambda Layer ${LAYER_NAME} (${ARCH}) in region ${region} already holds these bytes as version ${version}; reusing it"
+    else
+        echo "Publishing Lambda Layer ${LAYER_NAME} (${ARCH}) in region ${region}..."
+        version=$(aws lambda publish-layer-version \
+            --layer-name "${LAYER_NAME}" \
+            --description "${LAYER_DESCRIPTION}" \
+            --content "S3Bucket=${bucket_name},S3Key=${s3_key}" \
+            --compatible-runtimes ${COMPATIBLE_RUNTIMES} \
+            --compatible-architectures "${LAMBDA_ARCH}" \
+            --license-info "Apache-2.0" \
+            --output text \
+            --query Version \
+            --region "${region}")
+        echo "Published Lambda Layer ${LAYER_NAME} (${ARCH}) in region ${region} version ${version}"
+    fi
 
     if (( publicize )); then
         echo "Setting public permissions on Lambda Layer ${LAYER_NAME} version ${version} in region ${region}..."
-        aws lambda add-layer-version-permission \
+        # Re-adding the same statement to an already-public version is the
+        # expected outcome of a re-run, not a failure. Anything else is.
+        if err=$(aws lambda add-layer-version-permission \
             --layer-name "${LAYER_NAME}" \
             --version-number "${version}" \
             --statement-id public \
             --action lambda:GetLayerVersion \
             --principal "*" \
-            --region "${region}" \
-            > /dev/null
-        echo "Public permissions set on Lambda Layer ${LAYER_NAME} version ${version} in region ${region}"
+            --region "${region}" 2>&1 >/dev/null); then
+            echo "Public permissions set on Lambda Layer ${LAYER_NAME} version ${version} in region ${region}"
+        elif [[ "${err}" == *ResourceConflictException* ]]; then
+            echo "Public permissions already set on Lambda Layer ${LAYER_NAME} version ${version} in region ${region}"
+        else
+            printf '%s\n' "${err}" >&2
+            exit 1
+        fi
     fi
 done

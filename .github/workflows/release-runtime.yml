@@ -4,6 +4,10 @@ name: release-runtime
 #   * Push a `release-YYYY.MM.DD` tag: the tag is the immutable record of the
 #     commit that was published, and it is what a re-run re-publishes.
 #   * Dispatch: an ad-hoc or partial republish (runtime / arch / publicize).
+#     Dispatch with `dry_run: true` to exercise the whole path — the credential
+#     preflight, the build and the scan — without uploading to S3 or creating a
+#     layer version, which is the only way to reach the preflight's secret and
+#     role checks without publishing anything.
 # The workflow deliberately never creates the tag itself — a tag pushed with
 # GITHUB_TOKEN does not trigger workflows, so "tag then publish" and "publish
 # then tag" cannot both work. The tag is the input.
@@ -20,6 +24,11 @@ on:
         default: "all"
       publicize:
         description: "Grant public layer permissions after publish"
+        required: true
+        default: false
+        type: boolean
+      dry_run:
+        description: "Build and scan only; skip the S3 upload and the publish"
         required: true
         default: false
         type: boolean
@@ -179,21 +188,30 @@ jobs:
           # unconditionally, because a publish must never skip it.
           skip-build: ${{ steps.build-env.outputs.package-cache-hit == 'true' }}
           audit: "true"
+      # Everything below writes to S3 or creates a layer version; a dry run stops
+      # here, having already exercised the credential preflight, the package cache
+      # and the scan.
       - name: Upload runtime artifact to S3
+        if: ${{ github.event.inputs.dry_run != 'true' }}
         run: make upload RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Publish Lambda layer
-        if: ${{ github.event.inputs.publicize != 'true' }}
+        if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.publicize != 'true' }}
         run: make publish RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Publish and publicize Lambda layer
-        if: ${{ github.event.inputs.publicize == 'true' }}
+        if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.publicize == 'true' }}
         run: make publicize RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Summarize latest layer arns
+        if: ${{ github.event.inputs.dry_run != 'true' }}
         run: |
           {
             echo "### ${{ matrix.runtime }} (${{ matrix.arch }})"
             bash tools/bin/latest-runtime "${{ matrix.runtime }}" "${{ matrix.arch }}"
             echo
           } >> "${GITHUB_STEP_SUMMARY}"
+      - name: Report the dry run
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        run: |
+          echo "::notice::dry run: ${{ matrix.runtime }} (${{ matrix.arch }}) was built and scanned; no S3 object was written and no layer version was created."
 
   # The tag is the release record, so this makes the layer versions answerable
   # from it. It only runs when every cell published.
@@ -201,7 +219,7 @@ jobs:
     needs:
       - prepare-matrix
       - publish
-    if: ${{ always() && needs.publish.result == 'success' }}
+    if: ${{ always() && needs.publish.result == 'success' && github.event.inputs.dry_run != 'true' }}
     environment: release
     runs-on: ubuntu-26.04
     timeout-minutes: 15
