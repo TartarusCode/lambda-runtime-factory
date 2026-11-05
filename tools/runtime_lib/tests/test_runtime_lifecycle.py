@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -811,7 +815,9 @@ def test_the_release_records_what_it_published() -> None:
     record = _workflow("release-runtime.yml")["jobs"]["record-release"]
 
     assert record["needs"] == ["prepare-matrix", "publish"]
-    assert record["if"] == "${{ always() && needs.publish.result == 'success' }}"
+    assert record["if"] == (
+        "${{ always() && needs.publish.result == 'success' && github.event.inputs.dry_run != 'true' }}"
+    )
     # Job-level permissions replace the workflow-level map, so the OIDC scope has
     # to be repeated or the credential step in this job fails.
     assert record["permissions"] == {"contents": "write", "id-token": "write"}
@@ -824,3 +830,170 @@ def test_every_job_has_a_timeout() -> None:
 
         for job_name, job in jobs.items():
             assert job.get("timeout-minutes"), f"{path.name}:{job_name} needs timeout-minutes"
+
+
+def test_a_release_can_be_dry_run_without_publishing_anything() -> None:
+    """The preflight's secret and role checks sit behind the tag gate, so a dry
+    run is the only way to reach them without creating a layer version."""
+    triggers = _triggers("release-runtime.yml")
+    assert "dry_run" in triggers["workflow_dispatch"]["inputs"]
+
+    doc = _workflow("release-runtime.yml")
+    by_name = {step.get("name"): step for step in doc["jobs"]["publish"]["steps"]}
+
+    for name in (
+        "Upload runtime artifact to S3",
+        "Publish Lambda layer",
+        "Publish and publicize Lambda layer",
+        "Summarize latest layer arns",
+    ):
+        assert "github.event.inputs.dry_run != 'true'" in by_name[name]["if"], name
+
+    assert by_name["Report the dry run"]["if"] == "${{ github.event.inputs.dry_run == 'true' }}"
+    assert "github.event.inputs.dry_run != 'true'" in doc["jobs"]["record-release"]["if"], (
+        "a dry run must not create a GitHub Release"
+    )
+
+
+# --- Layer publish contract ----------------------------------------------------
+#
+# Publishing a layer version is not idempotent, so a re-run of a release used to
+# mint another version for bytes that were already published. The content hash
+# decides reuse. These tests run the real script against a stubbed aws CLI, so
+# they cover the behaviour rather than the text.
+
+_FAKE_AWS = '''#!/usr/bin/env python3
+import os
+import sys
+
+args = sys.argv[1:]
+with open(os.environ["FAKE_AWS_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(" ".join(args) + "\\n")
+
+command = args[:2]
+if command == ["lambda", "list-layer-versions"]:
+    existing = os.environ.get("FAKE_AWS_EXISTING_VERSION", "")
+    if existing:
+        print(existing)
+        sys.exit(0)
+    sys.exit(254)  # the CLI's ResourceNotFoundException path
+if command == ["lambda", "publish-layer-version"]:
+    print("99")
+    sys.exit(0)
+if command == ["lambda", "add-layer-version-permission"]:
+    error = os.environ.get("FAKE_AWS_PERMISSION_ERROR", "")
+    if error:
+        sys.stderr.write(
+            "An error occurred (" + error + ") when calling the "
+            "AddLayerVersionPermission operation: " + error + "\\n"
+        )
+        sys.exit(255)
+    sys.exit(0)
+sys.exit(2)
+'''
+
+
+def _publish_package_path(tmp_path: Path) -> Path:
+    """Where the build would put the package, straight from the manifest CLI."""
+    output = subprocess.run(
+        [
+            sys.executable,
+            "tools/runtime_lib/runtime_manifest.py",
+            "env",
+            "--runtime",
+            "pypy311",
+            "--arch",
+            "x86_64",
+        ],
+        cwd=_REPO_ROOT,
+        env=dict(os.environ, BUILD_ROOT=str(tmp_path)),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+
+    for line in output.splitlines():
+        if line.startswith("PACKAGE_PATH="):
+            return Path(shlex.split(line.split("=", 1)[1])[0])
+
+    raise AssertionError("runtime_manifest env did not report PACKAGE_PATH")
+
+
+def _run_publish_runtime(
+    tmp_path: Path,
+    *,
+    publicize: bool = False,
+    existing_version: str = "",
+    permission_error: str = "",
+) -> tuple[subprocess.CompletedProcess, str]:
+    """Run `publish-runtime` with a stubbed aws CLI. Returns (result, aws calls)."""
+    package = _publish_package_path(tmp_path)
+    package.parent.mkdir(parents=True, exist_ok=True)
+    package.write_bytes(b"layer bytes\n")
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    aws = fake_bin / "aws"
+    aws.write_text(_FAKE_AWS, encoding="utf-8")
+    aws.chmod(0o755)
+
+    log = tmp_path / "aws-calls.log"
+    env = dict(
+        os.environ,
+        PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        # The package is already on disk; do not let the helper build it.
+        RUNTIME_BUILD_IN_PROGRESS="1",
+        BUILD_ROOT=str(tmp_path),
+        FAKE_AWS_LOG=str(log),
+        FAKE_AWS_EXISTING_VERSION=existing_version,
+        FAKE_AWS_PERMISSION_ERROR=permission_error,
+    )
+
+    args = ["bash", "tools/bin/publish-runtime"]
+    if publicize:
+        args.append("--publicize")
+    args += ["pypy311", "x86_64"]
+
+    result = subprocess.run(args, cwd=_REPO_ROOT, env=env, capture_output=True, text=True)
+    return result, log.read_text(encoding="utf-8") if log.exists() else ""
+
+
+def test_republishing_unchanged_bytes_reuses_the_existing_version(tmp_path: Path) -> None:
+    """The layer itself already carries these bytes, so nothing is published."""
+    result, calls = _run_publish_runtime(tmp_path, existing_version="7")
+
+    assert result.returncode == 0, result.stderr
+    assert "reusing it" in result.stdout
+    assert "publish-layer-version" not in calls, (
+        "a re-run of a release must not mint another layer version"
+    )
+
+
+def test_a_layer_that_does_not_exist_yet_is_published(tmp_path: Path) -> None:
+    """The content-hash lookup fails when the layer has no versions; that is not
+    fatal, and the version is published."""
+    result, calls = _run_publish_runtime(tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "list-layer-versions" in calls
+    assert "publish-layer-version" in calls
+    assert "Content.CodeSha256" in calls, "reuse must be decided by the content hash"
+
+
+def test_publicizing_an_already_public_version_is_not_a_failure(tmp_path: Path) -> None:
+    result, _ = _run_publish_runtime(
+        tmp_path, publicize=True, existing_version="7", permission_error="ResourceConflictException"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "already set" in result.stdout
+
+
+def test_a_real_permission_error_still_fails(tmp_path: Path) -> None:
+    """Only the duplicate-statement conflict is tolerated."""
+    result, _ = _run_publish_runtime(
+        tmp_path, publicize=True, existing_version="7", permission_error="AccessDeniedException"
+    )
+
+    assert result.returncode != 0
+    assert "AccessDeniedException" in result.stderr

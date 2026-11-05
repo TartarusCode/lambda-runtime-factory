@@ -172,6 +172,18 @@ git push origin release-2026.11.05
 The workflow never creates the tag itself: a tag pushed with `GITHUB_TOKEN` does not trigger
 workflows, so the tag is always the record of what was published.
 
+To exercise the path without publishing anything — the credential preflight, the package
+cache, the build and the scan all run — dispatch it as a dry run:
+
+```bash
+gh workflow run release-runtime.yml -f runtime=pypy311 -f arch=x86_64 -f dry_run=true
+```
+
+Publishing is idempotent for unchanged bytes: the layer's own `Content.CodeSha256` decides
+whether a version is created, so re-running a release for a commit whose package is already
+published reuses that version instead of minting another. Set `PUBLISH_FORCE_NEW_VERSION=1`
+to publish unconditionally.
+
 CI pins `aws-sam-cli` in `requirements-ci.txt` for reproducible SAM installs.
 
 ## Adding A New Runtime
