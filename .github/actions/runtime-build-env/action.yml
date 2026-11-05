@@ -72,13 +72,14 @@ runs:
       id: package
       if: inputs.runtime != ''
       # Keyed on everything the build reads — the pinned archive, our bootstrap and
-      # helpers, and the layout logic — so a hit can only ever mean "the package
-      # this build would produce is already cached". Deliberately no restore-keys:
-      # a package built from different inputs must never be reused.
+      # helpers, the build script and the shared shell helpers it sources — so a
+      # hit can only ever mean "the package this build would produce is already
+      # cached". Deliberately no restore-keys: a package built from different
+      # inputs must never be reused.
       uses: actions/cache@v6
       with:
         path: ${{ runner.temp }}/lambda-runtime-monorepo/${{ inputs.runtime }}/${{ inputs.arch }}/artifacts
-        key: package-${{ runner.os }}-${{ inputs.runtime }}-${{ inputs.arch }}-${{ hashFiles(format('runtimes/{0}/runtime.json', inputs.runtime), format('runtimes/{0}/checksums/**', inputs.runtime), format('runtimes/{0}/bootstrap/**', inputs.runtime), format('runtimes/{0}/helpers/**', inputs.runtime), 'tools/bin/build-runtime', 'tools/runtime_lib/runtime_manifest.py') }}
+        key: package-${{ runner.os }}-${{ inputs.runtime }}-${{ inputs.arch }}-${{ hashFiles(format('runtimes/{0}/runtime.json', inputs.runtime), format('runtimes/{0}/checksums/**', inputs.runtime), format('runtimes/{0}/bootstrap/**', inputs.runtime), format('runtimes/{0}/helpers/**', inputs.runtime), 'tools/bin/build-runtime', 'tools/bin/_common.sh', 'tools/runtime_lib/runtime_manifest.py') }}
 
     - name: Decide whether to audit
       id: decide
@@ -140,24 +141,35 @@ runs:
     # refresh would be discarded at the end of the job.
     - name: Update vulnerability database
       id: dbupdate
-      if: steps.decide.outputs.audit == 'true' && inputs.db-refresh == 'true' && steps.dbcache.outputs.cache-hit != 'true'
+      # Only the default branch may write the shared entry: a cache created on
+      # any other ref (a PR's refs/pull/N/merge, a tag) is readable by nothing
+      # else, so saving one there costs ~458MB of the repo's 10GB budget and
+      # evicts the package cache. Gating the update as well as the save keeps a
+      # PR from paying the ~58s refresh for a result that would be discarded.
+      if: steps.decide.outputs.audit == 'true' && inputs.db-refresh == 'true' && steps.dbcache.outputs.cache-hit != 'true' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
       shell: bash
       # Best effort: a failed refresh must not block the matrix, which falls back to
       # the database that was just restored. The step records whether the refresh
       # actually happened so the save below cannot cache a stale database.
       run: |
-        if "${GRYPE_INSTALL_DIR}/grype db update"; then
+        # The binary path is quoted on its own: quoting the whole command makes
+        # bash look for a file literally named "grype db update", which fails
+        # with ENOENT while the `if` still reports success.
+        if "${GRYPE_INSTALL_DIR}/grype" db update; then
           echo "refreshed=true" >> "$GITHUB_OUTPUT"
         else
           echo "refreshed=false" >> "$GITHUB_OUTPUT"
-          echo "::warning::grype db update failed; this week's database was not refreshed"
+          # An error annotation, not a warning: this step is `if`-guarded, so a
+          # permanently broken refresh would otherwise stay invisible in a green
+          # run (it did, for weeks, and no database entry was ever written).
+          echo "::error::grype db update failed; this week's database was not refreshed"
         fi
 
     # Only the refresher writes the entry, and only when it actually refreshed: a
     # failed refresh would otherwise freeze the stale database it fell back to under
     # the new week's key.
     - name: Save vulnerability database
-      if: steps.decide.outputs.audit == 'true' && inputs.db-refresh == 'true' && steps.dbcache.outputs.cache-hit != 'true' && steps.dbupdate.outputs.refreshed == 'true'
+      if: steps.decide.outputs.audit == 'true' && inputs.db-refresh == 'true' && steps.dbcache.outputs.cache-hit != 'true' && steps.dbupdate.outputs.refreshed == 'true' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
       # A concurrent refresher on the same week can win the race to save; the entry
       # it wrote holds the same week's database, so losing here is harmless.
       continue-on-error: true

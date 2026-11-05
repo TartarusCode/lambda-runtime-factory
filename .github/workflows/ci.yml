@@ -28,12 +28,11 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
+      # The matrix action is resolved from the workspace, so the checkout has to
+      # happen here rather than inside it.
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
       - id: matrix
-        run: echo "matrix=$(python3 tools/runtime_lib/runtime_manifest.py matrix)" >> "$GITHUB_OUTPUT"
+        uses: ./.github/actions/runtime-matrix
 
   repo-checks:
     # Deliberately runs for dependabot PRs too: it is ~10s and it is the only
@@ -112,28 +111,21 @@ jobs:
           grype: when-changed
           # Cells only read the week's database; the grype-db job writes it.
           db-refresh: "false"
-      - name: Install archive tooling
-        # ubuntu runners ship zip/unzip; only install when actually missing.
-        run: |
-          if ! command -v zip >/dev/null || ! command -v unzip >/dev/null; then
-            sudo apt-get update && sudo apt-get install -y zip unzip
-          fi
-      - name: Build runtime package
-        # Skipped when the package cache hit: the pinned archive, our bootstrap and
-        # helpers and the build script are all unchanged, so rebuilding only repeats
-        # the same extraction and zip (up to ~80s for rust). The restored zip still
-        # feeds the SAM example and the artifact upload.
-        if: steps.build-env.outputs.package-cache-hit != 'true'
-        # A pathological upstream download must fail fast, not hang the cell.
-        timeout-minutes: 20
-        run: make build RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
-      - name: Audit runtime package
-        # Skipped when this cell's archive was already cached: the findings come
-        # only from the pinned upstream payload, so an unchanged archive can only
-        # report CVE-database drift that no commit caused. That drift is caught by
-        # the weekly audit-runtimes workflow instead of blocking unrelated PRs.
-        if: steps.build-env.outputs.audit == 'true'
-        run: bash tools/bin/audit-runtime "${{ matrix.runtime }}" "${{ matrix.arch }}"
+      - name: Build and audit runtime package
+        uses: ./.github/actions/build-and-audit-runtime
+        with:
+          runtime: ${{ matrix.runtime }}
+          arch: ${{ matrix.arch }}
+          # Skipped when the package cache hit: the pinned archive, our bootstrap and
+          # helpers and the build script are all unchanged, so rebuilding only repeats
+          # the same extraction and zip (up to ~80s for rust). The restored zip still
+          # feeds the SAM example and the artifact upload.
+          skip-build: ${{ steps.build-env.outputs.package-cache-hit == 'true' }}
+          # Skipped when this cell's archive was already cached: the findings come
+          # only from the pinned upstream payload, so an unchanged archive can only
+          # report CVE-database drift that no commit caused. That drift is caught by
+          # the weekly audit-runtimes workflow instead of blocking unrelated PRs.
+          audit: ${{ steps.build-env.outputs.audit }}
       - name: Install SAM CLI
         if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke
         uses: actions/setup-python@v7
