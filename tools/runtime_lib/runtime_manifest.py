@@ -24,7 +24,7 @@ REPO_DEFAULTS: Dict[str, Any] = {
     },
     "release": {
         "bucket_base_name": "tartarus-runtimes",
-        "regions": ["eu-central-1", "us-west-1"],
+        "regions": ["us-east-1"],
     },
     "local_testing": {
         "sam_template": "examples/sam/template.local.example.yaml",

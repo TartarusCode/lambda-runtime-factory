@@ -10,7 +10,7 @@ Every runtime in the matrix is published as a Lambda layer, per architecture:
 - **Layer name** is the runtime id (`pypy311`, `deno29`, `rust199`, …)
 - **Compatible runtime**: `provided.al2023`
 - **Architectures**: `x86_64` and `arm64`
-- **Regions**: `eu-central-1`, `us-west-1`
+- **Regions**: `us-east-1`
 - **Uploads** go to `s3://tartarus-runtimes-<region>/<runtime-id>/<arch>/<sha256>.zip` —
   content-addressed, so a layer version always points at the exact bytes it was built from
 - **Layers are public**: `lambda:GetLayerVersion` is granted to `*`
@@ -19,7 +19,7 @@ Resolve the current ARN for a layer:
 
 ```bash
 aws lambda list-layer-versions \
-  --layer-name pypy311 --region eu-central-1 \
+  --layer-name pypy311 --region us-east-1 \
   --query 'LayerVersions[0].LayerVersionArn' --output text
 
 make latest RUNTIME=pypy311     # or: make latest-all
@@ -29,7 +29,7 @@ Attach it to a function:
 
 ```bash
 aws lambda update-function-configuration --function-name my-function \
-  --layers arn:aws:lambda:eu-central-1:485809183296:layer:pypy311:<version>
+  --layers arn:aws:lambda:us-east-1:485809183296:layer:pypy311:<version>
 ```
 
 The layers live in AWS account `485809183296`; `make latest` prints the full ARN.

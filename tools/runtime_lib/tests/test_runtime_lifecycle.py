@@ -1061,3 +1061,23 @@ def test_display_names_follow_the_family_and_line_convention() -> None:
             f"{runtime_id}: display_name is '{manifest['display_name']}', expected '{expected}' — "
             "it becomes the published layer description"
         )
+
+
+# --- Deployment settings are repo-level ------------------------------------------
+#
+# Regions and the S3 bucket base name live in REPO_DEFAULTS. A runtime manifest is merged
+# last, so a per-runtime copy of either one silently wins over the global value — which is
+# exactly what happened: all twelve manifests carried their own region list.
+
+
+def test_deployment_regions_are_a_repo_level_setting() -> None:
+    assert runtime_manifest.REPO_DEFAULTS["release"]["regions"] == ["us-east-1"]
+
+    for runtime_id in runtime_manifest.list_runtime_ids():
+        raw = json.loads(
+            runtime_manifest.runtime_manifest_path(runtime_id).read_text(encoding="utf-8")
+        )
+        assert "release" not in raw, (
+            f"{runtime_id}: runtime.json must not redeclare release settings — regions and the "
+            "bucket base name are repo-level (see REPO_DEFAULTS)"
+        )
