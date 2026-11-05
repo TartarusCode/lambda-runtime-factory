@@ -997,3 +997,36 @@ def test_a_real_permission_error_still_fails(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "AccessDeniedException" in result.stderr
+
+
+# --- Documentation contract ----------------------------------------------------
+#
+# The README's runtime table is written by hand, so it drifts the moment a line is
+# added: rust199 was in the build matrix while the README's list still ended at
+# rust198. The manifests are the source of truth.
+
+
+def test_the_readme_lists_every_active_runtime() -> None:
+    readme = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
+
+    missing = [
+        runtime_id
+        for runtime_id in runtime_manifest.list_active_runtime_ids()
+        if f"`{runtime_id}`" not in readme
+    ]
+
+    assert not missing, f"README.md does not mention {missing}"
+
+
+def test_the_development_documentation_is_linked_and_present() -> None:
+    """The README is the entry point; the build, CI and release half lives next door."""
+    readme = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    contributing = _REPO_ROOT / "CONTRIBUTING.md"
+
+    assert contributing.exists()
+    assert "CONTRIBUTING.md" in readme
+
+    for target in ("make build", "make local-invoke", "roll-off"):
+        assert target in contributing.read_text(encoding="utf-8"), (
+            f"CONTRIBUTING.md should document {target}"
+        )
