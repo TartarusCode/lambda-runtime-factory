@@ -1030,3 +1030,34 @@ def test_the_development_documentation_is_linked_and_present() -> None:
         assert target in contributing.read_text(encoding="utf-8"), (
             f"CONTRIBUTING.md should document {target}"
         )
+
+
+# --- Manifest naming convention -------------------------------------------------
+#
+# `display_name` is what the published layer description is built from
+# ("{display_name} Lambda Runtime"), so a stale one ships to AWS. bun13, go126 and
+# rust194 still read "Bun 1.x", "Go 1.x" and "Rust 1.x" while every line added since
+# is named after its version line by _new_display_name().
+
+_FAMILY_LABELS = {
+    "bun": "Bun",
+    "deno": "Deno",
+    "go-toolchain": "Go",
+    "rust-musl": "Rust",
+    "portable-pypy": "PyPy",
+    "graalpy": "GraalPy",
+}
+
+
+def test_display_names_follow_the_family_and_line_convention() -> None:
+    for runtime_id in runtime_manifest.list_runtime_ids():
+        manifest = json.loads(
+            runtime_manifest.runtime_manifest_path(runtime_id).read_text(encoding="utf-8")
+        )
+        line = manifest.get("version_line") or manifest.get("python_version")
+        expected = f"{_FAMILY_LABELS[manifest['runtime_family']]} {line}"
+
+        assert manifest["display_name"] == expected, (
+            f"{runtime_id}: display_name is '{manifest['display_name']}', expected '{expected}' — "
+            "it becomes the published layer description"
+        )

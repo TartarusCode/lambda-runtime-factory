@@ -1,4 +1,4 @@
-# Developing lambda-runtime-monorepo
+# Developing lambda-runtime-factory
 
 Building, testing, releasing and extending the runtime packages. For what the repository
 publishes — layer names, regions, architectures and how to consume them — see the
