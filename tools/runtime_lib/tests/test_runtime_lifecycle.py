@@ -1061,3 +1061,47 @@ def test_display_names_follow_the_family_and_line_convention() -> None:
             f"{runtime_id}: display_name is '{manifest['display_name']}', expected '{expected}' — "
             "it becomes the published layer description"
         )
+
+
+# --- Deployment settings are repo-level ------------------------------------------
+#
+# Regions and the S3 bucket base name live in REPO_DEFAULTS. A runtime manifest is merged
+# last, so a per-runtime copy of either one silently wins over the global value — which is
+# exactly what happened: all twelve manifests carried their own region list.
+
+
+def test_deployment_regions_are_a_repo_level_setting() -> None:
+    assert runtime_manifest.REPO_DEFAULTS["release"]["regions"] == ["us-east-1"]
+
+    for runtime_id in runtime_manifest.list_runtime_ids():
+        raw = json.loads(
+            runtime_manifest.runtime_manifest_path(runtime_id).read_text(encoding="utf-8")
+        )
+        assert "release" not in raw, (
+            f"{runtime_id}: runtime.json must not redeclare release settings — regions and the "
+            "bucket base name are repo-level (see REPO_DEFAULTS)"
+        )
+
+
+# --- Release visibility ----------------------------------------------------------
+#
+# A tag push carries no workflow inputs, so `github.event.inputs.publicize` is empty
+# on the one path that must never disagree with the README's "layers are public".
+# Comparing it against 'true' selected the private branch silently, and nothing in
+# the run said so.
+
+
+def test_a_tagged_release_publicizes_its_layers() -> None:
+    job = yaml.safe_load(_workflow_text("release-runtime.yml"))["jobs"]["publish"]
+
+    assert "github.event_name != 'workflow_dispatch'" in job["env"]["PUBLICIZE"], (
+        "the publish job must read an absent publicize input (a tag push) as public"
+    )
+
+    steps = {step.get("name"): step for step in job["steps"]}
+    assert "env.PUBLICIZE == 'true'" in steps["Publish and publicize Lambda layer"]["if"], (
+        "the publicize step must key off the resolved PUBLICIZE value"
+    )
+    assert "env.PUBLICIZE != 'true'" in steps["Publish Lambda layer"]["if"], (
+        "the private publish must be the explicit opt-out, not the fallback"
+    )

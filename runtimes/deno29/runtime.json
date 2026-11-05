@@ -6,11 +6,5 @@
   "version_line": "2.9",
   "artifact": {
     "checksum_file": "checksums/deno.sha256"
-  },
-  "release": {
-    "regions": [
-      "eu-central-1",
-      "us-west-1"
-    ]
   }
 }

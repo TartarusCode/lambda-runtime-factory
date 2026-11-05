@@ -6,11 +6,5 @@
   "python_version": "3.13",
   "artifact": {
     "checksum_file": "checksums/graalpy.sha256"
-  },
-  "release": {
-    "regions": [
-      "eu-central-1",
-      "us-west-1"
-    ]
   }
 }

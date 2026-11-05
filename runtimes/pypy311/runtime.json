@@ -7,11 +7,5 @@
   "artifact": {
     "checksum_file": "checksums/pypy.sha256"
   },
-  "release": {
-    "regions": [
-      "eu-central-1",
-      "us-west-1"
-    ]
-  },
   "archive_ext": ".tar.gz"
 }

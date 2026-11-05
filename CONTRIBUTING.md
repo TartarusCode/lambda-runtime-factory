@@ -49,6 +49,10 @@ python3 tools/runtime_lib/runtime_manifest.py env --runtime pypy311 --arch x86_6
 The manifest list is the single source of truth for the CI and release matrices — both call
 `runtime_manifest.py matrix` through the same composite action.
 
+Deployment regions and the S3 bucket base name are repo-level settings in `REPO_DEFAULTS`, not
+per-runtime fields. A runtime manifest that redeclares them silently wins over the global value,
+because the manifest is merged last.
+
 ## Local SAM test flow
 
 Each runtime carries its own local SAM assets, for example under `runtimes/pypy311/examples/sam/`:
