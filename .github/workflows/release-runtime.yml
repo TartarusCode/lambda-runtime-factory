@@ -158,6 +158,11 @@ jobs:
     env:
       SAM_CLI_TELEMETRY: "0"
       BUILD_BEST_EFFORT_AUDIT: "0"
+      # A tag push carries no inputs, so an absent `publicize` must mean "public":
+      # the layers are advertised as public in the README, and comparing the input
+      # against 'true' silently downgraded a tagged release to a private layer.
+      # Only an explicit dispatch may opt out.
+      PUBLICIZE: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.publicize == 'true' }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -195,10 +200,10 @@ jobs:
         if: ${{ github.event.inputs.dry_run != 'true' }}
         run: make upload RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Publish Lambda layer
-        if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.publicize != 'true' }}
+        if: ${{ github.event.inputs.dry_run != 'true' && env.PUBLICIZE != 'true' }}
         run: make publish RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Publish and publicize Lambda layer
-        if: ${{ github.event.inputs.dry_run != 'true' && github.event.inputs.publicize == 'true' }}
+        if: ${{ github.event.inputs.dry_run != 'true' && env.PUBLICIZE == 'true' }}
         run: make publicize RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
       - name: Summarize latest layer arns
         if: ${{ github.event.inputs.dry_run != 'true' }}

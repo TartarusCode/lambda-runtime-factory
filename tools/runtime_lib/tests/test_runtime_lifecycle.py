@@ -1081,3 +1081,27 @@ def test_deployment_regions_are_a_repo_level_setting() -> None:
             f"{runtime_id}: runtime.json must not redeclare release settings — regions and the "
             "bucket base name are repo-level (see REPO_DEFAULTS)"
         )
+
+
+# --- Release visibility ----------------------------------------------------------
+#
+# A tag push carries no workflow inputs, so `github.event.inputs.publicize` is empty
+# on the one path that must never disagree with the README's "layers are public".
+# Comparing it against 'true' selected the private branch silently, and nothing in
+# the run said so.
+
+
+def test_a_tagged_release_publicizes_its_layers() -> None:
+    job = yaml.safe_load(_workflow_text("release-runtime.yml"))["jobs"]["publish"]
+
+    assert "github.event_name != 'workflow_dispatch'" in job["env"]["PUBLICIZE"], (
+        "the publish job must read an absent publicize input (a tag push) as public"
+    )
+
+    steps = {step.get("name"): step for step in job["steps"]}
+    assert "env.PUBLICIZE == 'true'" in steps["Publish and publicize Lambda layer"]["if"], (
+        "the publicize step must key off the resolved PUBLICIZE value"
+    )
+    assert "env.PUBLICIZE != 'true'" in steps["Publish Lambda layer"]["if"], (
+        "the private publish must be the explicit opt-out, not the fallback"
+    )
