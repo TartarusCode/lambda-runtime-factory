@@ -8,3 +8,6 @@ event.json
 event*.json
 __pycache__/
 *.py[cod]
+
+# Local agent context: kept in the working tree, never committed.
+CLAUDE.md
