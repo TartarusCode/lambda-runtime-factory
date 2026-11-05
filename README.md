@@ -1,4 +1,4 @@
-# lambda-runtime-monorepo
+# lambda-runtime-factory
 
 AWS Lambda **layer** packages for the `provided.al2023` runtime, built and published from one
 manifest-driven pipeline. Each runtime is an independent package under `runtimes/`.
@@ -29,10 +29,10 @@ Attach it to a function:
 
 ```bash
 aws lambda update-function-configuration --function-name my-function \
-  --layers arn:aws:lambda:eu-central-1:<account-id>:layer:pypy311:<version>
+  --layers arn:aws:lambda:eu-central-1:485809183296:layer:pypy311:<version>
 ```
 
-`<account-id>` is the account that owns the published layers; `make latest` prints the full ARN.
+The layers live in AWS account `485809183296`; `make latest` prints the full ARN.
 
 ## Runtimes
 
