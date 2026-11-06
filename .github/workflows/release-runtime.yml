@@ -61,6 +61,11 @@ env:
   GRYPE_VERSION: v0.98.0
   # The container smoke test runs the same pinned emulator everywhere.
   AWS_LAMBDA_RIE_VERSION: v1.38
+  # The manifest names the ECR Public alias the project publishes under; a custom
+  # alias can sit pending in the console, so a repository variable can point the
+  # release at the account's current alias without a code change. Empty means "use
+  # the manifest".
+  ECR_PUBLIC_ALIAS: ${{ vars.ECR_PUBLIC_ALIAS }}
 
 jobs:
   prepare-matrix:

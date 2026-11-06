@@ -1718,7 +1718,29 @@ def test_soci_publishing_is_opt_in_and_needs_no_containerd() -> None:
     assert "latest-soci" not in merge_script
 
 
-def test_every_runtime_publishes_to_the_primary_registry_and_ecr_public() -> None:
+def test_the_ecr_alias_can_be_pointed_at_the_live_one(monkeypatch) -> None:
+    """A custom ECR Public alias can sit pending while the account's default alias
+    works, and a push into a non-active alias goes nowhere. The manifest names the
+    alias the project wants; `ECR_PUBLIC_ALIAS` names the one that is live, so
+    flipping it is a repository variable and not a code change."""
+    monkeypatch.setenv("ECR_PUBLIC_ALIAS", "q7s5j4e1")
+    env = runtime_manifest.runtime_env("go126", "x86_64")
+    registries = json.loads(env["CONTAINER_REGISTRIES"])
+
+    assert "public.ecr.aws/q7s5j4e1/lambda-runtime-factory" in registries
+    assert not any("tartaruscode" in item for item in registries if item.startswith("public.ecr.aws/"))
+    # The primary registry is not ECR and must not be rewritten.
+    assert env["CONTAINER_REGISTRY"] == "ghcr.io/tartaruscode/lambda-runtime-factory"
+
+    monkeypatch.setenv("ECR_PUBLIC_ALIAS", "Bad_Alias!")
+    with pytest.raises(ValueError, match="not a valid ECR Public alias"):
+        runtime_manifest.runtime_env("go126", "x86_64")
+
+
+def test_every_runtime_publishes_to_the_primary_registry_and_ecr_public(monkeypatch) -> None:
+    # The tests must not depend on the caller's shell: ECR_PUBLIC_ALIAS rewrites
+    # the alias the release publishes under, and CI sets it.
+    monkeypatch.delenv("ECR_PUBLIC_ALIAS", raising=False)
     for runtime_id in runtime_manifest.list_active_runtime_ids():
         env = runtime_manifest.runtime_env(runtime_id, "x86_64")
         registries = json.loads(env["CONTAINER_REGISTRIES"])
@@ -1738,7 +1760,7 @@ def test_the_ecr_repository_name_excludes_the_account_alias() -> None:
     environment = {
         key: value
         for key, value in os.environ.items()
-        if key != "CONTAINER_REGISTRIES_OVERRIDE"
+        if key not in ("CONTAINER_REGISTRIES_OVERRIDE", "ECR_PUBLIC_ALIAS")
     }
     output = subprocess.run(
         [
