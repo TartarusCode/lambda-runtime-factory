@@ -1,20 +1,21 @@
 #!/bin/bash
-# Generate and publish AWS SOCI (Seekable OCI) indexes for a runtime's images.
+# Publish a SOCI-enabled copy of one architecture's image.
 #
-# A SOCI index lets Lambda start a container image lazily: the microVM boots
-# before the image has finished downloading and faults in only the blocks the
-# runtime actually touches, which removes image size from the cold-start path.
-# The index is an OCI artifact that refers to the image manifest, so it is
-# generated after `merge-containers` has created the multi-arch tag.
+# Lambda lazily loads a container image from Amazon ECR when the function runs on
+# Lambda Managed Instances and its image URI points at a tag that carries a SOCI
+# index. That is a *second* image, not the one we publish normally: SOCI Index
+# Manifest v2 bundles the index into a new image — the original layers plus the
+# index — so it has its own digest and its own tag. This publishes
+# `<tag>-<arch>-soci`; `merge-container-tags --soci` combines the architectures.
 #
-# Lambda reads SOCI indexes from Amazon ECR. An image on a registry that is not
-# ECR gets a notice and no index: publishing one there would be bytes nothing
-# consumes.
+#   publish-soci-index <runtime_id> [arch] [--push]
 #
-#   publish-soci-index <runtime_id> [--push]
+# Containerd-free on purpose. `soci create` / `soci push` resolve the image through
+# containerd's image service, which a runner that builds with Docker does not have;
+# `soci convert --standalone` reads and writes OCI image layouts instead, and
+# `oras` moves them between the layout and the registry. No root, no daemon.
 #
-# Env: SOCI_VERSION (pinned), SOCI_USER / SOCI_PASSWORD for `soci push`,
-#      SOCI_STORE_ROOT for the local content store.
+# Env: SOCI_VERSION, ORAS_VERSION (both pinned), SOCI_BIN, ORAS_BIN overrides.
 set -euo pipefail
 
 source "$(dirname "$0")/_common.sh"
@@ -33,116 +34,155 @@ runtime_id=$(common::require_runtime_id "${positional[0]:-}")
 common::load_runtime_env "${runtime_id}" "${positional[1]:-x86_64}" standard
 
 soci_version="${SOCI_VERSION:-v0.16.1}"
-store_root="${SOCI_STORE_ROOT:-${BUILD_DIR}/soci-store}"
-soci="${SOCI_BIN:-${DOWNLOADS_DIR}/soci-${soci_version}}"
+oras_version="${ORAS_VERSION:-v1.3.6}"
 
-if [[ ! -x "${soci}" ]]; then
-    case "$(uname -m)" in
-        x86_64) soci_arch=amd64 ;;
-        aarch64 | arm64) soci_arch=arm64 ;;
-        *) echo "no soci asset for $(uname -m)" >&2; exit 1 ;;
-    esac
-    asset="soci-snapshotter-${soci_version#v}-linux-${soci_arch}.tar.gz"
-    url="https://github.com/awslabs/soci-snapshotter/releases/download/${soci_version}/${asset}"
-    echo "Downloading ${asset} (${soci_version})"
+case "$(uname -m)" in
+    x86_64) tool_arch=amd64 ;;
+    aarch64 | arm64) tool_arch=arm64 ;;
+    *) echo "no soci/oras asset for $(uname -m)" >&2; exit 1 ;;
+esac
+
+# install_tool <url> <asset> <destination> <binary>
+install_tool() {
+    local url=$1 asset=$2 destination=$3 binary=$4 tmp
+    echo "Downloading ${asset}"
     tmp=$(mktemp -d)
     curl --fail --location --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors \
         --retry-delay 2 --connect-timeout 30 --output "${tmp}/${asset}" "${url}"
     tar -xzf "${tmp}/${asset}" -C "${tmp}"
-    install -m 0755 "$(find "${tmp}" -type f -name soci -print -quit)" "${soci}"
+    install -m 0755 "$(find "${tmp}" -type f -name "${binary}" -print -quit)" "${destination}"
     rm -rf "${tmp}"
-fi
-
-# The self-contained content store keeps blobs out of containerd, but it does not
-# make the CLI containerd-free: `create` and `push` both resolve the image through
-# containerd's image service (`internal.NewClient` -> `containerd.New(address)`),
-# so a containerd that knows this image has to be reachable. Verified against
-# v0.16.1: it dials /run/containerd/containerd.sock and fails with "permission
-# denied" even with `--content-store soci`.
-soci_store_args=(--content-store soci --root "${store_root}")
-: "${CONTAINERD_ADDRESS:=/run/containerd/containerd.sock}"
-: "${CONTAINERD_NAMESPACE:=default}"
-
-containerd_help() {
-    cat >&2 <<EOF
-soci needs a containerd image service, not just a registry: \`create\` looks the
-image up with containerd's ImageService and \`push\` reads it from the same client,
-so --content-store only moves the blobs.
-
-To run this:
-  1. have containerd reachable at ${CONTAINERD_ADDRESS} (with access to the
-     socket — on hosted runners it is root-owned, so run soci under sudo),
-  2. import the image into that containerd, e.g.
-     docker save ${CONTAINER_IMAGE}:${CONTAINER_TAG}${CONTAINER_TAG_SUFFIX} \
-       | sudo ctr --address ${CONTAINERD_ADDRESS} -n ${CONTAINERD_NAMESPACE} images import - ,
-  3. re-run this script.
-
-\`soci convert --standalone\` avoids containerd entirely, but it reads and writes
-OCI layouts: it produces the index locally and does not publish the referrer, so
-it needs something like oras or crane to push. Nothing in the release does that
-yet — see CONTRIBUTING.md.
-EOF
 }
 
-# `soci push` needs registry credentials. Rather than putting a token in the
-# workflow, mint one from the AWS role the job already assumed: ECR Public
-# accepts the registry password from `aws ecr-public get-login-password`.
-if [[ -z "${SOCI_PASSWORD:-}" ]] && type -P aws >/dev/null; then
-    SOCI_PASSWORD=$(aws ecr-public get-login-password --region "${AWS_REGION:-us-east-1}" 2>/dev/null || true)
-    if [[ -n "${SOCI_PASSWORD}" ]]; then
-        SOCI_USER="${SOCI_USER:-AWS}"
-    fi
+soci="${SOCI_BIN:-${DOWNLOADS_DIR}/soci-${soci_version}}"
+if [[ ! -x "${soci}" ]]; then
+    asset="soci-snapshotter-${soci_version#v}-linux-${tool_arch}.tar.gz"
+    install_tool \
+        "https://github.com/awslabs/soci-snapshotter/releases/download/${soci_version}/${asset}" \
+        "${asset}" "${soci}" soci
 fi
 
-mapfile -t registries < <(python3 -c 'import json,sys
-for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIES}")
+oras="${ORAS_BIN:-${DOWNLOADS_DIR}/oras-${oras_version}}"
+if [[ ! -x "${oras}" ]]; then
+    asset="oras_${oras_version#v}_linux_${tool_arch}.tar.gz"
+    install_tool \
+        "https://github.com/oras-project/oras/releases/download/${oras_version}/${asset}" \
+        "${asset}" "${oras}" oras
+fi
 
-job_summary() {
-    [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] || return 0
-    {
-        echo "#### SOCI index: ${runtime_id}"
-        echo
-        echo "- \`$1\`"
-        echo
-    } >> "${GITHUB_STEP_SUMMARY}"
+workdir="${TEMP_ROOT}/soci/${CONTAINER_ARCH}"
+layout="${workdir}/image"
+converted="${workdir}/image-soci"
+
+mapfile -t registries < <(python3 - "${SOCI_REGISTRIES:-}" "${CONTAINER_REGISTRIES_OVERRIDE:-${CONTAINER_REGISTRIES}}" <<'PY'
+import json
+import sys
+
+explicit, configured = sys.argv[1], sys.argv[2]
+candidates = json.loads(explicit) if explicit else json.loads(configured)
+for registry in candidates:
+    # Lambda reads SOCI indexes from Amazon ECR. A SOCI copy on another registry
+    # would be bytes nothing consumes, so it is only published there when asked for
+    # explicitly (a mirror, or a throwaway registry in a test).
+    if explicit or registry.startswith("public.ecr.aws/") or ".dkr.ecr." in registry:
+        print(registry)
+PY
+)
+
+if [[ ${#registries[@]} -eq 0 ]]; then
+    echo "no ECR registry in the manifest and SOCI_REGISTRIES is unset; Lambda reads SOCI indexes from ECR, so nothing is published"
+    exit 0
+fi
+
+# A throwaway registry in a test is plain HTTP; ECR is not. The flags differ per
+# direction, so keep them separate and decide per registry rather than guessing.
+plain_flags() {  # plain_flags <registry>; sets PLAIN_SOURCE, PLAIN_DESTINATION, PLAIN_FETCH
+    local host=${1%%/*}
+    PLAIN_SOURCE=()
+    PLAIN_DESTINATION=()
+    PLAIN_FETCH=()
+    if [[ "${host}" =~ ^(localhost|127\.0\.0\.1)(:[0-9]+)?$ ]]; then
+        PLAIN_SOURCE=(--from-plain-http)
+        PLAIN_DESTINATION=(--to-plain-http)
+        PLAIN_FETCH=(--plain-http)
+    fi
+}
+
+# The SOCI copy is an index whose two entries are the image manifest and the index
+# manifest, cross-annotated, for this architecture only. If any of that is wrong
+# the function would still start — just without the index it is supposed to carry —
+# so the shape is checked rather than assumed.
+verify_soci_index() {
+    local reference=$1 file=$2
+    "${oras}" manifest fetch "${PLAIN_FETCH[@]}" "${reference}" > "${file}"
+    python3 - "${CONTAINER_ARCH}" "${file}" <<'PY'
+import json
+import sys
+
+arch, path = sys.argv[1], sys.argv[2]
+with open(path, encoding="utf-8") as handle:
+    document = json.load(handle)
+
+entries = document.get("manifests") or []
+if not entries:
+    sys.exit(f"{path}: not an image index")
+
+
+def annotation(entry, key):
+    return (entry.get("annotations") or {}).get(key, "")
+
+
+if not any(annotation(entry, "com.amazon.soci.index-digest") for entry in entries):
+    sys.exit(f"{path}: no entry carries com.amazon.soci.index-digest")
+if not any(annotation(entry, "com.amazon.soci.image-manifest-digest") for entry in entries):
+    sys.exit(f"{path}: no entry carries com.amazon.soci.image-manifest-digest")
+
+platforms = {(entry.get("platform") or {}).get("architecture") for entry in entries}
+if platforms != {arch}:
+    sys.exit(f"{path}: expected only {arch}, found {sorted(str(p) for p in platforms)}")
+
+print(f"{arch}: {len(entries)} entries, image and index manifests paired")
+PY
 }
 
 for registry in "${registries[@]}"; do
     image="${registry}/${RUNTIME_ID}"
-    case "${image}" in
-        public.ecr.aws/* | *.dkr.ecr.*) ;;
-        *)
-            echo "${runtime_id}: ${image} is not an ECR registry; Lambda reads SOCI indexes from ECR, so no index is published there"
-            continue
-            ;;
-    esac
 
-    reference="${image}:${CONTAINER_TAG}${CONTAINER_TAG_SUFFIX}"
-    echo "soci create --all-platforms ${reference}"
-    # --all-platforms makes one index for the manifest list rather than for the
-    # platform this runner happens to be.
-    if ! create_output=$("${soci}" --address "${CONTAINERD_ADDRESS}" --namespace "${CONTAINERD_NAMESPACE}" \
-        create "${soci_store_args[@]}" --all-platforms "${reference}" 2>&1); then
-        printf '%s\n' "${create_output}" >&2
-        if grep -qiE 'containerd.sock|connection error|permission denied|no such file' <<<"${create_output}"; then
-            containerd_help
-        fi
-        exit 1
+    reference="${image}:${CONTAINER_TAG}-${CONTAINER_ARCH}"
+    soci_reference="${reference}${CONTAINER_SOCI_SUFFIX}"
+    plain_flags "${registry}"
+
+    rm -rf "${layout}" "${converted}"
+    mkdir -p "${workdir}"
+
+    # One architecture at a time: a SOCI index describes a single image manifest,
+    # and a per-arch tag is exactly one manifest, so nothing has to be resolved
+    # per platform and the multi-arch tag is merged afterwards.
+    echo "Pulling ${reference} to an OCI layout"
+    "${oras}" cp "${PLAIN_SOURCE[@]}" --to-oci-layout "${reference}" "${layout}:${CONTAINER_TAG}"
+
+    echo "Converting ${reference} to a SOCI-enabled image"
+    "${soci}" convert --standalone --format oci-dir "${layout}" "${converted}"
+
+    index_digest=$(python3 -c 'import json,sys
+print(json.load(open(sys.argv[1]))["manifests"][0]["digest"])' "${converted}/index.json")
+
+    if (( ! push )); then
+        echo "Dry run: SOCI-enabled image for ${reference} is in ${converted} (${index_digest}); pass --push to publish it"
+        continue
     fi
-    printf '%s\n' "${create_output}"
 
-    if (( push )); then
-        if [[ -n "${SOCI_USER:-}" ]]; then
-            echo "soci push --user ${SOCI_USER} ${reference}"
-            "${soci}" --address "${CONTAINERD_ADDRESS}" --namespace "${CONTAINERD_NAMESPACE}" \
-                push "${soci_store_args[@]}" --user "${SOCI_USER}:${SOCI_PASSWORD:-}" "${reference}"
-        else
-            echo "soci push ${reference}"
-            "${soci}" --address "${CONTAINERD_ADDRESS}" --namespace "${CONTAINERD_NAMESPACE}" \
-                push "${soci_store_args[@]}" "${reference}"
-        fi
-        job_summary "${reference}"
-    else
-        echo "Dry run: index created in ${store_root} for ${reference}; pass --push to publish it"
+    echo "Pushing ${soci_reference}"
+    "${oras}" cp --from-oci-layout "${converted}@${index_digest}" "${PLAIN_DESTINATION[@]}" "${soci_reference}"
+    verify_soci_index "${soci_reference}" "${workdir}/soci-index.json"
+
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+        {
+            echo "#### SOCI-enabled image: ${runtime_id} (${CONTAINER_ARCH})"
+            echo
+            echo "- \`${soci_reference}\`"
+            echo "- index ${index_digest}"
+            echo
+        } >> "${GITHUB_STEP_SUMMARY}"
     fi
 done

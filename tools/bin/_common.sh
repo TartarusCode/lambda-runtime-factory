@@ -1,5 +1,10 @@
 #!/bin/bash
 
+# The tag a SOCI-enabled image is published under. Per architecture it is
+# `<tag>-<arch>-soci`; the merge turns the two into `<tag>-soci` and
+# `<line>-soci`. Lambda's function image URI points at the merged tag.
+CONTAINER_SOCI_SUFFIX="-soci"
+
 common::repo_root() {
     cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd
 }

@@ -18,6 +18,14 @@ source "$(dirname "$0")/_common.sh"
 runtime_id=$(common::require_runtime_id "${1:-}")
 common::load_runtime_env "${runtime_id}" "${ARCH:-x86_64}" standard
 
+soci=0
+for argument in "${@:2}"; do
+    case "${argument}" in
+        --soci) soci=1 ;;
+        *) echo "Unknown option: ${argument}" >&2; exit 2 ;;
+    esac
+done
+
 tag="${CONTAINER_TAG}"
 line="${VERSION_LINE}"
 
@@ -64,4 +72,35 @@ for registry in "${registries[@]}"; do
             } >> "${GITHUB_STEP_SUMMARY}"
         fi
     done
+
+    # The SOCI-enabled images merge the same way, but they are indexes rather than
+    # image manifests: buildx flattens each one's two entries into the list, so the
+    # result carries the image manifest and its index for every architecture.
+    if (( soci )); then
+        soci_arm="${image}:${tag}-arm64${CONTAINER_SOCI_SUFFIX}"
+        if ! docker buildx imagetools inspect "${soci_arm}" >/dev/null 2>&1; then
+            echo "::notice::${runtime_id} (soci): no ${soci_arm}; leaving the per-arch SOCI images as published"
+            continue
+        fi
+
+        # No moving tag on purpose: a SOCI Index Manifest v2 image cannot have its
+        # index added or removed, so a function pinned to a moving tag would change
+        # what it runs the moment another release moved it.
+        echo "Merging ${image}:${tag}${CONTAINER_SOCI_SUFFIX} from the two per-arch SOCI images"
+        docker buildx imagetools create \
+            --tag "${image}:${tag}${CONTAINER_SOCI_SUFFIX}" \
+            --tag "${image}:${line}${CONTAINER_SOCI_SUFFIX}" \
+            "${image}:${tag}-amd64${CONTAINER_SOCI_SUFFIX}" "${soci_arm}"
+
+        if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+            {
+                echo "### Multi-arch SOCI-enabled image: ${runtime_id}"
+                echo
+                echo '```'
+                docker buildx imagetools inspect "${image}:${tag}${CONTAINER_SOCI_SUFFIX}"
+                echo '```'
+                echo
+            } >> "${GITHUB_STEP_SUMMARY}"
+        fi
+    fi
 done

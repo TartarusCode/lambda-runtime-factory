@@ -35,6 +35,10 @@ limit:
 - **Architectures**: one multi-arch manifest for `linux/amd64` and `linux/arm64`
 - **Tags**: `<distribution-version>` (e.g. `1.26.10`), the version line (`1.26`), and
   `latest` on a tagged release
+- **SOCI copies**: `<distribution-version>-soci` and `<line>-soci` are the same images with a
+  SOCI index bundled in. Point a function that runs on **Lambda Managed Instances** at the
+  `-soci` tag and Lambda lazy-loads the image instead of downloading all of it first. There is no
+  moving `-soci` tag: that image is immutable by design.
 - **Debug variants**: every distroless runtime also publishes `<version>-debug`,
   `<line>-debug` and `debug` — the same payload and entrypoint on a base that carries a
   busybox shell, for inspecting an image that failed to start. The production tags never

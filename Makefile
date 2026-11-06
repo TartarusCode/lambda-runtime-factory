@@ -100,10 +100,12 @@ container-variants:
 	bash tools/bin/check-container-variants "$(RUNTIME)" "$(ARCH)"
 
 container-merge:
-	bash tools/bin/merge-container-tags "$(RUNTIME)"
+	bash tools/bin/merge-container-tags "$(RUNTIME)" $(if $(SOCI),--soci)
 
+# Converts the pushed per-arch image into a SOCI-enabled one. A dry run unless
+# PUSH=1, because the result is a new image in the registry.
 container-soci:
-	bash tools/bin/publish-soci-index "$(RUNTIME)"
+	bash tools/bin/publish-soci-index "$(RUNTIME)" "$(ARCH)" $(if $(PUSH),--push)
 
 container-repos:
 	bash tools/bin/ensure-container-repos "$(RUNTIME)"

@@ -1683,28 +1683,39 @@ def test_the_release_publishes_to_ecr_public_and_writes_a_soci_index() -> None:
     assert "ensure-container-repos" in publish["Ensure the image repositories exist"]["run"]
     assert "check-container-variants" in publish["Check that the variants differ only by the shell"]["run"]
 
-    soci = jobs["publish-soci"]
-    assert soci["needs"] == ["prepare-matrix", "merge-containers"]
-    step = {step.get("name"): step for step in soci["steps"]}["Publish the SOCI index"]
-    assert "publish-soci-index" in step["run"] and "--push" in step["run"]
-    assert "SOCI_VERSION" in step["env"], "the soci CLI must be pinned"
+    # SOCI runs beside the image it converts, not in a job that re-fetches it.
+    soci = publish["Publish the SOCI-enabled copy"]
+    assert "publish-soci-index" in soci["run"] and "--push" in soci["run"]
+    assert "SOCI_VERSION" in soci["env"], "the soci CLI must be pinned"
+    assert "ORAS_VERSION" in soci["env"], "oras moves the OCI layout, so it is pinned too"
+    assert "publish-soci" not in jobs, "the separate SOCI job was folded into the image jobs"
 
 
-def test_soci_publishing_is_opt_in_because_it_needs_containerd() -> None:
-    """`soci create` and `soci push` resolve the image through containerd's image
-    service; --content-store only moves the blobs. A hosted runner has no
-    containerd that holds these images, so the job has to be asked for explicitly
-    rather than turning every release red on its last step."""
-    soci = _workflow("release-runtime.yml")["jobs"]["publish-soci"]
-    assert "inputs.publish_soci" in soci["if"], soci["if"]
-
+def test_soci_publishing_is_opt_in_and_needs_no_containerd() -> None:
+    """SOCI is a Lambda Managed Instances optimisation, not part of a working
+    image, and the conversion has to run without a containerd: `soci create` and
+    `soci push` resolve the image through the containerd image service, which a
+    runner that builds with Docker does not have. `soci convert --standalone`
+    reads an OCI layout instead, and oras moves it."""
+    release = _workflow("release-runtime.yml")
     inputs = _triggers("release-runtime.yml")["workflow_dispatch"]["inputs"]
     assert inputs["publish_soci"]["default"] is False
 
+    publish = {step.get("name"): step for step in release["jobs"]["publish-containers"]["steps"]}
+    assert "inputs.publish_soci" in publish["Publish the SOCI-enabled copy"]["if"]
+
+    merge = {step.get("name"): step for step in release["jobs"]["merge-containers"]["steps"]}
+    assert "--soci" in merge["Create the multi-arch tags"]["run"]
+
     script = (_REPO_ROOT / "tools" / "bin" / "publish-soci-index").read_text(encoding="utf-8")
-    assert "containerd" in script and "images import" in script, (
-        "the script has to tell a runner what SOCI needs, instead of failing at the socket"
-    )
+    assert "convert --standalone" in script, "standalone mode is what removes the containerd dependency"
+    assert "oras" in script
+    assert "containerd.sock" not in script and "images import" not in script
+
+    # A SOCI Index Manifest v2 image is immutable: a moving `-soci` tag would let a
+    # release change what a function runs, which is exactly what v2 forbids.
+    merge_script = (_REPO_ROOT / "tools" / "bin" / "merge-container-tags").read_text(encoding="utf-8")
+    assert "latest-soci" not in merge_script
 
 
 def test_every_runtime_publishes_to_the_primary_registry_and_ecr_public() -> None:

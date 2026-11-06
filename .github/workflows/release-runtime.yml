@@ -33,7 +33,7 @@ on:
         default: false
         type: boolean
       publish_soci:
-        description: "Publish SOCI indexes (needs a containerd that holds the image; see CONTRIBUTING)"
+        description: "Also publish SOCI-enabled image copies (<tag>-soci) for Lambda Managed Instances"
         required: true
         default: false
         type: boolean
@@ -346,6 +346,16 @@ jobs:
           for variant in $(bash tools/bin/container-variants "${{ matrix.runtime }}" "${{ matrix.arch }}"); do
             bash tools/bin/push-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --variant "${variant}"
           done
+      - name: Publish the SOCI-enabled copy
+        # A second image per architecture, not a tag on the first: SOCI Index
+        # Manifest v2 bundles the index into a new image, and Lambda lazy-loads the
+        # one whose URI it is given. No containerd and no root needed —
+        # `soci convert --standalone` works on OCI layouts and oras moves them.
+        if: ${{ inputs.publish_soci && github.event.inputs.dry_run != 'true' }}
+        env:
+          SOCI_VERSION: v0.16.1
+          ORAS_VERSION: v1.3.6
+        run: bash tools/bin/publish-soci-index "${{ matrix.runtime }}" "${{ matrix.arch }}" --push
       - name: Report the dry run
         if: ${{ github.event.inputs.dry_run == 'true' }}
         run: |
@@ -392,49 +402,15 @@ jobs:
         # Every registry in the manifest gets the same tags, for the standard
         # image and (where the family has one) the debug image. A dispatch that
         # targeted one architecture leaves the per-arch tags alone with a notice.
-        run: bash tools/bin/merge-container-tags "${{ matrix.runtime }}"
+        run: |
+          arguments=("${{ matrix.runtime }}")
+          if [ "${{ inputs.publish_soci }}" = "true" ]; then arguments+=(--soci); fi
+          bash tools/bin/merge-container-tags "${arguments[@]}"
 
 
-  # SOCI indexes are a Lambda-side optimisation, not a release gate: an image is
-  # already published and usable without one, so a failure here is visible on the
-  # run without blocking the release record.
-  publish-soci:
-    needs:
-      - prepare-matrix
-      - merge-containers
-    # Opt-in, because the soci CLI resolves the image through containerd's image
-    # service: `--content-store soci` only moves the blobs, and `create`/`push`
-    # both dial containerd. A hosted runner builds with Docker and has no
-    # containerd that knows these images, so a default release would go red on its
-    # last step. `publish-soci-index` says exactly what a runner needs when the
-    # prerequisite is missing.
-    if: ${{ always() && needs.merge-containers.result == 'success' && inputs.publish_soci && github.event.inputs.dry_run != 'true' }}
-    environment: release
-    runs-on: ubuntu-26.04
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      id-token: write
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.prepare-matrix.outputs.merge-matrix) }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ secrets.AWS_RELEASE_ROLE_ARN }}
-          aws-region: us-east-1
-      - name: Publish the SOCI index
-        # The script mints its registry token from this role and only acts on ECR
-        # registries: a SOCI index on GHCR is bytes nothing consumes.
-        env:
-          SOCI_VERSION: v0.16.1
-        run: bash tools/bin/publish-soci-index "${{ matrix.runtime }}" --push
-
+  # SOCI publishing lives in `publish-containers` (per architecture) and
+  # `merge-containers` (the multi-arch `-soci` tag), so the conversion runs beside
+  # the image it belongs to instead of in a job that re-fetches it.
 
   record-release:
     needs:
