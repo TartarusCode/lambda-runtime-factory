@@ -56,14 +56,21 @@ REPO_DEFAULTS: Dict[str, Any] = {
         # A toolchain image is only useful as a build stage, and a distroless base
         # cannot run a `RUN` step at all.
         "profile": "distroless",
-        "base_image": "gcr.io/distroless/cc-debian12:nonroot",
+        # Upstream distroless supports the current Debian release only; debian12
+        # images are no longer rebuilt, which is how the bookworm base came to ship
+        # an OpenSSL with fixable High and Critical CVEs while trixie has moved on.
+        "base_image": "gcr.io/distroless/cc-debian13:nonroot",
+        # Libraries staged into the image have to come from the same Debian release
+        # as the base, or the payload gets newer glibc's dependencies grafted onto an
+        # older C library. Derived from `base_image` when this is empty.
+        "libs_base_image": "debian:13-slim",
         # Every runtime also ships a `<tag>-debug` variant on a base that carries a
         # busybox shell and nothing else, so a failing image can be inspected
         # (`docker run --rm -it --entrypoint /busybox/sh <image>`) without putting a
         # shell into the production image. Empty means "no debug variant": the
         # `build` families already have a shell, so a second copy would be the same
         # image under another tag.
-        "debug_base_image": "gcr.io/distroless/cc-debian12:debug-nonroot",
+        "debug_base_image": "gcr.io/distroless/cc-debian13:debug-nonroot",
         # Registries the release publishes to. The first is the primary: it names
         # the image in the docs, the examples and the release record. Amazon ECR
         # Public is here because a Lambda *function* cannot pull from GHCR at
@@ -115,6 +122,17 @@ CONTAINER_ARCH_SLUGS: Dict[str, str] = {
 # `distroless` images are runtime bases; `build` images are build environments
 # with a shell and a package manager. See the container block in REPO_DEFAULTS.
 CONTAINER_PROFILES = ("distroless", "build")
+
+def debian_slim_for(base_image: str) -> str:
+    """The `debian:<N>-slim` builder that matches a Debian-based base image.
+
+    A library staged into a distroless image has to come from the same Debian release
+    as the base: copying bookworm's libraries into a trixie image (or the reverse)
+    grafts one release's dependencies onto another's C library.
+    """
+    match = re.search(r"debian[-/:]?(?:cc-)?(\d+)", base_image)
+    return f"debian:{match.group(1)}-slim" if match else ""
+
 
 # A runtime publishes a standard image and, when its base is distroless, a
 # `<tag>-debug` variant of the same payload with a busybox shell in it.
@@ -788,6 +806,9 @@ def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH, variant: str = "stand
         "CONTAINER_DEBUG_BASE_IMAGE": debug_base_image,
         "CONTAINER_PROFILE": container["profile"],
         "CONTAINER_BASE_IMAGE": container_base_image,
+        "CONTAINER_LIBS_BASE_IMAGE": (
+            container.get("libs_base_image") or debian_slim_for(container_base_image)
+        ),
         "CONTAINER_PACKAGES": json.dumps(container["packages"]),
         "CONTAINER_LINKS": json.dumps(container["links"], sort_keys=True),
         "CONTAINER_SMOKE_TEST": json.dumps(container["smoke_test"]),

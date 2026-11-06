@@ -39,7 +39,7 @@ are first-class release artifacts.
 An image is one of two shapes, and the manifest's `container.profile` picks which:
 
 - **`distroless`** — a runtime base, for the interpreter runtimes. The base is
-  `gcr.io/distroless/cc-debian12`, which removes the shell the old bootstrap depended on and
+  `gcr.io/distroless/cc-debian13`, which removes the shell the old bootstrap depended on and
   keeps the OS CVE surface to glibc, libstdc++, OpenSSL and ca-certificates.
 - **`build`** — a build environment, for the Go and Rust toolchains. A toolchain image is only
   useful as a Dockerfile build stage (`FROM …/go126:1.26 AS build` then `RUN go build`), and a
@@ -72,7 +72,7 @@ Beyond the two artifact shapes, every runtime publishes a **debug variant** and,
 **SOCI index**:
 
 - `<version>-debug` is the same payload and invocation on
-  `gcr.io/distroless/cc-debian12:debug-nonroot`, which carries a busybox shell. It exists so a
+  `gcr.io/distroless/cc-debian13:debug-nonroot`, which carries a busybox shell. It exists so a
   failing image can be inspected instead of guessed at, and `check-container-variants` asserts
   the claims: the production image has no shell at all, the debug image runs `/busybox/sh` as
   the same uid with the same entrypoint.

@@ -4,14 +4,17 @@ The image is derived from the same ``${LAYER_ROOT}`` payload the Lambda zip laye
 is built from, so there is exactly one copy of every runtime. What differs is the
 base, and the manifest picks it per family through ``container.profile``:
 
-* **``distroless``** — a runtime base. ``gcr.io/distroless/cc-debian12`` has no
+* **``distroless``** — a runtime base. ``gcr.io/distroless/cc-debian13`` has no
   shell, no package manager and no OS tooling, which removes the shell dependency
   from the entrypoint and shrinks the OS CVE surface to glibc, libstdc++, libssl
-  and ca-certificates. Two things the base does not carry are handled here:
+  and ca-certificates. Upstream distroless only supports the current Debian
+  release, so the base tracks `debian13` (trixie) and the previous line stops being
+  rebuilt — which is exactly how a bookworm base ends up shipping an OpenSSL with
+  fixable CVEs. Two things the base does not carry are handled here:
   a static scan of the payload's ``DT_NEEDED`` entries finds the libraries it
   links against (``libz`` for GraalPy, zlib/bzip2/ncurses for portable PyPy) and
-  the generated Dockerfile copies those from a ``debian:12-slim`` stage, matching
-  the base's own Debian release instead of borrowing the build host's newer glibc;
+  the generated Dockerfile copies those from a matching ``debian:<N>-slim`` stage,
+  the release the base itself is built from;
   and the Lambda filesystem contract (``/tmp`` world-writable, code at
   ``/var/task``) is verified rather than assumed.
 * **``build``** — a build environment. A toolchain image is only useful as a
@@ -40,9 +43,10 @@ import runtime_manifest  # noqa: E402  (sibling module, resolved via sys.path ab
 
 ELF_MAGIC = b"\x7fELF"
 
-# Libraries that ``gcr.io/distroless/cc-debian12`` already provides. Verified
-# against the image itself (see CONTRIBUTING.md) — a name missing from this set is
-# staged from Debian 12 in the builder stage.
+# Libraries that ``gcr.io/distroless/cc-debian13`` already provides. Verified
+# against the image itself (see CONTRIBUTING.md) — the set is the same on
+# debian12 and debian13, so the check survives a base bump. A name missing from it
+# is staged from the matching Debian release in the builder stage.
 DISTROLESS_CC_PROVIDED = {
     "ld-linux-aarch64.so.1",
     "ld-linux-x86-64.so.2",
@@ -239,6 +243,7 @@ def render_dockerfile(
     packages: Sequence[str],
     sonames: Sequence[str],
     profile: str = "distroless",
+    libs_base_image: str = "",
     links: Optional[Dict[str, str]] = None,
     labels: Optional[Dict[str, str]] = None,
     variant: str = "standard",
@@ -246,8 +251,9 @@ def render_dockerfile(
     """Return the Dockerfile for one runtime and architecture.
 
     A ``distroless`` image is multi-stage and runs no shell in the final stage: the
-    libraries the payload needs are copied in from a ``debian:12-slim`` builder. A
-    ``build`` image is single-stage and does run a shell — that is the point of it.
+    libraries the payload needs are copied in from a ``debian:<N>-slim`` builder that
+    matches the base's release. A ``build`` image is single-stage and does run a
+    shell — that is the point of it.
 
     ``variant`` only changes the comment header and the labels: the ``debug``
     variant differs in its base image (which carries a busybox shell), not in how
@@ -266,11 +272,16 @@ def render_dockerfile(
     ]
 
     if profile == "distroless" and packages:
+        if not libs_base_image:
+            raise ContainerError(
+                f"profile 'distroless' needs a libs builder matching '{base_image}' but "
+                "none was derived; set container.libs_base_image in the manifest"
+            )
         lines += [
             "",
-            "FROM debian:12-slim AS libs",
+            f"FROM {libs_base_image} AS libs",
             "# Same Debian release as the distroless base, so the staged libraries",
-            "# match its glibc instead of borrowing the build host's newer one.",
+            "# match its glibc instead of borrowing another release's.",
             "RUN apt-get update \\",
             " && apt-get install -y --no-install-recommends "
             + " ".join(packages)
@@ -344,6 +355,7 @@ def _spec_for(runtime_id: str, arch: str, variant: str = "standard") -> Dict[str
         "tag_suffix": env["CONTAINER_TAG_SUFFIX"],
         "profile": env["CONTAINER_PROFILE"],
         "base_image": env["CONTAINER_BASE_IMAGE"],
+        "libs_base_image": env.get("CONTAINER_LIBS_BASE_IMAGE", ""),
         "packages": json.loads(env["CONTAINER_PACKAGES"]),
         "links": json.loads(env["CONTAINER_LINKS"]),
         "platform": env["CONTAINER_PLATFORM"],
@@ -482,6 +494,7 @@ def prepare(
         packages=packages,
         sonames=staged_sonames,
         profile=spec["profile"],
+        libs_base_image=spec["libs_base_image"],
         links=spec["links"],
         labels=labels,
         variant=spec["variant"],
