@@ -150,6 +150,27 @@ image that cannot `dlopen`. The final stage only uses `COPY`, `ENV`, `WORKDIR`, 
 (plus `/opt`) from the exported rootfs before reporting success, because Lambda's contract
 requires them.
 
+### Building arm64 on an x86 host
+
+`--platform linux/arm64` needs qemu registered with the kernel; without it the container dies
+with `exec format error`. Docker Desktop registers it, a plain `dockerd` does not:
+
+```bash
+docker run --privileged --rm tonistiigi/binfmt --install arm64
+docker run --rm --platform linux/arm64 alpine:3.22 uname -m    # aarch64
+```
+
+Emulation is slow, and for a GraalVM-based payload also a little flaky: GraalPy's first
+invocation takes ~19 s instead of ~2 s, and the first request after a container start can be
+reset once before it answers — retry before suspecting the image. CI is the authoritative
+check: `ARCH_RUNNERS` assigns `ubuntu-26.04-arm` to every arm64 cell, so the build, the Grype
+scan and the RIE smoke test all run natively there. Use qemu only to catch an
+architecture-specific mistake early. One thing it cannot do is `strip`: it refuses a foreign
+payload, so a cross-arch build packages unstripped binaries and comes out slightly larger than
+the same build on a native runner. The multi-arch merge step can be exercised without GHCR by
+pushing both per-arch tags to a throwaway registry (`docker run -d -p 5000:5000 registry:2`)
+and running the `imagetools create` line from `release-runtime.yml` against it.
+
 ### Publishing and consuming
 
 `push-container` tags the local image `<version>-<arch-slug>` and pushes it. The release

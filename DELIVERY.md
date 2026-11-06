@@ -52,7 +52,12 @@ An image is one of two shapes, and the manifest's `container.profile` picks whic
 
 Measured on the built images (x86_64): `go126` 251,143,202 B, `rust198` 1,521,548,887 B,
 `bun13` 116,426,951 B, `pypy311` 113,874,310 B. `go build` and `cargo build` were both run
-inside the published images, and the resulting binaries executed.
+inside the published images, and the resulting binaries executed. The arm64 images were built
+and exercised too — `go126` 274,250,387 B answers `go version go1.26.10 linux/arm64`, and
+`graalpy312` 293,552,414 B returned a 200 from an RIE invocation with an ARM `libz.so.1` staged
+into it — and the two per-arch tags were combined into a real multi-arch manifest list against a
+throwaway registry to exercise the release's merge step. See CONTRIBUTING.md for the qemu setup
+and why CI's native arm runners are the authoritative check.
 
 ## What slimming actually bought
 
