@@ -207,10 +207,19 @@ and running the `imagetools create` line from `release-runtime.yml` against it.
 
 Every runtime publishes to **both** registries in `container.registries`: GHCR
 (`ghcr.io/tartaruscode/lambda-runtime-factory/<runtime>`) and Amazon ECR Public
-(`public.ecr.aws/tartaruscode/<runtime>`). GHCR is the browsable copy; ECR Public exists
-because a Lambda *function* cannot pull from GHCR at execution time, and gives anonymous,
-high-bandwidth pulls inside AWS. `push-container` iterates that list, and
-`ensure-container-repos` creates the ECR Public repository a first push needs.
+(`public.ecr.aws/tartaruscode/lambda-runtime-factory/<runtime>`). GHCR is the browsable copy;
+ECR Public exists because a Lambda *function* cannot pull from GHCR at execution time, and
+gives anonymous, high-bandwidth pulls inside AWS.
+
+The alias in an ECR Public path is the registry namespace, and the path after it is the
+repository name: `public.ecr.aws/tartaruscode/lambda-runtime-factory/pypy311` is repository
+`lambda-runtime-factory/pypy311`. A registry has a **default alias** — `tartarusgroup` for this
+account, assigned with its first public repository — plus any **custom aliases** requested in the
+ECR console under Public registry settings, and *any active alias* can be used for pulls. That
+is why the manifest names `tartaruscode`: it matches the project and the GHCR path, so only the
+registry host differs between the two. `ensure-container-repos` creates the repository
+idempotently and fails with the account's real aliases when `tartaruscode` is not among them,
+which is a far better error than a push that goes nowhere.
 
 `push-container --variant debug` uses `<version>-<arch-slug>-debug`, and the release's
 `merge-containers` job calls `merge-container-tags`, which combines the two per-arch images of

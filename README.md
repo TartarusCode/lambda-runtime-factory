@@ -27,9 +27,11 @@ limit:
 **OCI image** — for **every** runtime, including the toolchains a layer cannot carry:
 
 - **Images**: `ghcr.io/tartaruscode/lambda-runtime-factory/<runtime-id>` and
-  `public.ecr.aws/tartaruscode/<runtime-id>` — GHCR for browsing, ECR Public because a
-  Lambda function cannot pull from GHCR at execution time and gets anonymous,
-  high-bandwidth pulls from ECR inside AWS
+  `public.ecr.aws/tartaruscode/lambda-runtime-factory/<runtime-id>` — GHCR for browsing, ECR
+  Public because a Lambda function cannot pull from GHCR at execution time and gets anonymous,
+  high-bandwidth pulls from ECR inside AWS. The ECR path needs `tartaruscode` to be an active
+  alias on the registry (the account's default alias is `tartarusgroup`; a custom alias is
+  requested in the console, and either one pulls fine)
 - **Architectures**: one multi-arch manifest for `linux/amd64` and `linux/arm64`
 - **Tags**: `<distribution-version>` (e.g. `1.26.10`), the version line (`1.26`), and
   `latest` on a tagged release

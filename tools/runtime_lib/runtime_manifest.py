@@ -68,9 +68,16 @@ REPO_DEFAULTS: Dict[str, Any] = {
         # Public is here because a Lambda *function* cannot pull from GHCR at
         # execution time, and ECR Public gives anonymous, high-bandwidth pulls
         # inside AWS; GHCR stays the public browsable copy.
+        #
+        # The alias in an ECR Public path is the registry namespace, and a registry
+        # has a default alias (assigned with its first public repository) plus any
+        # custom aliases requested in the ECR console — any *active* alias works for
+        # pulling. `tartaruscode` is the custom alias that matches this project's
+        # name, so the image path is the same on both hosts; the release checks it
+        # is active and refuses to push into an alias the account does not own.
         "registries": [
             "ghcr.io/tartaruscode/lambda-runtime-factory",
-            "public.ecr.aws/tartaruscode",
+            "public.ecr.aws/tartaruscode/lambda-runtime-factory",
         ],
         "registry": "ghcr.io/tartaruscode/lambda-runtime-factory",
         "workdir": "/var/task",

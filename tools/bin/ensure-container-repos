@@ -1,27 +1,39 @@
 #!/bin/bash
 # Create the registry repositories a runtime publishes to, when they can be.
 #
-# GHCR creates a package on first push, but Amazon ECR Public (and a private ECR
-# registry) returns RepositoryNotFoundException until the repository exists, so a
-# release would fail its first push to a new runtime. This is idempotent: an
-# existing repository is reported and left alone.
+# GHCR creates a package on first push. Amazon ECR Public does not: a push to a
+# repository that does not exist fails with `RepositoryNotFoundException` — and
+# the repository name there does **not** include the account alias. The alias is
+# the registry namespace, so `public.ecr.aws/<alias>/<prefix>/<image>` is
+# repository `<prefix>/<image>`.
 #
-#   ensure-container-repos <runtime_id>
+#   ensure-container-repos <runtime_id> [--dry-run]
 #
-# Requires AWS credentials with ecr-public:CreateRepository /
-# ecr:CreateRepository; anything else is reported and skipped rather than failing
-# a release over a repository that may already exist.
+# Requires AWS credentials with ecr-public:DescribeRegistries,
+# ecr-public:DescribeRepositories and ecr-public:CreateRepository; anything else
+# is reported and skipped rather than failing a release over a repository that may
+# already exist.
 set -euo pipefail
 
 source "$(dirname "$0")/_common.sh"
 
-runtime_id=$(common::require_runtime_id "${1:-}")
+dry_run=0
+positional=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) dry_run=1; shift ;;
+        -*) echo "Unknown option: $1" >&2; exit 2 ;;
+        *) positional+=("$1"); shift ;;
+    esac
+done
+
+runtime_id=$(common::require_runtime_id "${positional[0]:-}")
 common::load_runtime_env "${runtime_id}" "${ARCH:-x86_64}" standard
 
 mapfile -t registries < <(python3 -c 'import json,sys
-for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIES}")
+for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIES_OVERRIDE:-${CONTAINER_REGISTRIES}}")
 
-if ! type -P aws >/dev/null; then
+if (( ! dry_run )) && ! type -P aws >/dev/null; then
     echo "aws CLI is not installed; skipping repository creation"
     exit 0
 fi
@@ -29,18 +41,48 @@ fi
 for registry in "${registries[@]}"; do
     case "${registry}" in
         public.ecr.aws/*)
-            alias=${registry#public.ecr.aws/}
-            repo="${alias}/${runtime_id}"
-            echo "Ensuring ECR Public repository ${repo}"
-            if aws ecr-public describe-repositories --registry-id "$(aws ecr-public describe-registries --query 'registries[0].registryId' --output text 2>/dev/null || true)" \
-                --repository-names "${repo}" >/dev/null 2>&1; then
-                echo "${repo} exists"
+            # public.ecr.aws/<alias>/<prefix...>: the alias is the namespace and
+            # everything after it is the repository name.
+            path=${registry#public.ecr.aws/}
+            alias=${path%%/*}
+            prefix=""
+            if [[ "${path}" == */* ]]; then
+                prefix=${path#*/}
+            fi
+            repo="${prefix:+${prefix}/}${runtime_id}"
+
+            if (( dry_run )); then
+                echo "would create public.ecr.aws/${alias}/${repo} (repository name ${repo})"
                 continue
             fi
-            if aws ecr-public create-repository --repository-name "${repo}" >/dev/null 2>&1; then
-                echo "Created ${repo}"
+
+            # A mismatched alias publishes into nothing. An account's registry has
+            # a default alias (assigned with its first public repository) plus any
+            # custom aliases requested in the ECR console, and **any active alias**
+            # can be used, so this checks membership rather than equality.
+            registry_json=$(aws ecr-public describe-registries --output json 2>/dev/null || true)
+            if [[ -z "${registry_json}" ]]; then
+                echo "::warning::could not read this registry's aliases; skipping the alias check" >&2
             else
-                echo "::warning::could not create ECR Public repository ${repo}; the push will report the real reason" >&2
+                account_aliases=$(python3 -c 'import json,sys
+print(" ".join(json.loads(sys.stdin.read())["registries"][0].get("aliases") or []))' <<<"${registry_json}")
+                if [[ -z "${account_aliases}" ]]; then
+                    echo "::error::this account has no ECR Public alias yet. One is assigned when the first public repository is created in the console, and nothing can be pushed to public.ecr.aws/${alias} before that." >&2
+                    exit 1
+                fi
+                if [[ " ${account_aliases} " != *" ${alias} "* ]]; then
+                    echo "::error::public.ecr.aws/${alias} is not an active alias for this registry (active: ${account_aliases}). A custom alias is added in the ECR console under Public registry settings, or point container.registries at an active one." >&2
+                    exit 1
+                fi
+                echo "public.ecr.aws/${alias} is an active alias"
+            fi
+
+            if aws ecr-public describe-repositories --repository-names "${repo}" >/dev/null 2>&1; then
+                echo "public.ecr.aws/${alias}/${repo} exists"
+            elif aws ecr-public create-repository --repository-name "${repo}" >/dev/null 2>&1; then
+                echo "Created public.ecr.aws/${alias}/${repo}"
+            else
+                echo "::warning::could not create public.ecr.aws/${alias}/${repo}; the push will report the real reason" >&2
             fi
             ;;
         *.dkr.ecr.*)

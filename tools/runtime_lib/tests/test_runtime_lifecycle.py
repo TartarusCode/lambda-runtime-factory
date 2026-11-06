@@ -1697,7 +1697,36 @@ def test_every_runtime_publishes_to_the_primary_registry_and_ecr_public() -> Non
 
         assert env["CONTAINER_REGISTRY"] in registries, runtime_id
         assert env["CONTAINER_IMAGE"].startswith(env["CONTAINER_REGISTRY"] + "/"), runtime_id
-        assert "public.ecr.aws/tartaruscode" in registries, runtime_id
+        assert "public.ecr.aws/tartaruscode/lambda-runtime-factory" in registries, runtime_id
+
+
+def test_the_ecr_repository_name_excludes_the_account_alias() -> None:
+    """ECR Public's alias is the registry namespace, not part of the repository
+    name — creating `tartarusgroup/lambda-runtime-factory/pypy311` would make a
+    repository two levels deeper than the image path that pushes to it."""
+    # The registry list can be overridden in the environment (that is how the
+    # merge and push scripts are pointed at a throwaway registry), so the check
+    # runs without it rather than depending on the caller's shell.
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key != "CONTAINER_REGISTRIES_OVERRIDE"
+    }
+    output = subprocess.run(
+        [
+            "bash",
+            str(_REPO_ROOT / "tools" / "bin" / "ensure-container-repos"),
+            "pypy311",
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=environment,
+    ).stdout
+
+    assert "(repository name lambda-runtime-factory/pypy311)" in output
+    assert "public.ecr.aws/tartaruscode/lambda-runtime-factory/pypy311" in output
 
 
 def test_a_runtime_without_a_shell_variant_says_so() -> None:
