@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -118,6 +119,41 @@ CONTAINER_PROFILES = ("distroless", "build")
 # A runtime publishes a standard image and, when its base is distroless, a
 # `<tag>-debug` variant of the same payload with a busybox shell in it.
 CONTAINER_VARIANTS = ("standard", "debug")
+
+_ECR_PUBLIC_PREFIX = "public.ecr.aws/"
+_ECR_ALIAS = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+
+
+def with_ecr_alias(registries: List[str]) -> List[str]:
+    """Rewrite the alias of every `public.ecr.aws/<alias>/...` entry.
+
+    A custom ECR Public alias can sit pending in the console while the account's
+    default alias (an auto-generated name) already works, and a release cannot push
+    into an alias the registry does not consider active. So the manifest names the
+    alias the project *wants* — the one the docs and the image URIs use — and
+    `ECR_PUBLIC_ALIAS` names the one that is live today. Empty or unset means "use
+    the manifest".
+    """
+    alias = os.environ.get("ECR_PUBLIC_ALIAS", "").strip()
+    if not alias:
+        return registries
+    if not _ECR_ALIAS.match(alias):
+        raise ValueError(
+            f"ECR_PUBLIC_ALIAS '{alias}' is not a valid ECR Public alias "
+            "(lowercase letters, digits and hyphens)"
+        )
+
+    rewritten: List[str] = []
+    for registry in registries:
+        if not registry.startswith(_ECR_PUBLIC_PREFIX):
+            rewritten.append(registry)
+            continue
+        remainder = registry[len(_ECR_PUBLIC_PREFIX) :]
+        path = remainder.split("/", 1)[1] if "/" in remainder else ""
+        rewritten.append(
+            f"{_ECR_PUBLIC_PREFIX}{alias}/{path}" if path else f"{_ECR_PUBLIC_PREFIX}{alias}"
+        )
+    return rewritten
 
 RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "portable-pypy": {
@@ -663,8 +699,8 @@ def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH, variant: str = "stand
     work_dir = build_dir / "work"
     container = data["container"]
     container_arch = CONTAINER_ARCH_SLUGS.get(arch, arch)
-    container_registries = [item.rstrip("/") for item in container["registries"]]
-    container_registry = container["registry"].rstrip("/")
+    container_registries = with_ecr_alias([item.rstrip("/") for item in container["registries"]])
+    container_registry = with_ecr_alias([container["registry"].rstrip("/")])[0]
     container_image = f"{container_registry}/{runtime_id}"
     container_tag = data["distribution_version"]
     # A debug image is the same payload on a base that carries a busybox shell.

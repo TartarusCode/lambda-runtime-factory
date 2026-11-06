@@ -221,6 +221,12 @@ registry host differs between the two. `ensure-container-repos` creates the repo
 idempotently and fails with the account's real aliases when `tartaruscode` is not among them,
 which is a far better error than a push that goes nowhere.
 
+While a custom alias is still pending in the console, the release has to publish under the alias
+the account actually has. The `ECR_PUBLIC_ALIAS` repository variable does that: it rewrites the
+alias segment of the `public.ecr.aws/...` entries only, so the manifest keeps naming the alias the
+docs and the image URIs use, and flipping over when the alias is approved is a settings change
+rather than a commit. Empty or unset means "use the manifest".
+
 `push-container --variant debug` uses `<version>-<arch-slug>-debug`, and the release's
 `merge-containers` job calls `merge-container-tags`, which combines the two per-arch images of
 each variant into `<version>`, the version line, and the moving tag — `latest` for the standard

@@ -6,55 +6,28 @@ runtime is an independent package under `runtimes/`.
 
 ## What gets published
 
-Every runtime in the matrix is built and scanned. Each runtime then ships as **two artifacts
-from the same payload**:
+Every runtime is built and scanned, then ships as **two artifacts from the same payload**:
 
-**Lambda zip layer** — for the runtimes that fit Lambda's 250 MB unzipped deployment-package
-limit:
+|  | Lambda layer | Container image |
+| --- | --- | --- |
+| **Runtimes** | the 7 that fit the 250 MB unzipped limit | all 12 |
+| **Location** | `s3://tartarus-runtimes-us-east-1/<runtime>/<arch>/<sha256>.zip` | `ghcr.io/tartaruscode/lambda-runtime-factory/<runtime>` and `public.ecr.aws/tartaruscode/lambda-runtime-factory/<runtime>` |
+| **Architectures** | `x86_64` and `arm64`, separate layers | one multi-arch manifest |
+| **Address by** | layer name = runtime id (`pypy311`), compatible with `provided.al2023` | `<version>` (`1.26.10`), `<line>` (`1.26`), `latest` |
 
-- **Layer name** is the runtime id (`pypy311`, `deno29`, `graalpy312`, …)
-- **Compatible runtime**: `provided.al2023`
-- **Architectures**: `x86_64` and `arm64`
-- **Regions**: `us-east-1`
-- **Uploads** go to `s3://tartarus-runtimes-<region>/<runtime-id>/<arch>/<sha256>.zip` —
-  content-addressed, so a layer version always points at the exact bytes it was built from
-- **Layers are public**: `lambda:GetLayerVersion` is granted to `*`
-- **Five runtimes are built but not published as layers** — `go126`, `go127`, `rust194`,
-  `rust198` and `rust199` ship a whole upstream toolchain and are flagged
-  `layer_publishable: false`. CI keeps building and scanning them; they publish as images.
-  See [DELIVERY.md](DELIVERY.md) for the constraint.
-
-**OCI image** — for **every** runtime, including the toolchains a layer cannot carry:
-
-- **Images**: `ghcr.io/tartaruscode/lambda-runtime-factory/<runtime-id>` and
-  `public.ecr.aws/tartaruscode/lambda-runtime-factory/<runtime-id>` — GHCR for browsing, ECR
-  Public because a Lambda function cannot pull from GHCR at execution time and gets anonymous,
-  high-bandwidth pulls from ECR inside AWS. The ECR path needs `tartaruscode` to be an active
-  alias on the registry (the account's default alias is `tartarusgroup`; a custom alias is
-  requested in the console, and either one pulls fine)
-- **Architectures**: one multi-arch manifest for `linux/amd64` and `linux/arm64`
-- **Tags**: `<distribution-version>` (e.g. `1.26.10`), the version line (`1.26`), and
-  `latest` on a tagged release
-- **SOCI copies**: `<distribution-version>-soci` and `<line>-soci` are the same images with a
-  SOCI index bundled in. Point a function that runs on **Lambda Managed Instances** at the
-  `-soci` tag and Lambda lazy-loads the image instead of downloading all of it first. There is no
+- Uploads are content-addressed, so a layer version always points at the exact bytes it was built
+  from, and layers are public (`lambda:GetLayerVersion` to `*`).
+- **Five runtimes ship no layer**: `go126`, `go127`, `rust194`, `rust198` and `rust199` carry a
+  whole upstream toolchain (`layer_publishable: false`). They are still built and scanned, and
+  they publish as images. See [DELIVERY.md](DELIVERY.md).
+- **`-debug` tags** — same payload and entrypoint on a base with a busybox shell, for looking at
+  an image that failed to start. The production tags never contain a shell.
+- **`-soci` tags** — the same image with a SOCI index bundled in, for functions on **Lambda
+  Managed Instances**, which then lazy-load it instead of downloading the whole thing. There is no
   moving `-soci` tag: that image is immutable by design.
-- **Debug variants**: every distroless runtime also publishes `<version>-debug`,
-  `<line>-debug` and `debug` — the same payload and entrypoint on a base that carries a
-  busybox shell, for inspecting an image that failed to start. The production tags never
-  have a shell.
-- **SOCI indexes**: the release publishes a SOCI index for the ECR Public copy, so Lambda
-  can start the image lazily instead of downloading every layer first
-- **Two shapes**, because a runtime base and a build environment are different things:
-  - **Runtime base** (the interpreter runtimes) — `gcr.io/distroless/cc-debian12`: no shell,
-    no package manager, minimal OS CVE surface, and a **10 GB** uncompressed limit instead of
-    the 250 MB layer budget. The entrypoint is exec-form and shell-free: the runtime binary,
-    or the runtime's compiled bootstrap launcher. `aws-lambda-rie` is mounted only for the
-    smoke test, never shipped.
-  - **Build environment** (the Go and Rust toolchains) — `debian:12-slim` and `alpine:3.22`
-    respectively, with a shell and a package manager, because the documented use is a
-    Dockerfile build stage and a `RUN` step needs a shell. The toolchain is on `PATH`; the
-    image's smoke test runs it (`go version`, `rustc --version`).
+- **Bases** — interpreter runtimes use `gcr.io/distroless/cc-debian12` (no shell, minimal OS CVE
+  surface, 10 GB limit instead of 250 MB); the Go and Rust toolchains use `debian:12-slim` and
+  `alpine:3.22`, because a `RUN go build` in a builder stage needs a shell.
 
 Resolve the current ARN for a layer:
 
