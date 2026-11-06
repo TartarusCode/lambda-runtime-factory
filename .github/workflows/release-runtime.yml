@@ -49,9 +49,13 @@ permissions:
   actions: read
   # Credentials are assumed through OIDC; the repo holds no long-lived AWS keys.
   id-token: write
+  # Container images publish to GHCR with the workflow token.
+  packages: write
 
 env:
   GRYPE_VERSION: v0.98.0
+  # The container smoke test runs the same pinned emulator everywhere.
+  AWS_LAMBDA_RIE_VERSION: v1.38
 
 jobs:
   prepare-matrix:
@@ -59,6 +63,8 @@ jobs:
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
+      container-matrix: ${{ steps.containers.outputs.matrix }}
+      merge-matrix: ${{ steps.merge.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
       # Same generator CI uses, so the runner labels and the deprecated-runtime
@@ -70,6 +76,29 @@ jobs:
         with:
           runtime: ${{ github.event.inputs.runtime || 'all' }}
           arch: ${{ github.event.inputs.arch || 'all' }}
+          # A deployment package is capped at 250 MB unzipped — the function plus
+          # all of its layers together — so the runtimes flagged
+          # layer_publishable: false are built and audited by CI but cannot be
+          # delivered as a layer. Publishing one fails every release on an AWS
+          # quota; CI keeps covering them so nothing rots.
+          layer-publishable-only: "true"
+      - id: containers
+        uses: ./.github/actions/runtime-matrix
+        with:
+          runtime: ${{ github.event.inputs.runtime || 'all' }}
+          arch: ${{ github.event.inputs.arch || 'all' }}
+          # Containers are the opposite answer to the same quota: a 10 GB
+          # uncompressed ceiling, so every runtime publishes an image — including
+          # the Go and Rust toolchains that can never be a layer.
+          layer-publishable-only: "false"
+      - id: merge
+        uses: ./.github/actions/runtime-matrix
+        with:
+          runtime: ${{ github.event.inputs.runtime || 'all' }}
+          # One cell per runtime: the merge combines both architectures, so
+          # running it per arch would repeat the same manifest edit twice.
+          arch: x86_64
+          layer-publishable-only: "false"
 
   # The publish cells only restore the database, so they need the entry primed
   # first: a manual release must not scan against a week-old database just because
@@ -106,6 +135,18 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           if [[ ! "${tag}" =~ ^release-[0-9]{4}\.[0-9]{2}\.[0-9]{2}(-[0-9]+)?$ ]]; then
             echo "::error::Tag '${tag}' is not a release tag. Expected release-YYYY.MM.DD, optionally suffixed -2, -3 for a second release on the same day."
+            exit 1
+          fi
+
+      # An empty matrix would otherwise be a green no-op: the run reports success
+      # having published nothing, which reads as "released" to anyone watching.
+      - name: Refuse an empty publish matrix
+        env:
+          MATRIX: ${{ needs.prepare-matrix.outputs.matrix }}
+        run: |
+          count=$(python3 -c 'import json,os; print(len(json.loads(os.environ["MATRIX"])["include"]))')
+          if [[ "${count}" -eq 0 ]]; then
+            echo "::error::the publish matrix is empty — every requested runtime is flagged layer_publishable: false or deprecated, so there is nothing to publish."
             exit 1
           fi
 
@@ -193,6 +234,10 @@ jobs:
           # unconditionally, because a publish must never skip it.
           skip-build: ${{ steps.build-env.outputs.package-cache-hit == 'true' }}
           audit: "true"
+          # This cell publishes the layer; the image is built, scanned, smoke
+          # tested and pushed by publish-containers, so building it here would
+          # duplicate work without changing what is published.
+          container: "false"
       # Everything below writes to S3 or creates a layer version; a dry run stops
       # here, having already exercised the credential preflight, the package cache
       # and the scan.
@@ -218,12 +263,129 @@ jobs:
         run: |
           echo "::notice::dry run: ${{ matrix.runtime }} (${{ matrix.arch }}) was built and scanned; no S3 object was written and no layer version was created."
 
-  # The tag is the release record, so this makes the layer versions answerable
-  # from it. It only runs when every cell published.
+  # Containers are a separate job from the layer publish on purpose: they cover
+  # every runtime (the layer matrix excludes the toolchains), they push to GHCR
+  # rather than S3/AWS, and a dry run still exercises the whole path.
+  publish-containers:
+    needs:
+      - prepare-matrix
+      - grype-db
+      - preflight
+    environment: release
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    # Job-level permissions replace the workflow map, so every scope is repeated.
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.container-matrix) }}
+    env:
+      BUILD_BEST_EFFORT_AUDIT: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: ./.github/actions/runtime-build-env
+        id: build-env
+        with:
+          runtime: ${{ matrix.runtime }}
+          arch: ${{ matrix.arch }}
+          # A published image must be gated on a fresh scan.
+          grype: always
+          db-refresh: "false"
+      - name: Log in to GHCR
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build the distroless image
+        # Builds the same payload as the layer, scans it, then smoke-tests it
+        # under aws-lambda-rie; only the bytes that passed are pushed below.
+        run: timeout 900 bash tools/bin/build-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
+      - name: Audit the container image
+        run: bash tools/bin/audit-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
+      - name: Smoke-test the container image
+        run: timeout 600 bash tools/bin/local-invoke-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
+      - name: Push the per-architecture image
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: bash tools/bin/push-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
+      - name: Report the dry run
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        run: |
+          echo "::notice::dry run: ${{ matrix.runtime }} (${{ matrix.arch }}) image was built, scanned and smoke-tested; nothing was pushed."
+
+  # Combine the two per-arch images into one multi-arch tag. Done once per
+  # runtime, after every architecture has pushed: a manifest list cannot be built
+  # from an image that does not exist yet.
+  merge-containers:
+    needs:
+      - prepare-matrix
+      - publish-containers
+    if: ${{ always() && needs.publish-containers.result == 'success' && github.event.inputs.dry_run != 'true' }}
+    environment: release
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.merge-matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create the multi-arch tags
+        run: |
+          env_text=$(python3 tools/runtime_lib/runtime_manifest.py env \
+            --runtime "${{ matrix.runtime }}" --arch x86_64)
+          image=$(grep '^CONTAINER_IMAGE=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
+          tag=$(grep '^CONTAINER_TAG=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
+          line=$(grep '^VERSION_LINE=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
+
+          # A dispatch can target one architecture; a manifest list needs both.
+          if ! docker buildx imagetools inspect "${image}:${tag}-arm64" >/dev/null 2>&1; then
+            echo "::notice::no arm64 image for ${{ matrix.runtime }}; leaving the per-arch tags as published"
+            exit 0
+          fi
+
+          tags=(--tag "${image}:${tag}" --tag "${image}:${line}")
+          # Moving `latest` is only meaningful for a tagged release: a replayed
+          # older dispatch must not roll it backwards.
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tags+=(--tag "${image}:latest")
+          fi
+          docker buildx imagetools create "${tags[@]}" \
+            "${image}:${tag}-amd64" "${image}:${tag}-arm64"
+
+          {
+            echo "### Multi-arch image: ${{ matrix.runtime }}"
+            echo
+            docker buildx imagetools inspect "${image}:${tag}"
+            echo
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+
   record-release:
     needs:
       - prepare-matrix
       - publish
+      # The images are release artifacts too, so the record waits for the
+      # multi-arch tags to exist before it names them.
+      - merge-containers
     if: ${{ always() && needs.publish.result == 'success' && github.event.inputs.dry_run != 'true' }}
     environment: release
     runs-on: ubuntu-26.04
@@ -268,6 +430,40 @@ jobs:
             } >> "${RUNNER_TEMP}/release-notes.md"
           done < "${RUNNER_TEMP}/cells.txt"
           cat "${RUNNER_TEMP}/release-notes.md" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Collect the published container images
+        # The images are the delivery path for the runtimes that cannot be a
+        # layer, so a release record that named only the layers would omit half
+        # the release. Skipped when the merge job did not run (dry run) or failed:
+        # naming an image that was never pushed is worse than omitting it.
+        if: ${{ needs.merge-containers.result == 'success' }}
+        env:
+          MATRIX: ${{ needs.prepare-matrix.outputs.container-matrix }}
+        run: |
+          python3 - <<'PY' > "${RUNNER_TEMP}/images.txt"
+          import json
+          import os
+
+          for cell in json.loads(os.environ["MATRIX"])["include"]:
+              print(cell["runtime"])
+          PY
+          # The section goes into the record *and* the run summary. Appending the
+          # whole notes file to the summary here would replay the layer section
+          # that was already written above, so only the new section is emitted.
+          {
+            echo "## Published container images"
+            echo
+            while read -r runtime; do
+              env_text=$(python3 tools/runtime_lib/runtime_manifest.py env \
+                --runtime "${runtime}" --arch x86_64)
+              image=$(grep '^CONTAINER_IMAGE=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
+              tag=$(grep '^CONTAINER_TAG=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
+              echo "- \`${image}:${tag}\`"
+            done < "${RUNNER_TEMP}/images.txt"
+            echo
+          } > "${RUNNER_TEMP}/container-images.md"
+          cat "${RUNNER_TEMP}/container-images.md" >> "${RUNNER_TEMP}/release-notes.md"
+          cat "${RUNNER_TEMP}/container-images.md" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Attach the record to the release tag
         if: github.ref_type == 'tag'

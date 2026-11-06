@@ -13,6 +13,8 @@ import pytest
 import yaml
 
 import bump_version
+import container_image
+import package_size
 import runtime_manifest
 
 
@@ -456,10 +458,19 @@ def test_every_matrix_job_checks_out_before_generating_the_matrix() -> None:
     for workflow in ("ci.yml", "release-runtime.yml", "audit-runtimes.yml"):
         steps = _workflow(workflow)["jobs"]["prepare-matrix"]["steps"]
 
-        assert [step.get("uses") for step in steps] == ["actions/checkout@v7", _MATRIX_ACTION], (
-            f"{workflow}:prepare-matrix must check out first, then generate the matrix"
+        assert steps[0].get("uses") == "actions/checkout@v7", (
+            f"{workflow}:prepare-matrix must check out before any local action"
         )
+        assert steps[1].get("uses") == _MATRIX_ACTION
         assert steps[1]["id"] == "matrix", "the job output must read steps.matrix.outputs.matrix"
+        # Every following matrix generated in the same job must use the same
+        # generator: a hand-rolled second matrix is how a runner label or the
+        # publish filter drifts.
+        for step in steps[2:]:
+            assert step.get("uses") == _MATRIX_ACTION, (
+                f"{workflow}:prepare-matrix may only add matrix steps from the shared action"
+            )
+            assert step.get("id"), "each extra matrix needs an id for its job output"
 
 
 def test_the_matrix_action_excludes_deprecated_runtimes_by_default() -> None:
@@ -624,6 +635,8 @@ _PACKAGE_INPUTS = (
     # Sourced by build-runtime; a change here that alters the layer layout would
     # otherwise reuse a package built by the old helpers.
     "tools/bin/_common.sh",
+    # Compiled into the Go/Rust bootstrap; a change here changes package bytes.
+    "tools/launcher/**",
     "tools/runtime_lib/runtime_manifest.py",
 )
 
@@ -814,13 +827,30 @@ def test_the_release_can_read_the_commits_ci_conclusion() -> None:
 def test_the_release_records_what_it_published() -> None:
     record = _workflow("release-runtime.yml")["jobs"]["record-release"]
 
-    assert record["needs"] == ["prepare-matrix", "publish"]
+    # The images are release artifacts too, so the record waits for the
+    # multi-arch tags before it names them.
+    assert record["needs"] == ["prepare-matrix", "publish", "merge-containers"]
     assert record["if"] == (
         "${{ always() && needs.publish.result == 'success' && github.event.inputs.dry_run != 'true' }}"
     )
     # Job-level permissions replace the workflow-level map, so the OIDC scope has
     # to be repeated or the credential step in this job fails.
     assert record["permissions"] == {"contents": "write", "id-token": "write"}
+
+
+def test_the_release_record_names_the_container_images() -> None:
+    """A record that listed only the layers would omit the toolchain runtimes."""
+    steps = _workflow("release-runtime.yml")["jobs"]["record-release"]["steps"]
+    by_name = {step.get("name"): step for step in steps}
+
+    images = by_name["Collect the published container images"]
+    # Naming an image the merge job never pushed is worse than omitting it.
+    assert images["if"] == "${{ needs.merge-containers.result == 'success' }}"
+    assert "container-matrix" in images["env"]["MATRIX"]
+    assert "CONTAINER_IMAGE" in images["run"] and "CONTAINER_TAG" in images["run"]
+    # The notes are attached to the tag, so the image list has to land in the
+    # same file the attach step reads.
+    assert "release-notes.md" in images["run"]
 
 
 def test_every_job_has_a_timeout() -> None:
@@ -1105,3 +1135,665 @@ def test_a_tagged_release_publicizes_its_layers() -> None:
     assert "env.PUBLICIZE != 'true'" in steps["Publish Lambda layer"]["if"], (
         "the private publish must be the explicit opt-out, not the fallback"
     )
+
+
+# --- Layer delivery limits -------------------------------------------------------
+#
+# A deployment package is capped at 250 MB unzipped, and that covers the function
+# plus every layer attached to it, so a runtime shipping a whole upstream toolchain
+# cannot be delivered as a layer however it is split. Those runtimes are built and
+# audited but kept out of the publish matrix. Both halves matter: dropping them from
+# CI as well would let their packages rot unnoticed.
+
+
+def test_unpublishable_runtimes_are_flagged_out_of_the_publish_matrix() -> None:
+    build = {entry["runtime"] for entry in runtime_manifest.manifest_matrix()["include"]}
+    publish = {
+        entry["runtime"]
+        for entry in runtime_manifest.manifest_matrix(layer_publishable_only=True)["include"]
+    }
+    flagged = {
+        runtime_id
+        for runtime_id in runtime_manifest.list_runtime_ids()
+        if not runtime_manifest.is_layer_publishable(runtime_id)
+    }
+
+    assert flagged, "nothing is flagged, so this guard cannot catch a regression"
+    assert not (flagged & publish), f"flagged runtimes are still published: {sorted(flagged & publish)}"
+    assert flagged <= build, "a flagged runtime must still be built and audited by CI"
+    assert build - flagged == publish
+
+
+def test_the_release_matrix_asks_for_publishable_runtimes_only() -> None:
+    steps = yaml.safe_load(_workflow_text("release-runtime.yml"))["jobs"]["prepare-matrix"]["steps"]
+    matrix_step = next(step for step in steps if step.get("id") == "matrix")
+
+    assert matrix_step["with"]["layer-publishable-only"] == "true", (
+        "the publish matrix must exclude runtimes that cannot be a layer"
+    )
+
+
+def test_an_empty_publish_matrix_is_refused_not_silently_green() -> None:
+    steps = yaml.safe_load(_workflow_text("release-runtime.yml"))["jobs"]["preflight"]["steps"]
+    refuse = next((step for step in steps if step.get("name") == "Refuse an empty publish matrix"), None)
+
+    assert refuse is not None, "a release with nothing to publish must fail, not report success"
+    assert "needs.prepare-matrix.outputs.matrix" in refuse["env"]["MATRIX"]
+    assert "-eq 0" in refuse["run"]
+
+
+# --- Deterministic packages ------------------------------------------------------
+#
+# The zip's SHA-256 is the S3 object key *and* the layer-reuse key
+# (Content.CodeSha256). A build that embeds "now" mints a new layer version on every
+# release and the reuse path can never fire — which is exactly what happened: the
+# same runtime and arch produced aff7a46c… and b0dd53dd… from identical inputs.
+
+
+def test_the_package_zip_is_deterministic() -> None:
+    script = (_REPO_ROOT / "tools" / "bin" / "build-runtime").read_text(encoding="utf-8")
+    # Match the zip invocation only: "unzip -qo" also contains "zip -".
+    zip_line = next(
+        line.strip()
+        for line in script.splitlines()
+        if "zip -" in line and "unzip" not in line
+    )
+    # zip takes combined short options (zip -qrX), so inspect the flag cluster
+    # rather than looking for the literal "-X".
+    flags = zip_line.split("zip -", 1)[1].split()[0]
+
+    assert "TZ=UTC" in zip_line, "stored timestamps must not depend on the machine's zone"
+    assert "X" in flags, "zip -X must drop the ownership extras; the uid differs per environment"
+    assert "touch -h -t" in script, (
+        "entry mtimes must be pinned before zipping — cp and cp -R stamp their copies "
+        "with the build time, which is what moved the hash on every run"
+    )
+
+
+# --- Deployment-package budget ---------------------------------------------------
+#
+# AWS caps a deployment package at 250 MB unzipped, and that ceiling covers the
+# function plus every layer attached to it. The build measures the package and
+# refuses to call an oversized one publishable; the publish matrix skips what the
+# build would refuse. Measured on graalpy312 before slimming: 252.7 MB unzipped —
+# 2.7 MB over, which is exactly the failure AWS reported.
+
+
+def test_the_size_budget_travels_to_the_build_script() -> None:
+    assert runtime_manifest.REPO_DEFAULTS["layer_publishable"] is True
+    assert runtime_manifest.REPO_DEFAULTS["max_unzipped_bytes"] == 262144000
+    assert runtime_manifest.REPO_DEFAULTS["warn_unzipped_bytes"] == 209715200
+
+    for runtime_id, expected in (("pypy311", "true"), ("go126", "false")):
+        env = runtime_manifest.runtime_env(runtime_id, arch="x86_64")
+        assert env["LAYER_PUBLISHABLE"] == expected, runtime_id
+        assert env["MAX_UNZIPPED_BYTES"] == "262144000"
+        assert env["WARN_UNZIPPED_BYTES"] == "209715200"
+
+
+def test_a_family_default_excludes_a_whole_family() -> None:
+    """A runtime line generated by a version bump must not walk back into the
+    publish matrix, so the exclusion belongs to the family, not to the manifest."""
+    for runtime_id in runtime_manifest.list_runtime_ids():
+        family = runtime_manifest.load_runtime(runtime_id)["runtime_family"]
+        if family not in ("go-toolchain", "rust-musl"):
+            continue
+
+        raw = json.loads(
+            runtime_manifest.runtime_manifest_path(runtime_id).read_text(encoding="utf-8")
+        )
+        assert runtime_manifest.is_layer_publishable(runtime_id) is False, runtime_id
+        assert "layer_publishable" not in raw, (
+            f"{runtime_id}: declare the exclusion on the family so a new line inherits it"
+        )
+
+
+def test_layer_slimming_never_prunes_package_metadata() -> None:
+    """Version identification reads metadata inside the package, so slimming may
+    only prune things it does not read."""
+    script = (_REPO_ROOT / "tools" / "bin" / "build-runtime").read_text(encoding="utf-8")
+    slim = script.split("slim_layer()", 1)[1].split("\n}\n", 1)[0]
+
+    for metadata in ("dist-info", "egg-info", "METADATA"):
+        assert metadata not in slim, (
+            f"slimming must not remove {metadata}: that is how a component version is identified"
+        )
+    assert "SLIM_LAYER" in slim, "the A/B switch is how the before/after byte counts are compared"
+
+
+def test_the_size_reporter_writes_the_budget_row(tmp_path: Path) -> None:
+    env = runtime_manifest.runtime_env("bun13", arch="x86_64")
+    artifact_dir = Path(env["ARTIFACT_DIR"])
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    stats = artifact_dir / "build-stats.json"
+    stats.write_text(
+        json.dumps(
+            {
+                "runtime_id": "bun13",
+                "arch": "x86_64",
+                "zipped_bytes": 35979139,
+                "unzipped_bytes": 92754962,
+                "max_unzipped_bytes": 262144000,
+                "warn_unzipped_bytes": 209715200,
+                "layer_publishable": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    summary = tmp_path / "summary.md"
+    reporter = _REPO_ROOT / ".github" / "actions" / "build-and-audit-runtime" / "report-package-size.sh"
+
+    try:
+        subprocess.run(
+            ["bash", str(reporter), "bun13", "x86_64"],
+            check=True,
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "GITHUB_STEP_SUMMARY": str(summary)},
+        )
+    finally:
+        stats.unlink()
+
+    row = summary.read_text(encoding="utf-8")
+    assert "| Runtime | Arch | Zipped (MB) |" in row
+    assert "| Container Image (MB) |" in row
+    assert "| `bun13` | `x86_64` | 34.3 | 92754962 / 88.5 | 35.4% | 161.5 | yes | n/a |" in row
+
+
+def test_the_size_row_carries_the_container_image(tmp_path: Path) -> None:
+    """The layer budget and the image size are the two halves of the artifact
+    decision, so they belong in one row."""
+    env = runtime_manifest.runtime_env("bun13", arch="x86_64")
+    artifact_dir = Path(env["ARTIFACT_DIR"])
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    stats = artifact_dir / "build-stats.json"
+    stats.write_text(
+        json.dumps(
+            {
+                "runtime_id": "bun13",
+                "arch": "x86_64",
+                "zipped_bytes": 35979139,
+                "unzipped_bytes": 92754962,
+                "max_unzipped_bytes": 262144000,
+                "warn_unzipped_bytes": 209715200,
+                "layer_publishable": True,
+                "container_image_bytes": 116426951,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    summary = tmp_path / "summary.md"
+    reporter = _REPO_ROOT / ".github" / "actions" / "build-and-audit-runtime" / "report-package-size.sh"
+
+    try:
+        subprocess.run(
+            ["bash", str(reporter), "bun13", "x86_64"],
+            check=True,
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "GITHUB_STEP_SUMMARY": str(summary)},
+        )
+    finally:
+        stats.unlink()
+
+    row = summary.read_text(encoding="utf-8")
+    assert "| `bun13` | `x86_64` | 34.3 | 92754962 / 88.5 | 35.4% | 161.5 | yes | 111.0 |" in row
+
+# --- Dual-artifact contract: distroless OCI images ------------------------------
+#
+# Every runtime ships an OCI image built from the same payload as the zip layer.
+# The base is distroless: no /bin/sh, no /usr/bin/env, no package manager. That
+# makes the entrypoint part of the contract — a shell string or a shebang script
+# cannot run — and it moves the size ceiling from 250 MB to 10 GB, which is the
+# only way the Go and Rust toolchains publish as first-class artifacts.
+
+
+def test_every_runtime_has_a_container_target() -> None:
+    for runtime_id in runtime_manifest.list_active_runtime_ids():
+        for arch in runtime_manifest.SUPPORTED_ARCHS:
+            container = runtime_manifest.load_runtime(runtime_id, arch=arch)["container"]
+
+            assert container["enabled"] is True, runtime_id
+            assert container["profile"] in runtime_manifest.CONTAINER_PROFILES, runtime_id
+            assert container["workdir"] == "/var/task", runtime_id
+            # Exec form, never a shell string.
+            assert isinstance(container["entrypoint"], list) and container["entrypoint"]
+
+
+def test_a_distroless_image_is_a_runtime_base() -> None:
+    """The interpreter runtimes ship as runtime bases: no shell, no package manager."""
+    for runtime_id in runtime_manifest.list_active_runtime_ids():
+        for arch in runtime_manifest.SUPPORTED_ARCHS:
+            container = runtime_manifest.load_runtime(runtime_id, arch=arch)["container"]
+            if container["profile"] != "distroless":
+                continue
+
+            assert container["base_image"].startswith("gcr.io/distroless/"), runtime_id
+            # The entrypoint has to be a binary inside the payload: there is no
+            # shell to interpret a script and no /usr/bin/env to find one.
+            assert container["entrypoint"][0].startswith("/opt/"), runtime_id
+            assert container["env"]["HOME"] == "/tmp", (
+                f"{runtime_id}: a distroless user has no writable home"
+            )
+            assert container["packages"] == [], runtime_id
+
+
+def test_a_toolchain_image_is_a_build_environment() -> None:
+    """A toolchain image is only useful as a `RUN go build` stage, and a RUN step
+    needs a shell — which is exactly what a distroless base does not have."""
+    for runtime_id in runtime_manifest.list_active_runtime_ids():
+        for arch in runtime_manifest.SUPPORTED_ARCHS:
+            container = runtime_manifest.load_runtime(runtime_id, arch=arch)["container"]
+            if container["profile"] != "build":
+                continue
+
+            assert not container["base_image"].startswith("gcr.io/distroless/"), runtime_id
+            assert container["entrypoint"] == ["/bin/sh"], runtime_id
+            # Root: a build stage installs packages and writes to the workdir.
+            assert container["user"] == "0:0", runtime_id
+            # The toolchain has to be on PATH or `RUN go build` cannot find it.
+            assert "/opt/" in container["env"]["PATH"], runtime_id
+            # No handler to invoke, so the toolchain command is the only proof the
+            # image works.
+            assert container["smoke_test"], runtime_id
+
+
+def test_the_toolchain_families_are_the_build_profiles() -> None:
+    """Only the two toolchain families are build environments; everything else is
+    a runtime base, so a new runtime cannot silently inherit a shell."""
+    build = {
+        runtime_id
+        for runtime_id in runtime_manifest.list_active_runtime_ids()
+        if runtime_manifest.load_runtime(runtime_id)["container"]["profile"] == "build"
+    }
+
+    assert build == {"go126", "go127", "rust194", "rust198", "rust199"}
+
+
+def test_container_coordinates_travel_to_the_builder() -> None:
+    env = runtime_manifest.runtime_env("graalpy312", arch="arm64")
+
+    assert env["CONTAINER_PLATFORM"] == "linux/arm64"
+    assert env["CONTAINER_ARCH"] == "arm64"
+    assert env["CONTAINER_WORKDIR"] == "/var/task"
+    assert json.loads(env["CONTAINER_ENTRYPOINT"]) == [
+        "/opt/graalpy/bin/graalpy",
+        "/opt/bootstrap",
+    ]
+    assert env["CONTAINER_IMAGE"].endswith("/graalpy312")
+    assert env["CONTAINER_TAG"] == "25.2.4"
+    assert env["VERSION_LINE"] == "3.12"
+
+
+def test_the_generated_dockerfile_is_shell_free_in_its_final_stage() -> None:
+    dockerfile = container_image.render_dockerfile(
+        base_image="gcr.io/distroless/cc-debian12:nonroot",
+        platform="linux/amd64",
+        layer_root="/opt",
+        workdir="/var/task",
+        user="65532:65532",
+        entrypoint=["/opt/bootstrap"],
+        env={"HOME": "/tmp", "TMPDIR": "/tmp"},
+        packages=["zlib1g"],
+        sonames=["libz.so.1"],
+    )
+    final_stage = dockerfile.split("FROM ${BASE_IMAGE}", 1)[1]
+
+    assert "RUN " not in final_stage, (
+        "the distroless stage has no shell; any RUN there fails with "
+        "'exec /bin/sh: no such file or directory'"
+    )
+    assert "COPY layer/ /opt/" in final_stage
+    assert "COPY --from=libs /out/ /usr/lib/x86_64-linux-gnu/" in final_stage
+    assert "WORKDIR /var/task" in final_stage
+    assert "USER 65532:65532" in final_stage
+    assert 'ENTRYPOINT ["/opt/bootstrap"]' in final_stage
+    # The extra libraries come from the same Debian release as the base, not from
+    # the build host's newer glibc.
+    assert "FROM debian:12-slim AS libs" in dockerfile
+    assert "zlib1g" in dockerfile
+
+
+def test_a_build_image_installs_its_packages_and_links_its_payload() -> None:
+    """A toolchain image is a build stage, so it must have a shell, a package
+    manager, and the symlinks that make the payload runnable."""
+    dockerfile = container_image.render_dockerfile(
+        base_image="alpine:3.22",
+        platform="linux/amd64",
+        layer_root="/opt",
+        workdir="/var/task",
+        user="0:0",
+        entrypoint=["/bin/sh"],
+        env={"PATH": "/opt/rust/cargo/bin:/usr/bin:/bin"},
+        packages=["libgcc", "gcc", "musl-dev"],
+        sonames=[],
+        profile="build",
+        links={
+            "/usr/lib/libc.so": "/lib/ld-musl-x86_64.so.1",
+            "/opt/rust/rustc/lib/rustlib": "/opt/rust/rust-std-x86_64-unknown-linux-musl/lib/rustlib",
+        },
+    )
+
+    # One stage: there is no distroless final stage to keep shell-free.
+    assert dockerfile.count("FROM ") == 1
+    assert "FROM debian:12-slim AS libs" not in dockerfile
+    assert "RUN apk add --no-cache libgcc gcc musl-dev" in dockerfile
+    # The links come after the COPY: one of them points into the payload.
+    assert dockerfile.index("COPY layer/ /opt/") < dockerfile.index("ln -s")
+    assert "ln -s /lib/ld-musl-x86_64.so.1 /usr/lib/libc.so" in dockerfile
+    assert "rust-std-x86_64-unknown-linux-musl/lib/rustlib" in dockerfile
+    # `ln -sfn` into an existing directory nests the link instead of replacing
+    # the path, which silently leaves the real path untouched.
+    assert "rm -rf /usr/lib/libc.so && ln -s" in dockerfile
+    assert 'ENTRYPOINT ["/bin/sh"]' in dockerfile
+
+
+def test_a_debian_build_image_uses_apt() -> None:
+    dockerfile = container_image.render_dockerfile(
+        base_image="debian:12-slim",
+        platform="linux/amd64",
+        layer_root="/opt",
+        workdir="/var/task",
+        user="0:0",
+        entrypoint=["/bin/sh"],
+        env={"PATH": "/opt/go/bin:/usr/bin:/bin"},
+        packages=["ca-certificates"],
+        sonames=[],
+        profile="build",
+    )
+
+    assert "apt-get install -y --no-install-recommends ca-certificates" in dockerfile
+    assert "apk add" not in dockerfile
+
+
+def test_an_unknown_base_image_is_refused() -> None:
+    """Guessing a package manager fails minutes later inside the build."""
+    with pytest.raises(container_image.ContainerError, match="no package manager"):
+        container_image.package_manager_for("ubuntu:24.04")
+
+
+def test_only_libraries_the_base_lacks_are_staged() -> None:
+    # glibc, libm, libpthread, libstdc++ and the SSL runtime are in the base.
+    assert container_image.required_packages(["libc.so.6", "libm.so.6", "libstdc++.so.6"]) == []
+    assert container_image.required_packages(["libz.so.1", "libbz2.so.1.0"]) == [
+        "libbz2-1.0",
+        "zlib1g",
+    ]
+
+    with pytest.raises(container_image.ContainerError, match="libunknown.so.9"):
+        container_image.required_packages(["libunknown.so.9"])
+
+
+def test_the_unpacked_size_is_summed_from_the_rootfs_listing() -> None:
+    """The recorded size must not depend on the daemon's image store.
+
+    `docker image inspect .Size` is the compressed size on a containerd store, so
+    the same image reads about three times smaller there than on the classic
+    overlay2 store. The rootfs export is measured instead, and only regular files
+    carry bytes: a directory and a symlink (whose listing ends with its target,
+    not with its own path) contribute nothing.
+    """
+    listing = "\n".join(
+        [
+            "drwxrwxrwt 0/0 0 2026-01-01 00:00 tmp/",
+            "-rw-r--r-- 0/0 1024 2026-01-01 00:00 opt/go/bin/go",
+            "lrwxrwxrwx 0/0 0 2026-01-01 00:00 usr/lib/libz.so.1 -> libz.so.1.2.13",
+            "-rw-r--r-- 0/0 512 2026-01-01 00:00 usr/lib/libz.so.1.2.13",
+        ]
+    )
+
+    summary = container_image.parse_rootfs_listing(listing)
+
+    assert summary["unpacked_bytes"] == 1536
+    assert summary["entries"]["tmp"] == "drwxrwxrwt"
+    assert summary["entries"]["opt/go/bin/go"] == "-rw-r--r--"
+    assert summary["entries"]["usr/lib/libz.so.1"] == "lrwxrwxrwx"
+    assert summary["entries"]["usr/lib/libz.so.1.2.13"] == "-rw-r--r--"
+
+
+def test_a_shebang_script_can_never_be_a_container_entrypoint(tmp_path: Path) -> None:
+    payload = tmp_path / "layer"
+    payload.mkdir()
+    script = payload / "bootstrap"
+    script.write_text("#!/bin/sh\nexec /opt/go/bin/handler\n", encoding="utf-8")
+
+    with pytest.raises(container_image.ContainerError, match="not an ELF binary"):
+        container_image.assert_native_entrypoint(payload, ["/opt/bootstrap"])
+
+    script.write_bytes(b"\x7fELF" + b"\x00" * 12)
+    assert container_image.assert_native_entrypoint(payload, ["/opt/bootstrap"]) == script
+
+    with pytest.raises(container_image.ContainerError, match="does not exist"):
+        container_image.assert_native_entrypoint(payload, ["/opt/missing"])
+
+
+def test_go_and_rust_get_a_compiled_launcher_not_a_script() -> None:
+    script = (_REPO_ROOT / "tools" / "bin" / "build-runtime").read_text(encoding="utf-8")
+    launcher = (_REPO_ROOT / "tools" / "launcher" / "bootstrap.c").read_text(encoding="utf-8")
+
+    assert "install_native_bootstrap" in script
+    assert "go-toolchain | rust-musl" in script, "the launcher belongs to both shell families"
+    assert "execv(" in launcher
+    # The compiled launcher must not start with a shebang: that is exactly the
+    # thing this replaces.
+    assert not launcher.lstrip().startswith("#!")
+    assert "RUNTIME_DIR_NAME" in launcher, "the launcher must resolve each runtime's own bin/"
+
+
+def test_the_javascript_helpers_initialize_the_environment_themselves() -> None:
+    """The shell bootstrap is gone in the image, so HOME/DENO_DIR must be set by
+    the helper — otherwise Bun or Deno guesses and writes to a read-only home."""
+    bun = (
+        _REPO_ROOT / "runtimes" / "bun13" / "helpers" / "lambda_runtime_bun" / "runtime.ts"
+    ).read_text(encoding="utf-8")
+    bun14 = (
+        _REPO_ROOT / "runtimes" / "bun14" / "helpers" / "lambda_runtime_bun" / "runtime.ts"
+    ).read_text(encoding="utf-8")
+    deno = (
+        _REPO_ROOT / "runtimes" / "deno29" / "helpers" / "lambda_runtime_deno" / "runtime.ts"
+    ).read_text(encoding="utf-8")
+
+    for text in (bun, bun14):
+        assert 'process.env.HOME ??= "/tmp"' in text
+    assert 'process.env.DENO_DIR ??= "/tmp/.deno"' in deno
+    assert 'process.env.HOME ??= "/tmp"' in deno
+
+
+def test_ci_builds_scans_and_smoke_tests_the_container_image() -> None:
+    call = _call_site("ci.yml", "runtime-checks", _BUILD_ACTION)
+
+    assert call["container"] == "true"
+    build = _named_step("build-and-audit-runtime", "Build distroless container image")
+    audit = _named_step("build-and-audit-runtime", "Audit the container image")
+    smoke = _named_step("build-and-audit-runtime", "Smoke-test the container image")
+
+    assert build["if"] == "inputs.container == 'true'"
+    assert "build-container" in build["run"]
+    assert audit["if"] == "inputs.container == 'true' && inputs.audit == 'true'"
+    assert "audit-container" in audit["run"]
+    assert "local-invoke-container" in smoke["run"]
+    assert "aws-lambda-rie" in smoke["run"] or "local-invoke-container" in smoke["run"]
+
+
+def test_the_container_publish_matrix_covers_every_runtime() -> None:
+    """Containers are the delivery path for the runtimes a layer cannot carry, so
+    the publish matrix must not inherit the layer filter."""
+    jobs = _workflow("release-runtime.yml")["jobs"]
+    steps = jobs["prepare-matrix"]["steps"]
+    containers = next(step for step in steps if step.get("id") == "containers")
+
+    assert containers["with"]["layer-publishable-only"] == "false"
+
+    containers_matrix = {
+        entry["runtime"]
+        for entry in runtime_manifest.manifest_matrix(layer_publishable_only=False)["include"]
+    }
+    assert set(runtime_manifest.list_active_runtime_ids()) <= containers_matrix
+    for toolchain in ("go126", "go127", "rust194", "rust198", "rust199"):
+        assert toolchain in containers_matrix, f"{toolchain} must publish an image"
+
+
+def test_the_release_pushes_ghcr_images_and_merges_the_architectures() -> None:
+    jobs = _workflow("release-runtime.yml")["jobs"]
+
+    assert "publish-containers" in jobs and "merge-containers" in jobs
+    publish = jobs["publish-containers"]
+    steps = {step.get("name"): step for step in publish["steps"]}
+
+    assert publish["permissions"]["packages"] == "write"
+    assert steps["Log in to GHCR"]["with"]["registry"] == "ghcr.io"
+    for name in ("Log in to GHCR", "Push the per-architecture image"):
+        assert "github.event.inputs.dry_run != 'true'" in steps[name]["if"], name
+    assert steps["Smoke-test the container image"]["run"].endswith(
+        '"${{ matrix.arch }}"'
+    )
+
+    merge = jobs["merge-containers"]
+    merge_run = next(step for step in merge["steps"] if step.get("name") == "Create the multi-arch tags")["run"]
+    assert "docker buildx imagetools create" in merge_run
+    assert "-amd64" in merge_run and "-arm64" in merge_run
+    assert merge["permissions"]["packages"] == "write"
+
+
+def test_the_layer_publish_cell_does_not_build_the_container() -> None:
+    """The image job owns the image; building it twice would only cost time."""
+    call = _call_site("release-runtime.yml", "publish", _BUILD_ACTION)
+
+    assert call["container"] == "false"
+
+
+def test_a_version_bump_keeps_layer_publishability(
+    fake_root: Path, mocker: pytest.MockFixture
+) -> None:
+    """A bump rewrites the raw manifest, so a flag declared there has to survive
+    it; otherwise a rescue (graalpy312) silently walks back out of the matrix."""
+    _write_manifest(
+        fake_root,
+        "graalpy312",
+        "graalpy",
+        "25.2.4",
+        python_version="3.12",
+        layer_publishable=True,
+    )
+    mocker.patch.object(
+        bump_version,
+        "fetch_checksums",
+        return_value=[
+            ("aaa", "graalpy3.12-25.3.0-linux-amd64.tar.gz"),
+            ("bbb", "graalpy3.12-25.3.0-linux-aarch64.tar.gz"),
+        ],
+    )
+    # The release tag resolver reads the GitHub releases index to learn that
+    # `25.3.0` ships those assets; stub it so the test stays offline.
+    mocker.patch.object(
+        bump_version,
+        "_http_get",
+        return_value=json.dumps(
+            [
+                {
+                    "tag_name": "graal-25.3.0",
+                    "assets": [
+                        {"name": "graalpy3.12-25.3.0-linux-amd64.tar.gz"},
+                        {"name": "graalpy3.12-25.3.0-linux-aarch64.tar.gz"},
+                    ],
+                }
+            ]
+        ).encode("utf-8"),
+    )
+
+    bump_version.bump_runtime("graalpy312", "25.3.0")
+
+    raw = json.loads((fake_root / "graalpy312" / "runtime.json").read_text(encoding="utf-8"))
+    assert raw["distribution_version"] == "25.3.0"
+    assert raw["layer_publishable"] is True
+
+
+def test_a_new_line_inherits_the_family_exclusion(
+    fake_root: Path, mocker: pytest.MockFixture
+) -> None:
+    """The Go/Rust exclusion is a family default, so a generated line must land
+    outside the publish matrix without repeating the flag in its manifest."""
+    _write_manifest(
+        fake_root,
+        "go126",
+        "go-toolchain",
+        "1.26.10",
+        version_line="1.26",
+        local_testing={"handler": "handler"},
+    )
+    mocker.patch.object(
+        bump_version,
+        "fetch_checksums",
+        return_value=[
+            ("aaa", "go1.27.0.linux-amd64.tar.gz"),
+            ("bbb", "go1.27.0.linux-arm64.tar.gz"),
+        ],
+    )
+
+    new_id = bump_version.add_runtime_line("go-toolchain", "1.27.0")
+
+    raw = json.loads((fake_root / new_id / "runtime.json").read_text(encoding="utf-8"))
+    assert "layer_publishable" not in raw, "declare the exclusion once, on the family"
+    assert runtime_manifest.is_layer_publishable(new_id) is False
+
+
+def test_the_container_build_documents_a_consumer_dockerfile() -> None:
+    """The image is only useful if a consumer can copy it into their own
+    Dockerfile; the example is part of the contract, not decoration."""
+    readme = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    contributing = (_REPO_ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+
+    assert "FROM ghcr.io/tartaruscode/lambda-runtime-factory/" in readme
+    assert "FROM ghcr.io/tartaruscode/lambda-runtime-factory/" in contributing
+
+
+def test_an_oversized_publishable_package_fails_the_gate() -> None:
+    """The failure belongs in the build, not at PublishLayerVersion in a release."""
+    verdict = package_size.budget(
+        {
+            "runtime_id": "graalpy312",
+            "arch": "x86_64",
+            "zipped_bytes": 104501179,
+            "unzipped_bytes": 262144001,
+        },
+        publishable=True,
+    )
+
+    assert verdict["level"] == "error"
+    assert "262144001" in verdict["message"]
+    assert verdict["percent_of_quota"] > 100
+
+
+def test_an_oversized_unpublishable_package_is_only_recorded() -> None:
+    """A toolchain image has no ceiling to breach; its size is information."""
+    verdict = package_size.budget(
+        {
+            "runtime_id": "rust199",
+            "arch": "arm64",
+            "zipped_bytes": 250000000,
+            "unzipped_bytes": 700000000,
+        },
+        publishable=False,
+    )
+
+    assert verdict["level"] == "ok"
+    assert verdict["layer_publishable"] is False
+
+
+def test_a_narrow_margin_warns_without_failing() -> None:
+    verdict = package_size.budget(
+        {
+            "runtime_id": "graalpy312",
+            "arch": "x86_64",
+            "zipped_bytes": 104501179,
+            "unzipped_bytes": 256802903,
+        },
+        publishable=True,
+    )
+
+    assert verdict["level"] == "warning"
+    assert verdict["headroom_mb"] < 10

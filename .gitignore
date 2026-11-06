@@ -9,5 +9,7 @@ event*.json
 __pycache__/
 *.py[cod]
 
-# Local agent context: kept in the working tree, never committed.
-CLAUDE.md
+# Local scratch: checkout-local files (agent context, notes, throwaway state),
+# never committed. Kept in one directory so nothing local has to be named in
+# this file individually.
+.local/

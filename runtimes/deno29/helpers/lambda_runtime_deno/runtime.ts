@@ -1,3 +1,13 @@
+// The distroless image runs this file directly (no /bin/sh), so the environment
+// the shell bootstrap used to export is initialized here instead. Deno reads
+// DENO_DIR once at startup; the image also sets it as ENV, this is the fallback
+// for the zip layer and for a custom entrypoint.
+process.env.HOME ??= "/tmp";
+process.env.TMPDIR ??= "/tmp";
+process.env.DENO_DIR ??= "/tmp/.deno";
+process.env.DENO_NO_UPDATE_CHECK ??= "1";
+process.env.LAMBDA_TASK_ROOT ??= "/var/task";
+
 const RUNTIME_API = process.env.AWS_LAMBDA_RUNTIME_API!;
 const HANDLER = process.env._HANDLER!;
 const BASE = `http://${RUNTIME_API}/2018-06-01/runtime`;

@@ -1,19 +1,45 @@
 # lambda-runtime-factory
 
-AWS Lambda **layer** packages for the `provided.al2023` runtime, built and published from one
-manifest-driven pipeline. Each runtime is an independent package under `runtimes/`.
+AWS Lambda **runtime packages** for the `provided.al2023` runtime — a Lambda layer and a
+distroless OCI image per runtime, built and published from one manifest-driven pipeline. Each
+runtime is an independent package under `runtimes/`.
 
 ## What gets published
 
-Every runtime in the matrix is published as a Lambda layer, per architecture:
+Every runtime in the matrix is built and scanned. Each runtime then ships as **two artifacts
+from the same payload**:
 
-- **Layer name** is the runtime id (`pypy311`, `deno29`, `rust199`, …)
+**Lambda zip layer** — for the runtimes that fit Lambda's 250 MB unzipped deployment-package
+limit:
+
+- **Layer name** is the runtime id (`pypy311`, `deno29`, `graalpy312`, …)
 - **Compatible runtime**: `provided.al2023`
 - **Architectures**: `x86_64` and `arm64`
 - **Regions**: `us-east-1`
 - **Uploads** go to `s3://tartarus-runtimes-<region>/<runtime-id>/<arch>/<sha256>.zip` —
   content-addressed, so a layer version always points at the exact bytes it was built from
 - **Layers are public**: `lambda:GetLayerVersion` is granted to `*`
+- **Five runtimes are built but not published as layers** — `go126`, `go127`, `rust194`,
+  `rust198` and `rust199` ship a whole upstream toolchain and are flagged
+  `layer_publishable: false`. CI keeps building and scanning them; they publish as images.
+  See [DELIVERY.md](DELIVERY.md) for the constraint.
+
+**OCI image** — for **every** runtime, including the toolchains a layer cannot carry:
+
+- **Image**: `ghcr.io/tartaruscode/lambda-runtime-factory/<runtime-id>`
+- **Architectures**: one multi-arch manifest for `linux/amd64` and `linux/arm64`
+- **Tags**: `<distribution-version>` (e.g. `1.26.10`), the version line (`1.26`), and
+  `latest` on a tagged release
+- **Two shapes**, because a runtime base and a build environment are different things:
+  - **Runtime base** (the interpreter runtimes) — `gcr.io/distroless/cc-debian12`: no shell,
+    no package manager, minimal OS CVE surface, and a **10 GB** uncompressed limit instead of
+    the 250 MB layer budget. The entrypoint is exec-form and shell-free: the runtime binary,
+    or the runtime's compiled bootstrap launcher. `aws-lambda-rie` is mounted only for the
+    smoke test, never shipped.
+  - **Build environment** (the Go and Rust toolchains) — `debian:12-slim` and `alpine:3.22`
+    respectively, with a shell and a package manager, because the documented use is a
+    Dockerfile build stage and a `RUN` step needs a shell. The toolchain is on `PATH`; the
+    image's smoke test runs it (`go version`, `rustc --version`).
 
 Resolve the current ARN for a layer:
 
@@ -33,6 +59,41 @@ aws lambda update-function-configuration --function-name my-function \
 ```
 
 The layers live in AWS account `485809183296`; `make latest` prints the full ARN.
+
+## Container images
+
+Use a runtime image directly as a Lambda container image. The image's entrypoint starts the
+runtime; `CMD` carries the handler, which Lambda exposes as `_HANDLER`:
+
+```dockerfile
+FROM ghcr.io/tartaruscode/lambda-runtime-factory/pypy311:3.11
+
+COPY app.py ${LAMBDA_TASK_ROOT}/
+CMD ["app.handler"]
+```
+
+```bash
+docker build -t my-function .
+docker push <registry>/my-function
+aws lambda create-function --function-name my-function \
+  --package-type Image --code ImageUri=<registry>/my-function \
+  --role <execution-role-arn>
+```
+
+The Go and Rust images are **toolchain images**: they carry `go`/`rustc`, not a handler, and
+they are build environments rather than runtime bases — `debian:12-slim` and `alpine:3.22`
+(musl), so a `RUN` step has a shell to run in. Use one as a build stage and deliver the
+compiled bootstrap on the OS-only base:
+
+```dockerfile
+FROM ghcr.io/tartaruscode/lambda-runtime-factory/go126:1.26 AS build
+WORKDIR /src
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/bootstrap .
+
+FROM public.ecr.aws/lambda/provided:al2023
+COPY --from=build /out/bootstrap ${LAMBDA_RUNTIME_DIR}/bootstrap
+```
 
 ## Runtimes
 

@@ -23,6 +23,15 @@ inputs:
       ever ask for this; the build and publish matrices exclude them.
     required: false
     default: "false"
+  layer-publishable-only:
+    description: >-
+      "true" drops runtimes that cannot be published as a layer — a deployment
+      package is capped at 250 MB unzipped, covering the function and all of its
+      layers, so a runtime shipping a whole upstream toolchain cannot be
+      delivered that way. Only the publish matrix should ask for this: CI still
+      builds and audits those runtimes.
+    required: false
+    default: "false"
 
 outputs:
   matrix:
@@ -48,6 +57,9 @@ runs:
         args=()
         if [[ "${{ inputs.include-deprecated }}" == "true" ]]; then
           args+=(--include-deprecated)
+        fi
+        if [[ "${{ inputs.layer-publishable-only }}" == "true" ]]; then
+          args+=(--layer-publishable-only)
         fi
         matrix=$(python3 tools/runtime_lib/runtime_manifest.py matrix \
           --runtime "${INPUT_RUNTIME:-all}" \

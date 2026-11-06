@@ -19,6 +19,8 @@ permissions:
 
 env:
   GRYPE_VERSION: v0.98.0
+  # The container smoke test runs the same pinned emulator everywhere.
+  AWS_LAMBDA_RIE_VERSION: v1.38
 
 jobs:
   prepare-matrix:
@@ -126,6 +128,10 @@ jobs:
           # report CVE-database drift that no commit caused. That drift is caught by
           # the weekly audit-runtimes workflow instead of blocking unrelated PRs.
           audit: ${{ steps.build-env.outputs.audit }}
+          # CI exercises both artifacts: the zip layer and the distroless image,
+          # including a scan of the image and a Runtime Interface Emulator smoke
+          # test. A container regression cannot reach a release unseen.
+          container: "true"
       - name: Install SAM CLI
         if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke
         uses: actions/setup-python@v7

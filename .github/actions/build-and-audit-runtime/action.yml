@@ -29,6 +29,13 @@ inputs:
       or a literal "true" for a call site that must always scan.
     required: false
     default: "false"
+  container:
+    description: >-
+      "true" also builds the distroless OCI image from the same payload, scans it
+      and smoke-tests it through aws-lambda-rie. A release cell that publishes the
+      layer only passes "false"; the container publish job owns the image.
+    required: false
+    default: "true"
 
 runs:
   using: composite
@@ -49,9 +56,45 @@ runs:
       # schema rejects that key and GitHub then refuses to load the whole action
       # ("Unexpected value 'timeout-minutes'") before a single command runs.
       # test_composite_action_steps_only_use_supported_keys keeps it that way.
+      env:
+        # The summary row is written once, at the end of the action, so it can
+        # carry the container image size measured below.
+        LAMBDA_RUNTIME_SUMMARY_DEFERRED: "1"
       run: timeout 1200 make build RUNTIME="${{ inputs.runtime }}" ARCH="${{ inputs.arch }}"
 
     - name: Audit runtime package
       if: inputs.audit == 'true'
       shell: bash
       run: bash tools/bin/audit-runtime "${{ inputs.runtime }}" "${{ inputs.arch }}"
+
+    - name: Build distroless container image
+      if: inputs.container == 'true'
+      shell: bash
+      # Same payload as the zip layer, different base: distroless removes the
+      # shell the entrypoint used to depend on and gives the artifact the 10 GB
+      # container ceiling instead of the 250 MB layer budget.
+      env:
+        LAMBDA_RUNTIME_SUMMARY_DEFERRED: "1"
+      run: timeout 900 bash tools/bin/build-container "${{ inputs.runtime }}" "${{ inputs.arch }}"
+
+    - name: Audit the container image
+      if: inputs.container == 'true' && inputs.audit == 'true'
+      shell: bash
+      run: bash tools/bin/audit-container "${{ inputs.runtime }}" "${{ inputs.arch }}"
+
+    - name: Smoke-test the container image
+      # A runtime image has no handler of its own; aws-lambda-rie is mounted at
+      # run time, so production bytes stay clean. A toolchain image has no handler
+      # at all, so it runs its own toolchain command instead (container.smoke_test).
+      if: inputs.container == 'true'
+      shell: bash
+      run: timeout 600 bash tools/bin/local-invoke-container "${{ inputs.runtime }}" "${{ inputs.arch }}"
+
+    - name: Record the package size
+      # Always: the summary states this cell's share of the 250 MB deployment
+      # budget even when the package cache skipped the build.
+      if: always()
+      shell: bash
+      run: >-
+        bash .github/actions/build-and-audit-runtime/report-package-size.sh
+        "${{ inputs.runtime }}" "${{ inputs.arch }}"

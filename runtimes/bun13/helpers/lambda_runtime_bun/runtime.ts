@@ -1,3 +1,10 @@
+// The distroless image runs this file directly (no /bin/sh), so the environment
+// the shell bootstrap used to export is initialized here instead. The zip layer on
+// provided.al2023 still goes through bootstrap, which execs the same helper.
+process.env.HOME ??= "/tmp";
+process.env.TMPDIR ??= "/tmp";
+process.env.LAMBDA_TASK_ROOT ??= "/var/task";
+
 const RUNTIME_API = process.env.AWS_LAMBDA_RUNTIME_API!;
 const HANDLER = process.env._HANDLER!;
 const BASE = `http://${RUNTIME_API}/2018-06-01/runtime`;

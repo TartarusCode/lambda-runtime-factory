@@ -8,7 +8,10 @@ publishes — layer names, regions, architectures and how to consume them — se
 
 - Linux or WSL is required for build and release commands
 - The shared tooling assumes native Linux tools such as `bash`, `tar`, `zip`, `unzip`, `curl`,
-  `sha256sum`, and `make`
+  `sha256sum`, `cc`, and `make`. `cc` links the Go/Rust bootstrap launcher; without it the
+  shell bootstrap is kept (and the distroless image build refuses it)
+- Docker with BuildKit (`docker buildx`) is required for the container artifact
+- `readelf` (binutils) is used to resolve the payload's shared libraries
 - Transient build work is staged under `${BUILD_ROOT:-$RUNNER_TEMP}` or `/tmp` to avoid slow
   cross-OS archive operations
   - release and CI artifacts are built from temp storage by default
@@ -52,6 +55,142 @@ The manifest list is the single source of truth for the CI and release matrices 
 Deployment regions and the S3 bucket base name are repo-level settings in `REPO_DEFAULTS`, not
 per-runtime fields. A runtime manifest that redeclares them silently wins over the global value,
 because the manifest is merged last.
+
+One field is neither derived nor a version: `layer_publishable` marks a runtime whose package
+cannot be delivered as a Lambda layer, because a deployment package is capped at 250 MB
+unzipped — the function plus every layer attached to it. It is still built and scanned
+everywhere; only the publish matrix skips it. Because it is resolved from the *merged*
+manifest, declaring it on a family in `RUNTIME_FAMILY_DEFAULTS` covers every line of that
+family, including lines a version bump has not generated yet. See [DELIVERY.md](DELIVERY.md).
+
+The same view carries the byte budget: `max_unzipped_bytes` (262144000) and
+`warn_unzipped_bytes` (209715200) live in `REPO_DEFAULTS` and are exported to the build as
+`MAX_UNZIPPED_BYTES` and `WARN_UNZIPPED_BYTES`, alongside `LAYER_PUBLISHABLE`. The build
+measures the package, writes `build-stats.json` next to the artifact and appends a row to the
+job summary; an oversized package that claims to be publishable fails the build instead of
+failing a release at `PublishLayerVersion`.
+
+## Container images
+
+Every runtime also has a `container` block, merged from `REPO_DEFAULTS` and the family defaults:
+
+```json
+"container": {
+  "enabled": true,
+  "profile": "distroless",
+  "base_image": "gcr.io/distroless/cc-debian12:nonroot",
+  "registry": "ghcr.io/tartaruscode/lambda-runtime-factory",
+  "workdir": "/var/task",
+  "layer_root": "/opt",
+  "entrypoint": ["/opt/bootstrap"],
+  "packages": [],
+  "links": {},
+  "smoke_test": [],
+  "env": {"HOME": "/tmp", "TMPDIR": "/tmp", "LAMBDA_TASK_ROOT": "/var/task"},
+  "user": "65532:65532"
+}
+```
+
+`profile` decides what the image *is*, and the two answers are not interchangeable:
+
+- **`distroless`** — a runtime base. No shell, no package manager; the entrypoint must be a
+  binary inside the payload, and the libraries the payload links against are staged from
+  Debian 12. This is the default and what every interpreter runtime uses.
+- **`build`** — a build environment, for a toolchain. A toolchain image is only useful as a
+  Dockerfile build stage, and a `RUN` step needs a shell, so the base is a shell-bearing image
+  (`debian:12-slim`, `alpine:3.22`). The manifest then declares `packages` (installed with the
+  base's own package manager), `links` (symlinks the payload needs to be runnable, e.g. musl's
+  `libc.so` and rustc's sysroot) and `smoke_test` (the toolchain command that proves the image
+  works — a build image has no handler to invoke). `validate-runtimes` refuses a `build`
+  profile without a `smoke_test`, and refuses `packages` on a `distroless` one.
+
+The image is built from the **same** `${LAYER_ROOT}` as the zip layer, so the two artifacts
+cannot drift:
+
+```bash
+make build RUNTIME=pypy311 ARCH=x86_64        # payload
+make container RUNTIME=pypy311 ARCH=x86_64    # image from that payload
+make container-invoke RUNTIME=pypy311 ARCH=x86_64   # RIE smoke test (or the toolchain's own)
+bash tools/bin/audit-container pypy311 x86_64 # Grype scan of the image
+```
+
+### The entrypoint must not need a shell
+
+`gcr.io/distroless/cc-debian12` has no `/bin/sh`, no `/bin/bash` and no `/usr/bin/env`. That
+makes the entrypoint part of the contract:
+
+- **pypy / graalpy** — `["/opt/pypy/bin/pypy", "/opt/bootstrap"]` (the interpreter, then the
+  script). The shebang is still there for the zip layer, but the image does not rely on it.
+- **bun / deno** — the runtime binary itself, with the helper and its flags in argv:
+  `["/opt/deno/deno", "run", "--allow-net", …, "/opt/deno/lib/lambda_runtime_deno/runtime.ts"]`.
+  The environment the shell bootstrap used to export (`HOME=/tmp`, `DENO_DIR=/tmp/.deno`) is
+  initialized at the top of `helpers/lambda_runtime_*/runtime.ts`, so the zip layer and the
+  image share one code path.
+- **go / rust** — `build-runtime` compiles `tools/launcher/bootstrap.c` into `/opt/bootstrap`
+  with `cc -O2 -static`, replacing the `#!/bin/sh` exec wrapper. The same ELF runs on
+  `provided.al2023` and on distroless, which is what the *layer* needs. Their images are
+  `build` profiles and do not use it: a toolchain image is a build stage, so its entrypoint is
+  `/bin/sh` and the toolchain is on `PATH`. If the build host is a different architecture, the
+  script is kept and the build warns.
+
+`container_image.assert_native_entrypoint` enforces this before the Docker build: a shebang
+script or a missing path fails with a message naming the file.
+
+### Shared libraries and the filesystem contract
+
+The base ships glibc, libm, libpthread, librt, libgcc, libstdc++, OpenSSL and ca-certificates —
+not zlib, bzip2 or ncurses. `container_image.py` scans the payload's `DT_NEEDED` entries,
+maps anything the base lacks to a Debian 12 package (`PACKAGE_FOR_SONAME`), and generates a
+`debian:12-slim` builder stage that copies those `.so` files into the final image's
+`/usr/lib/<triplet>`. An unmapped soname fails the build with its name instead of producing an
+image that cannot `dlopen`. The final stage only uses `COPY`, `ENV`, `WORKDIR`, `USER` and
+`ENTRYPOINT` — never `RUN`, which would need a shell.
+
+`/tmp` is `1777` in the base and `/var/task` is the `WORKDIR`; `build-container` verifies both
+(plus `/opt`) from the exported rootfs before reporting success, because Lambda's contract
+requires them. That same export measures the image's **unpacked** size, which is what the job
+summary and `build-stats.json` record: `docker image inspect .Size` is the compressed size on a
+containerd image store and the uncompressed one on the classic overlay2 store, so the same image
+read 82,283,585 B on a CI runner and 251,143,202 B on a developer box. The rootfs sum is the
+number Lambda counts against its 10 GB container limit, and it does not depend on the daemon.
+
+### Building arm64 on an x86 host
+
+`--platform linux/arm64` needs qemu registered with the kernel; without it the container dies
+with `exec format error`. Docker Desktop registers it, a plain `dockerd` does not:
+
+```bash
+docker run --privileged --rm tonistiigi/binfmt --install arm64
+docker run --rm --platform linux/arm64 alpine:3.22 uname -m    # aarch64
+```
+
+Emulation is slow, and for a GraalVM-based payload also a little flaky: GraalPy's first
+invocation takes ~19 s instead of ~2 s, and the first request after a container start can be
+reset once before it answers — retry before suspecting the image. CI is the authoritative
+check: `ARCH_RUNNERS` assigns `ubuntu-26.04-arm` to every arm64 cell, so the build, the Grype
+scan and the RIE smoke test all run natively there. Use qemu only to catch an
+architecture-specific mistake early. One thing it cannot do is `strip`: it refuses a foreign
+payload, so a cross-arch build packages unstripped binaries and comes out slightly larger than
+the same build on a native runner. The multi-arch merge step can be exercised without GHCR by
+pushing both per-arch tags to a throwaway registry (`docker run -d -p 5000:5000 registry:2`)
+and running the `imagetools create` line from `release-runtime.yml` against it.
+
+### Publishing and consuming
+
+`push-container` tags the local image `<version>-<arch-slug>` and pushes it. The release
+`merge-containers` job combines the two per-arch manifests with `docker buildx imagetools
+create` into `<version>` and the version line, plus `latest` on a tagged release:
+
+```dockerfile
+# A runtime image is a Lambda container image: entrypoint = runtime, CMD = handler.
+FROM ghcr.io/tartaruscode/lambda-runtime-factory/graalpy312:3.12
+COPY app.py ${LAMBDA_TASK_ROOT}/
+CMD ["app.handler"]
+```
+
+The Go and Rust images are build environments (`FROM …/go126:1.26 AS build`); deliver the
+compiled bootstrap on `public.ecr.aws/lambda/provided:al2023`, as shown in the README.
+
 
 ## Local SAM test flow
 
@@ -137,6 +276,10 @@ Publishing is idempotent for unchanged bytes: the layer's own `Content.CodeSha25
 whether a version is created, so re-running a release whose package is already published reuses
 that version instead of minting another. Set `PUBLISH_FORCE_NEW_VERSION=1` to publish
 unconditionally.
+
+That only works because the package is deterministic. `build-runtime` pins every entry's mtime
+and zips with `-X`, because a zip that embeds "now" produces a different hash on every build —
+and then the reuse above can never match.
 
 ## Adding a new runtime
 
