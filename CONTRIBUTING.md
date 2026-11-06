@@ -78,7 +78,8 @@ Every runtime also has a `container` block, merged from `REPO_DEFAULTS` and the 
 "container": {
   "enabled": true,
   "profile": "distroless",
-  "base_image": "gcr.io/distroless/cc-debian12:nonroot",
+  "base_image": "gcr.io/distroless/cc-debian13:nonroot",
+  "libs_base_image": "debian:13-slim",
   "registry": "ghcr.io/tartaruscode/lambda-runtime-factory",
   "workdir": "/var/task",
   "layer_root": "/opt",
@@ -121,7 +122,7 @@ Every distroless runtime publishes two images from one payload:
 - **`<version>`** — the production image: no shell, `USER 65532:65532`, and the runtime's
   entrypoint. This is the one a function uses.
 - **`<version>-debug`** — the *same payload and entrypoint* on
-  `gcr.io/distroless/cc-debian12:debug-nonroot`, which also carries a busybox shell
+  `gcr.io/distroless/cc-debian13:debug-nonroot`, which also carries a busybox shell
   (`/busybox/sh`, already on `PATH`). Same uid, same invocation: what you inspect is what
   failed. It is not meant to be deployed.
 
@@ -144,7 +145,7 @@ swap that quietly dropped the entrypoint or the user fails there rather than in 
 
 ### The entrypoint must not need a shell
 
-`gcr.io/distroless/cc-debian12` has no `/bin/sh`, no `/bin/bash` and no `/usr/bin/env`. That
+`gcr.io/distroless/cc-debian13` has no `/bin/sh`, no `/bin/bash` and no `/usr/bin/env`. That
 makes the entrypoint part of the contract:
 
 - **pypy / graalpy** — `["/opt/pypy/bin/pypy", "/opt/bootstrap"]` (the interpreter, then the
@@ -168,8 +169,9 @@ script or a missing path fails with a message naming the file.
 
 The base ships glibc, libm, libpthread, librt, libgcc, libstdc++, OpenSSL and ca-certificates —
 not zlib, bzip2 or ncurses. `container_image.py` scans the payload's `DT_NEEDED` entries,
-maps anything the base lacks to a Debian 12 package (`PACKAGE_FOR_SONAME`), and generates a
-`debian:12-slim` builder stage that copies those `.so` files into the final image's
+maps anything the base lacks to a Debian package (`PACKAGE_FOR_SONAME`), and generates a
+`debian:<N>-slim` builder stage — the same release the base is built from, `debian:13-slim` for
+trixie — that copies those `.so` files into the final image's
 `/usr/lib/<triplet>`. An unmapped soname fails the build with its name instead of producing an
 image that cannot `dlopen`. The final stage only uses `COPY`, `ENV`, `WORKDIR`, `USER` and
 `ENTRYPOINT` — never `RUN`, which would need a shell.

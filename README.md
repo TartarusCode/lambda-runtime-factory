@@ -25,9 +25,11 @@ Every runtime is built and scanned, then ships as **two artifacts from the same 
 - **`-soci` tags** — the same image with a SOCI index bundled in, for functions on **Lambda
   Managed Instances**, which then lazy-load it instead of downloading the whole thing. There is no
   moving `-soci` tag: that image is immutable by design.
-- **Bases** — interpreter runtimes use `gcr.io/distroless/cc-debian12` (no shell, minimal OS CVE
-  surface, 10 GB limit instead of 250 MB); the Go and Rust toolchains use `debian:12-slim` and
-  `alpine:3.22`, because a `RUN go build` in a builder stage needs a shell.
+- **Bases** — interpreter runtimes use `gcr.io/distroless/cc-debian13` (Debian 13/trixie:
+  upstream distroless only rebuilds the current release, so an older tag stops getting security
+  updates; no shell, minimal OS CVE surface, 10 GB limit instead of 250 MB); the Go and Rust
+  toolchains use `debian:12-slim` and `alpine:3.22`, because a `RUN go build` in a builder stage
+  needs a shell.
 
 Resolve the current ARN for a layer:
 

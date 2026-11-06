@@ -22,7 +22,7 @@ The recipes are templates: copy one into your project and put your own `app.py` 
 `:<version>` is the production image: distroless, no shell, uid 65532.
 
 `:<version>-debug` is the *same payload and entrypoint* on
-`gcr.io/distroless/cc-debian12:debug-nonroot`, which also carries a busybox
+`gcr.io/distroless/cc-debian13:debug-nonroot`, which also carries a busybox
 shell. Use it when a handler fails with an import or `dlopen` error and you need
 to look inside:
 

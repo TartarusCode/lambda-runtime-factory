@@ -1431,7 +1431,7 @@ def test_container_coordinates_travel_to_the_builder() -> None:
 
 def test_the_generated_dockerfile_is_shell_free_in_its_final_stage() -> None:
     dockerfile = container_image.render_dockerfile(
-        base_image="gcr.io/distroless/cc-debian12:nonroot",
+        base_image="gcr.io/distroless/cc-debian13:nonroot",
         platform="linux/amd64",
         layer_root="/opt",
         workdir="/var/task",
@@ -1440,6 +1440,7 @@ def test_the_generated_dockerfile_is_shell_free_in_its_final_stage() -> None:
         env={"HOME": "/tmp", "TMPDIR": "/tmp"},
         packages=["zlib1g"],
         sonames=["libz.so.1"],
+        libs_base_image="debian:13-slim",
     )
     final_stage = dockerfile.split("FROM ${BASE_IMAGE}", 1)[1]
 
@@ -1454,8 +1455,27 @@ def test_the_generated_dockerfile_is_shell_free_in_its_final_stage() -> None:
     assert 'ENTRYPOINT ["/opt/bootstrap"]' in final_stage
     # The extra libraries come from the same Debian release as the base, not from
     # the build host's newer glibc.
-    assert "FROM debian:12-slim AS libs" in dockerfile
+    assert "FROM debian:13-slim AS libs" in dockerfile
     assert "zlib1g" in dockerfile
+
+
+def test_the_libs_stage_matches_the_distroless_release() -> None:
+    """A library staged from the wrong Debian release grafts one release's
+    dependencies onto another's C library — and upstream distroless only rebuilds
+    the current release, so the base itself moves."""
+    base = runtime_manifest.REPO_DEFAULTS["container"]["base_image"]
+    libs = runtime_manifest.REPO_DEFAULTS["container"]["libs_base_image"]
+
+    assert runtime_manifest.debian_slim_for(base) == libs, (base, libs)
+    assert "debian13" in base, "distroless only supports the current Debian release"
+
+    for runtime_id in runtime_manifest.list_active_runtime_ids():
+        env = runtime_manifest.runtime_env(runtime_id, "x86_64")
+        if env["CONTAINER_PROFILE"] != "distroless":
+            continue
+        assert env["CONTAINER_LIBS_BASE_IMAGE"] == libs, runtime_id
+        assert "debian13" in env["CONTAINER_BASE_IMAGE"], runtime_id
+        assert "debian13" in env["CONTAINER_DEBUG_BASE_IMAGE"], runtime_id
 
 
 def test_a_build_image_installs_its_packages_and_links_its_payload() -> None:
@@ -1480,7 +1500,7 @@ def test_a_build_image_installs_its_packages_and_links_its_payload() -> None:
 
     # One stage: there is no distroless final stage to keep shell-free.
     assert dockerfile.count("FROM ") == 1
-    assert "FROM debian:12-slim AS libs" not in dockerfile
+    assert "AS libs" not in dockerfile
     assert "RUN apk add --no-cache libgcc gcc musl-dev" in dockerfile
     # The links come after the COPY: one of them points into the payload.
     assert dockerfile.index("COPY layer/ /opt/") < dockerfile.index("ln -s")
@@ -1808,8 +1828,8 @@ def test_the_debug_variant_differs_only_by_its_base_and_tags() -> None:
     standard = runtime_manifest.runtime_env("pypy311", "x86_64")
     debug = runtime_manifest.runtime_env("pypy311", "x86_64", variant="debug")
 
-    assert standard["CONTAINER_BASE_IMAGE"] == "gcr.io/distroless/cc-debian12:nonroot"
-    assert debug["CONTAINER_BASE_IMAGE"] == "gcr.io/distroless/cc-debian12:debug-nonroot"
+    assert standard["CONTAINER_BASE_IMAGE"] == "gcr.io/distroless/cc-debian13:nonroot"
+    assert debug["CONTAINER_BASE_IMAGE"] == "gcr.io/distroless/cc-debian13:debug-nonroot"
     assert debug["CONTAINER_TAG_SUFFIX"] == "-debug"
     assert debug["CONTAINER_LOCAL_IMAGE"].endswith("-x86_64-debug")
     assert debug["CONTAINER_CONTEXT_DIR"] != standard["CONTAINER_CONTEXT_DIR"]
