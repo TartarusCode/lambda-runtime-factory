@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -497,20 +498,49 @@ def prepare(runtime_id: str, arch: str, *, force: bool = False) -> Dict[str, Any
     return staged
 
 
-def verify_image_layout(image: str) -> Dict[str, Any]:
-    """Check the Lambda filesystem contract inside a built image.
+# `tar -tv` line: mode, owner, size, date, time, name — then `-> target` for a
+# symlink. The name is captured non-greedily so a symlink keeps its own path
+# rather than the target's, and a name containing spaces survives.
+_ROOTFS_LINE = re.compile(
+    r"^(?P<mode>[bcdlps-][rwxsStT-]{9})\s+\S+\s+(?P<size>\d+)\s+\S+\s+\S+\s+"
+    r"(?P<name>.+?)(?:\s+->\s+.+)?$"
+)
 
-    The image has no shell, so the check runs against the exported rootfs. It
-    asserts the two paths Lambda depends on — a world-writable ``/tmp`` and the
-    ``/var/task`` workdir — plus ``/opt`` for the mounted payload.
+
+def parse_rootfs_listing(listing: str) -> Dict[str, Any]:
+    """Summarize the ``tar -tv`` output of an exported rootfs.
+
+    ``entries`` maps a path to its mode string. ``unpacked_bytes`` sums the
+    regular files, which is the unpacked size of the image — the number Lambda
+    counts against its 10 GB container limit, and the one a consumer pays in disk
+    and pull-to-run time. ``docker image inspect .Size`` is *not* that number on
+    every daemon: on a containerd image store it reports the compressed size, so
+    the same image reads roughly three times smaller there than on the classic
+    overlay2 store. Two runners with different stores would put two different
+    numbers for one artifact into the summary; exporting the rootfs makes the
+    recorded size mean one thing wherever it is measured.
     """
+    entries: Dict[str, str] = {}
+    unpacked_bytes = 0
+    for line in listing.splitlines():
+        match = _ROOTFS_LINE.match(line)
+        if match is None:
+            continue
+        entries[match.group("name").rstrip("/")] = match.group("mode")
+        if match.group("mode").startswith("-"):
+            unpacked_bytes += int(match.group("size"))
+    return {"entries": entries, "unpacked_bytes": unpacked_bytes}
+
+
+def export_rootfs(image: str) -> Dict[str, Any]:
+    """Create a container from ``image`` and summarize its exported rootfs."""
+    # A distroless image has no CMD, so `create` needs an explicit argv; it only
+    # records it. A non-zero exit here is a real Docker failure.
     created = subprocess.run(
         ["docker", "create", "--entrypoint", "/nonexistent", image, "/nonexistent"],
         capture_output=True,
         text=True,
     )
-    # Some runtimes have no /nonexistent entrypoint, but `create` only records the
-    # argv; it does not execute it. A non-zero exit here is a real Docker failure.
     if created.returncode != 0:
         raise ContainerError(
             f"docker create failed for {image}: {created.stderr.strip()}"
@@ -531,11 +561,20 @@ def verify_image_layout(image: str) -> Dict[str, Any]:
     finally:
         subprocess.run(["docker", "rm", "-f", container_id], capture_output=True)
 
-    entries: Dict[str, str] = {}
-    for line in listing.stdout.decode("utf-8", "replace").splitlines():
-        parts = line.split()
-        if len(parts) >= 6:
-            entries[parts[-1].rstrip("/")] = parts[0]
+    if listing.returncode != 0:
+        raise ContainerError(f"could not list the exported rootfs of {image}")
+    return parse_rootfs_listing(listing.stdout.decode("utf-8", "replace"))
+
+
+def verify_image_layout(image: str) -> Dict[str, Any]:
+    """Check the Lambda filesystem contract inside a built image.
+
+    The image has no shell, so the check runs against the exported rootfs. It
+    asserts the two paths Lambda depends on — a world-writable ``/tmp`` and the
+    ``/var/task`` workdir — plus ``/opt`` for the mounted payload.
+    """
+    rootfs = export_rootfs(image)
+    entries: Dict[str, str] = rootfs["entries"]
 
     problems = []
     if entries.get("tmp") != "drwxrwxrwt":
@@ -546,19 +585,42 @@ def verify_image_layout(image: str) -> Dict[str, Any]:
 
     if problems:
         raise ContainerError(f"{image}: " + "; ".join(problems))
-    return {"image": image, "tmp_mode": entries["tmp"], "paths": sorted(entries)}
+    return {
+        "image": image,
+        "tmp_mode": entries["tmp"],
+        "unpacked_bytes": rootfs["unpacked_bytes"],
+        "paths": sorted(entries),
+    }
 
 
-def record_size(image: str, runtime_id: str, arch: str) -> Optional[int]:
-    """Write the built image size next to the package stats and return the bytes."""
-    result = subprocess.run(
-        ["docker", "image", "inspect", "--format", "{{.Size}}", image],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        return None
-    size = int(result.stdout.strip())
+def record_size(
+    image: str,
+    runtime_id: str,
+    arch: str,
+    *,
+    unpacked_bytes: Optional[int] = None,
+) -> Optional[int]:
+    """Write the built image size next to the package stats and return the bytes.
+
+    ``unpacked_bytes``, measured from the exported rootfs, is preferred: it means
+    the same thing on every daemon. The fallback reads the daemon's own number,
+    which is the *compressed* size when the daemon uses a containerd image store
+    — the same image then reads roughly three times smaller than on the classic
+    overlay2 store, so the fallback is labelled rather than passed off as the
+    unpacked size.
+    """
+    source = "rootfs-export"
+    size = unpacked_bytes
+    if size is None:
+        result = subprocess.run(
+            ["docker", "image", "inspect", "--format", "{{.Size}}", image],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        size = int(result.stdout.strip())
+        source = "docker-image-inspect"
 
     env = runtime_manifest.runtime_env(runtime_id, arch=arch)
     artifact_dir = Path(env["ARTIFACT_DIR"])
@@ -582,6 +644,7 @@ def record_size(image: str, runtime_id: str, arch: str) -> Optional[int]:
     stats.setdefault("warn_unzipped_bytes", int(env["WARN_UNZIPPED_BYTES"]))
     stats.setdefault("layer_publishable", env["LAYER_PUBLISHABLE"] == "true")
     stats["container_image_bytes"] = size
+    stats["container_image_bytes_measured"] = source
     stats["container_image"] = image
     stats_path.parent.mkdir(parents=True, exist_ok=True)
     stats_path.write_text(
@@ -606,6 +669,16 @@ def _main() -> None:
     size_parser.add_argument("--runtime", required=True)
     size_parser.add_argument("--arch", required=True)
     size_parser.add_argument("--image", required=True)
+    size_parser.add_argument(
+        "--unpacked-bytes",
+        type=int,
+        default=None,
+        help=(
+            "Unpacked size measured from the exported rootfs. Preferred over "
+            "`docker image inspect .Size`, which is the compressed size on a "
+            "containerd image store."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -617,7 +690,12 @@ def _main() -> None:
         print(json.dumps(verify_image_layout(args.image), indent=2))
         return
 
-    size = record_size(args.image, args.runtime, args.arch)
+    size = record_size(
+        args.image,
+        args.runtime,
+        args.arch,
+        unpacked_bytes=args.unpacked_bytes,
+    )
     if size is None:
         raise SystemExit(f"could not read the size of {args.image}")
     print(f"{args.image}: {size} bytes")

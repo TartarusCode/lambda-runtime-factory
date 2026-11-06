@@ -148,7 +148,11 @@ image that cannot `dlopen`. The final stage only uses `COPY`, `ENV`, `WORKDIR`, 
 
 `/tmp` is `1777` in the base and `/var/task` is the `WORKDIR`; `build-container` verifies both
 (plus `/opt`) from the exported rootfs before reporting success, because Lambda's contract
-requires them.
+requires them. That same export measures the image's **unpacked** size, which is what the job
+summary and `build-stats.json` record: `docker image inspect .Size` is the compressed size on a
+containerd image store and the uncompressed one on the classic overlay2 store, so the same image
+read 82,283,585 B on a CI runner and 251,143,202 B on a developer box. The rootfs sum is the
+number Lambda counts against its 10 GB container limit, and it does not depend on the daemon.
 
 ### Building arm64 on an x86 host
 

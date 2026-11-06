@@ -1528,6 +1528,33 @@ def test_only_libraries_the_base_lacks_are_staged() -> None:
         container_image.required_packages(["libunknown.so.9"])
 
 
+def test_the_unpacked_size_is_summed_from_the_rootfs_listing() -> None:
+    """The recorded size must not depend on the daemon's image store.
+
+    `docker image inspect .Size` is the compressed size on a containerd store, so
+    the same image reads about three times smaller there than on the classic
+    overlay2 store. The rootfs export is measured instead, and only regular files
+    carry bytes: a directory and a symlink (whose listing ends with its target,
+    not with its own path) contribute nothing.
+    """
+    listing = "\n".join(
+        [
+            "drwxrwxrwt 0/0 0 2026-01-01 00:00 tmp/",
+            "-rw-r--r-- 0/0 1024 2026-01-01 00:00 opt/go/bin/go",
+            "lrwxrwxrwx 0/0 0 2026-01-01 00:00 usr/lib/libz.so.1 -> libz.so.1.2.13",
+            "-rw-r--r-- 0/0 512 2026-01-01 00:00 usr/lib/libz.so.1.2.13",
+        ]
+    )
+
+    summary = container_image.parse_rootfs_listing(listing)
+
+    assert summary["unpacked_bytes"] == 1536
+    assert summary["entries"]["tmp"] == "drwxrwxrwt"
+    assert summary["entries"]["opt/go/bin/go"] == "-rw-r--r--"
+    assert summary["entries"]["usr/lib/libz.so.1"] == "lrwxrwxrwx"
+    assert summary["entries"]["usr/lib/libz.so.1.2.13"] == "-rw-r--r--"
+
+
 def test_a_shebang_script_can_never_be_a_container_entrypoint(tmp_path: Path) -> None:
     payload = tmp_path / "layer"
     payload.mkdir()

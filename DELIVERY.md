@@ -50,14 +50,21 @@ An image is one of two shapes, and the manifest's `container.profile` picks whic
   `libc.so` and rustc's sysroot into place, and its smoke test runs the toolchain
   (`go version`, `rustc --version`) rather than invoking a handler it does not have.
 
-Measured on the built images (x86_64): `go126` 251,143,202 B, `rust198` 1,521,548,887 B,
-`bun13` 116,426,951 B, `pypy311` 113,874,310 B. `go build` and `cargo build` were both run
-inside the published images, and the resulting binaries executed. The arm64 images were built
-and exercised too — `go126` 274,250,387 B answers `go version go1.26.10 linux/arm64`, and
-`graalpy312` 293,552,414 B returned a 200 from an RIE invocation with an ARM `libz.so.1` staged
-into it — and the two per-arch tags were combined into a real multi-arch manifest list against a
-throwaway registry to exercise the release's merge step. See CONTRIBUTING.md for the qemu setup
-and why CI's native arm runners are the authoritative check.
+Measured on the built images (x86_64, unpacked bytes summed from the exported rootfs): `go126`
+251,136,536 B, `rust198` 1,521,518,187 B, `bun13` 116,422,312 B, `pypy311` 113,869,671 B.
+`go build` and `cargo build` were both run inside the published images, and the resulting
+binaries executed. The arm64 images were built and exercised too — `go126` 274,243,748 B answers
+`go version go1.26.10 linux/arm64`, and `graalpy312` 293,547,778 B returned a 200 from an RIE
+invocation with an ARM `libz.so.1` staged into it — and the two per-arch tags were combined into
+a real multi-arch manifest list against a throwaway registry to exercise the release's merge
+step. See CONTRIBUTING.md for the qemu setup and why CI's native arm runners are the
+authoritative check.
+
+The size is measured from the exported rootfs rather than from `docker image inspect .Size`,
+because that field is the *compressed* size on a containerd image store and the uncompressed one
+on the classic overlay2 store: the same image read 82,283,585 B on a CI runner and 251,143,202 B
+on a developer box. The rootfs sum is the unpacked size Lambda counts against its 10 GB limit,
+and it is the same number wherever it is measured.
 
 ## What slimming actually bought
 

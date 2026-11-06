@@ -89,12 +89,18 @@ fi
 
 docker "${build_args[@]}" "${context_dir}"
 
-python3 "$(common::repo_root)/tools/runtime_lib/container_image.py" verify --image "${image}" >/dev/null
+# The rootfs export is also the size measurement. `docker image inspect .Size` is
+# the compressed size on a containerd image store and the uncompressed one on the
+# classic overlay2 store, so the same image would be recorded with numbers a
+# factor of three apart depending on the runner.
+verify_json=$(python3 "$(common::repo_root)/tools/runtime_lib/container_image.py" verify --image "${image}")
+unpacked_bytes=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["unpacked_bytes"])' <<<"${verify_json}")
 container_image_bytes=$(python3 "$(common::repo_root)/tools/runtime_lib/container_image.py" \
     record-size --runtime "${runtime_id}" --arch "${arch}" --image "${image}" \
+    --unpacked-bytes "${unpacked_bytes}" \
     | awk '{ print $(NF-1) }')
 
-echo "${runtime_id} (${arch}): image ${image} is ${container_image_bytes} bytes uncompressed"
+echo "${runtime_id} (${arch}): image ${image} holds ${container_image_bytes} bytes unpacked (summed from the exported rootfs)"
 if (( push )); then
     bash "$(dirname "$0")/push-container" "${runtime_id}" "${arch}"
 fi
@@ -105,7 +111,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" && "${LAMBDA_RUNTIME_SUMMARY_DEFERRED:-0}" !
         echo
         echo "- \`${CONTAINER_IMAGE}:${CONTAINER_TAG}-${ARCH}\`"
         echo "- base: \`${CONTAINER_BASE_IMAGE}\`"
-        echo "- uncompressed size: $(( container_image_bytes / 1048576 )) MB"
+        echo "- unpacked size: $(( container_image_bytes / 1048576 )) MB"
         echo
     } >> "${GITHUB_STEP_SUMMARY}"
 fi
