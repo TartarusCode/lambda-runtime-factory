@@ -227,21 +227,24 @@ each variant into `<version>`, the version line, and the moving tag — `latest`
 image, `debug` for the debug one — once per registry. A dispatch that targeted one architecture
 leaves the per-arch tags alone with a notice instead of failing.
 
-SOCI indexes are generated after the merge, by `publish-soci-index`, for ECR registries only:
-Lambda reads them from ECR and starts an image lazily instead of downloading every layer first.
-The CLI is pinned (`SOCI_VERSION`, v0.16.1).
+SOCI publishing produces a **second image per architecture**, not a tag on the published one:
+`soci convert --standalone` packages the index into a new image (SOCI Index Manifest v2), and
+`merge-containers` merges the two into `<version>-soci` plus the version line's `-soci`. There is
+deliberately no moving `-soci` tag: a v2 image cannot have its index added or removed, so a
+function pinned to a moving tag would change what it runs the moment the next release moved it.
+Lambda lazy-loads an image when the function runs on **Lambda Managed Instances** and its image
+URI points at the `-soci` tag.
 
-It is **opt-in** (`publish_soci: true` on a dispatch), because the soci CLI is not
-containerd-free: `create` resolves the image through containerd's image service and `push` reads
-it through the same client, so `--content-store soci` only relocates the blobs. Measured against
-v0.16.1: it dials `/run/containerd/containerd.sock` and fails with `permission denied` even with
-that flag set. Publishing an index therefore needs a containerd that is reachable (under `sudo`
-on a hosted runner, where the socket is root-owned) and that already holds the image —
-`docker save <image> | sudo ctr -n default images import -`. `publish-soci-index` prints exactly
-those steps when the prerequisite is missing, rather than leaving the socket error to speak for
-itself. `soci convert --standalone` is the containerd-free alternative, but it reads and writes
-OCI layouts and does not publish the referrer; pushing that would need oras or crane, which the
-release does not do yet.
+Nothing in that path needs containerd or root. `soci create` and `soci push` resolve the image
+through containerd's image service, which a runner that builds with Docker does not have, so the
+release pulls the per-arch image into an OCI layout with `oras`, converts it with `soci convert
+--standalone`, and pushes the result back. The push is verified rather than assumed: the tag must
+be an index whose two entries are the image manifest and the index manifest, cross-annotated, and
+only for the architecture it was built from — an unindexed image would still start, just slowly.
+
+Both tools are pinned (`SOCI_VERSION`, `ORAS_VERSION`). The work is opt-in (`publish_soci: true`)
+because it only pays off on Managed Instances and it adds an image, an index and the ztoc blobs
+per architecture (the original layers are referenced, not re-uploaded).
 
 ```dockerfile
 # A runtime image is a Lambda container image: entrypoint = runtime, CMD = handler.
