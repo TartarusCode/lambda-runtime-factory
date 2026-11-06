@@ -66,6 +66,40 @@ on the classic overlay2 store: the same image read 82,283,585 B on a CI runner a
 on a developer box. The rootfs sum is the unpacked size Lambda counts against its 10 GB limit,
 and it is the same number wherever it is measured.
 
+## What else the release publishes
+
+Beyond the two artifact shapes, every runtime publishes a **debug variant** and, on ECR, a
+**SOCI index**:
+
+- `<version>-debug` is the same payload and invocation on
+  `gcr.io/distroless/cc-debian12:debug-nonroot`, which carries a busybox shell. It exists so a
+  failing image can be inspected instead of guessed at, and `check-container-variants` asserts
+  the claims: the production image has no shell at all, the debug image runs `/busybox/sh` as
+  the same uid with the same entrypoint.
+- The images go to GHCR **and** Amazon ECR Public. A Lambda function cannot pull from GHCR at
+  execution time, so ECR Public is the copy that matters inside AWS.
+- The SOCI index is generated after the multi-arch tag exists, for ECR only: Lambda uses it to
+  start an image lazily, which takes image size out of the cold-start path.
+
+## What the bytecode experiment showed (and why it is off)
+
+Precompiling the interpreter's standard library to `.pyc` was expected to cut cold-start time.
+Measured on `pypy311` x86_64, 12 cold starts per configuration, same handler:
+
+| Payload | Unzipped | Init median | Init mean |
+| --- | --- | --- | --- |
+| sources only (default) | 90.3 MB | 1693 ms | 1675 ms |
+| `PRECOMPILE_BYTECODE=1` | 106.5 MB | 1713 ms | 1744 ms |
+
+It costs 16 MB and buys nothing measurable: the interpreter's own startup dominates this
+handler's init, and PyPy executes source quickly. It stays as an opt-in for a family where
+imports are the bottleneck, and a runtime close to the layer ceiling drops the generated
+`.pyc` files again rather than failing a build over an optimisation.
+
+What was pruned instead, and is worth keeping: stdlib test suites, GUI toolkits, headers,
+static archives and debug symbols — and nothing else, because the payloads ship no locale data
+(glibc provides it) and their bundled `zoneinfo` is 52 KB that timezone-aware code reads.
+
 ## What slimming actually bought
 
 Measured on the built artifacts (`build-stats.json`, sum of zip entry sizes):

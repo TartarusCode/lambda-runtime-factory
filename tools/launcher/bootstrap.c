@@ -29,11 +29,18 @@
 #endif
 
 int main(int argc, char **argv) {
-    (void)argc;
-
+    /* Lambda sets _HANDLER; a container image may instead pass the handler as
+     * CMD (`CMD ["app.handler"]`), which reaches us as the first argument after
+     * the entrypoint. Accepting both keeps one payload usable as a zip layer and
+     * as a container image, and exporting it keeps the handler code's own
+     * getenv("_HANDLER") working either way. */
     const char *handler = getenv("_HANDLER");
+    if ((handler == NULL || handler[0] == '\0') && argc > 1) {
+        handler = argv[1];
+        setenv("_HANDLER", handler, 1);
+    }
     if (handler == NULL || handler[0] == '\0') {
-        fprintf(stderr, "bootstrap: _HANDLER is not set\n");
+        fprintf(stderr, "bootstrap: _HANDLER is not set and no handler was given as an argument\n");
         return 127;
     }
 

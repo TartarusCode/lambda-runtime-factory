@@ -1,0 +1,53 @@
+#!/bin/bash
+# Create the registry repositories a runtime publishes to, when they can be.
+#
+# GHCR creates a package on first push, but Amazon ECR Public (and a private ECR
+# registry) returns RepositoryNotFoundException until the repository exists, so a
+# release would fail its first push to a new runtime. This is idempotent: an
+# existing repository is reported and left alone.
+#
+#   ensure-container-repos <runtime_id>
+#
+# Requires AWS credentials with ecr-public:CreateRepository /
+# ecr:CreateRepository; anything else is reported and skipped rather than failing
+# a release over a repository that may already exist.
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+
+runtime_id=$(common::require_runtime_id "${1:-}")
+common::load_runtime_env "${runtime_id}" "${ARCH:-x86_64}" standard
+
+mapfile -t registries < <(python3 -c 'import json,sys
+for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIES}")
+
+if ! type -P aws >/dev/null; then
+    echo "aws CLI is not installed; skipping repository creation"
+    exit 0
+fi
+
+for registry in "${registries[@]}"; do
+    case "${registry}" in
+        public.ecr.aws/*)
+            alias=${registry#public.ecr.aws/}
+            repo="${alias}/${runtime_id}"
+            echo "Ensuring ECR Public repository ${repo}"
+            if aws ecr-public describe-repositories --registry-id "$(aws ecr-public describe-registries --query 'registries[0].registryId' --output text 2>/dev/null || true)" \
+                --repository-names "${repo}" >/dev/null 2>&1; then
+                echo "${repo} exists"
+                continue
+            fi
+            if aws ecr-public create-repository --repository-name "${repo}" >/dev/null 2>&1; then
+                echo "Created ${repo}"
+            else
+                echo "::warning::could not create ECR Public repository ${repo}; the push will report the real reason" >&2
+            fi
+            ;;
+        *.dkr.ecr.*)
+            echo "Private ECR registries are created by the account that owns them; assuming ${registry}/${runtime_id} exists"
+            ;;
+        *)
+            echo "${registry}: created on first push"
+            ;;
+    esac
+done

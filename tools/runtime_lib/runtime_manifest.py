@@ -56,6 +56,22 @@ REPO_DEFAULTS: Dict[str, Any] = {
         # cannot run a `RUN` step at all.
         "profile": "distroless",
         "base_image": "gcr.io/distroless/cc-debian12:nonroot",
+        # Every runtime also ships a `<tag>-debug` variant on a base that carries a
+        # busybox shell and nothing else, so a failing image can be inspected
+        # (`docker run --rm -it --entrypoint /busybox/sh <image>`) without putting a
+        # shell into the production image. Empty means "no debug variant": the
+        # `build` families already have a shell, so a second copy would be the same
+        # image under another tag.
+        "debug_base_image": "gcr.io/distroless/cc-debian12:debug-nonroot",
+        # Registries the release publishes to. The first is the primary: it names
+        # the image in the docs, the examples and the release record. Amazon ECR
+        # Public is here because a Lambda *function* cannot pull from GHCR at
+        # execution time, and ECR Public gives anonymous, high-bandwidth pulls
+        # inside AWS; GHCR stays the public browsable copy.
+        "registries": [
+            "ghcr.io/tartaruscode/lambda-runtime-factory",
+            "public.ecr.aws/tartaruscode",
+        ],
         "registry": "ghcr.io/tartaruscode/lambda-runtime-factory",
         "workdir": "/var/task",
         "layer_root": "/opt",
@@ -91,6 +107,10 @@ CONTAINER_ARCH_SLUGS: Dict[str, str] = {
 # `distroless` images are runtime bases; `build` images are build environments
 # with a shell and a package manager. See the container block in REPO_DEFAULTS.
 CONTAINER_PROFILES = ("distroless", "build")
+
+# A runtime publishes a standard image and, when its base is distroless, a
+# `<tag>-debug` variant of the same payload with a busybox shell in it.
+CONTAINER_VARIANTS = ("standard", "debug")
 
 RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "portable-pypy": {
@@ -253,6 +273,9 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             # is built against and carries a shell.
             "profile": "build",
             "base_image": "debian:12-slim",
+            # A build image already ships a shell, so there is no separate debug
+            # variant to publish.
+            "debug_base_image": "",
             "user": "0:0",
             "entrypoint": ["/bin/sh"],
             "smoke_test": ["go", "version"],
@@ -295,6 +318,8 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             # has the shell a `RUN cargo build` needs.
             "profile": "build",
             "base_image": "alpine:3.22",
+            # Same as Go: the musl toolchain base already has a shell.
+            "debug_base_image": "",
             "user": "0:0",
             "entrypoint": ["/bin/sh"],
             "smoke_test": ["rustc", "--version"],
@@ -532,7 +557,9 @@ def validate_runtime_data(runtime_id: str, data: Dict[str, Any]) -> None:
             "enabled",
             "profile",
             "base_image",
+            "debug_base_image",
             "registry",
+            "registries",
             "workdir",
             "layer_root",
             "entrypoint",
@@ -576,6 +603,22 @@ def validate_runtime_data(runtime_id: str, data: Dict[str, Any]) -> None:
             "command that proves a build image works (e.g. ['go', 'version'])"
         )
 
+    # The release pushes to every registry in the list, and the first one is what
+    # the docs and the release record name: an empty list publishes nowhere, and a
+    # primary that is not in the list would be advertised but never updated.
+    registries = [item.rstrip("/") for item in data["container"]["registries"]]
+    if not registries:
+        raise ValueError(
+            f"Runtime {runtime_id} container.registries must name at least one registry"
+        )
+    if len(set(registries)) != len(registries):
+        raise ValueError(f"Runtime {runtime_id} container.registries contains a duplicate")
+    if data["container"]["registry"].rstrip("/") not in registries:
+        raise ValueError(
+            f"Runtime {runtime_id} container.registry must be one of "
+            f"container.registries ({', '.join(registries)})"
+        )
+
     if not data["lambda"]["compatible_runtimes"]:
         raise ValueError(f"Runtime {runtime_id} must declare compatible runtimes")
     if not data["release"]["regions"]:
@@ -586,9 +629,13 @@ def _absolute(runtime_id: str, relative_path: str) -> Path:
     return runtimes_root() / runtime_id / Path(relative_path)
 
 
-def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> Dict[str, str]:
+def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH, variant: str = "standard") -> Dict[str, str]:
     if arch not in SUPPORTED_ARCHS:
         raise ValueError(f"Unsupported architecture '{arch}'. Supported: {', '.join(SUPPORTED_ARCHS)}")
+    if variant not in CONTAINER_VARIANTS:
+        raise ValueError(
+            f"Unsupported container variant '{variant}'. Supported: {', '.join(CONTAINER_VARIANTS)}"
+        )
 
     data = load_runtime(runtime_id, arch=arch)
     runtime_dir = runtimes_root() / runtime_id
@@ -609,9 +656,22 @@ def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> Dict[str, str]:
     work_dir = build_dir / "work"
     container = data["container"]
     container_arch = CONTAINER_ARCH_SLUGS.get(arch, arch)
+    container_registries = [item.rstrip("/") for item in container["registries"]]
     container_registry = container["registry"].rstrip("/")
     container_image = f"{container_registry}/{runtime_id}"
     container_tag = data["distribution_version"]
+    # A debug image is the same payload on a base that carries a busybox shell.
+    # Only the base and the tags change: the entrypoint, user and environment stay
+    # identical, so what a user inspects is what failed in production.
+    debug_base_image = container.get("debug_base_image", "")
+    debug = variant == "debug"
+    if debug and not debug_base_image:
+        raise ValueError(
+            f"{runtime_id} has no debug container variant: container.debug_base_image is "
+            f"empty (a '{container['profile']}' base already carries a shell)"
+        )
+    container_base_image = debug_base_image if debug else container["base_image"]
+    variant_suffix = "-debug" if debug else ""
 
     env = {
         "REPO_ROOT": str(repo_root()),
@@ -679,12 +739,17 @@ def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> Dict[str, str]:
         # Container coordinates. The entrypoint and environment travel as JSON so
         # the Dockerfile generator cannot drift from what the manifest declares.
         "CONTAINER_ENABLED": "true" if container["enabled"] else "false",
+        "CONTAINER_VARIANT": variant,
+        "CONTAINER_TAG_SUFFIX": variant_suffix,
+        "CONTAINER_DEBUG_ENABLED": "true" if debug_base_image else "false",
+        "CONTAINER_DEBUG_BASE_IMAGE": debug_base_image,
         "CONTAINER_PROFILE": container["profile"],
-        "CONTAINER_BASE_IMAGE": container["base_image"],
+        "CONTAINER_BASE_IMAGE": container_base_image,
         "CONTAINER_PACKAGES": json.dumps(container["packages"]),
         "CONTAINER_LINKS": json.dumps(container["links"], sort_keys=True),
         "CONTAINER_SMOKE_TEST": json.dumps(container["smoke_test"]),
         "CONTAINER_REGISTRY": container_registry,
+        "CONTAINER_REGISTRIES": json.dumps(container_registries),
         "CONTAINER_IMAGE": container_image,
         "CONTAINER_TAG": container_tag,
         "CONTAINER_ARCH": container_arch,
@@ -694,8 +759,10 @@ def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> Dict[str, str]:
         "CONTAINER_USER": container["user"],
         "CONTAINER_ENTRYPOINT": json.dumps(container["entrypoint"]),
         "CONTAINER_ENV": json.dumps(container["env"], sort_keys=True),
-        "CONTAINER_CONTEXT_DIR": str(build_dir / "container"),
-        "CONTAINER_LOCAL_IMAGE": f"lambda-runtime-factory/{runtime_id}:{container_tag}-{arch}",
+        "CONTAINER_CONTEXT_DIR": str(build_dir / ("container-debug" if debug else "container")),
+        "CONTAINER_LOCAL_IMAGE": (
+            f"lambda-runtime-factory/{runtime_id}:{container_tag}-{arch}{variant_suffix}"
+        ),
         "EXPORT_ARTIFACT_DIR": os.environ.get("EXPORT_ARTIFACT_DIR", ""),
     }
     return env
@@ -815,8 +882,8 @@ def manifest_matrix(
     return {"include": entries}
 
 
-def print_shell_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> None:
-    for key, value in runtime_env(runtime_id, arch=arch).items():
+def print_shell_env(runtime_id: str, arch: str = DEFAULT_ARCH, variant: str = "standard") -> None:
+    for key, value in runtime_env(runtime_id, arch=arch, variant=variant).items():
         print(f"{key}={shlex.quote(value)}")
 
 
@@ -855,6 +922,12 @@ def build_parser() -> argparse.ArgumentParser:
     env_parser = subparsers.add_parser("env")
     env_parser.add_argument("--runtime", required=True)
     env_parser.add_argument("--arch", default=DEFAULT_ARCH)
+    env_parser.add_argument(
+        "--variant",
+        default="standard",
+        choices=CONTAINER_VARIANTS,
+        help="container variant whose coordinates to emit (standard or debug)",
+    )
 
     check_parser = subparsers.add_parser("check")
     check_parser.add_argument("--runtime", required=True)
@@ -913,7 +986,12 @@ def main() -> None:
         return
 
     if args.command == "env":
-        print_shell_env(args.runtime, arch=args.arch)
+        try:
+            print_shell_env(args.runtime, arch=args.arch, variant=args.variant)
+        except ValueError as error:
+            # A variant the runtime does not have is a user error, not a crash:
+            # the build scripts eval this output and need a one-line message.
+            raise SystemExit(str(error))
         return
 
     if args.command == "check":

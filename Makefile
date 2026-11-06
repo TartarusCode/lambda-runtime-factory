@@ -9,7 +9,7 @@ DEV_BUILD_ENV := BUILD_BEST_EFFORT_AUDIT=0
 
 all: validate-runtimes build
 
-.PHONY: all list-runtimes validate-runtimes check build build-all build-all-arches audit audit-all upload upload-all publish publish-all publicize publicize-all latest latest-all unpublish create-buckets local-build local-invoke clean shell check-updates bump bump-latest roll-off test container container-invoke container-audit container-push
+.PHONY: all list-runtimes validate-runtimes check build build-all build-all-arches audit audit-all upload upload-all publish publish-all publicize publicize-all latest latest-all unpublish create-buckets local-build local-invoke clean shell check-updates bump bump-latest roll-off test container container-debug container-variants container-invoke container-audit container-push container-merge container-soci container-repos
 
 list-runtimes:
 	python3 tools/runtime_lib/runtime_manifest.py list
@@ -92,6 +92,21 @@ local-invoke:
 
 container: validate-runtimes
 	$(DEV_BUILD_ENV) bash tools/bin/build-container "$(RUNTIME)" "$(ARCH)"
+
+container-debug:
+	$(DEV_BUILD_ENV) bash tools/bin/build-container "$(RUNTIME)" "$(ARCH)" --variant debug
+
+container-variants:
+	bash tools/bin/check-container-variants "$(RUNTIME)" "$(ARCH)"
+
+container-merge:
+	bash tools/bin/merge-container-tags "$(RUNTIME)"
+
+container-soci:
+	bash tools/bin/publish-soci-index "$(RUNTIME)"
+
+container-repos:
+	bash tools/bin/ensure-container-repos "$(RUNTIME)"
 
 container-audit:
 	bash tools/bin/audit-container "$(RUNTIME)" "$(ARCH)"

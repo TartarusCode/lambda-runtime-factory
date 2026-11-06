@@ -304,21 +304,47 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build the distroless image
-        # Builds the same payload as the layer, scans it, then smoke-tests it
-        # under aws-lambda-rie; only the bytes that passed are pushed below.
-        run: timeout 900 bash tools/bin/build-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
-      - name: Audit the container image
-        run: bash tools/bin/audit-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
-      - name: Smoke-test the container image
-        run: timeout 600 bash tools/bin/local-invoke-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
-      - name: Push the per-architecture image
+      - name: Configure AWS credentials
+        # Amazon ECR Public is the copy Lambda can actually pull from, so the
+        # image job needs the same OIDC role the layer publish uses.
         if: ${{ github.event.inputs.dry_run != 'true' }}
-        run: bash tools/bin/push-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_RELEASE_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Log in to Amazon ECR Public
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          aws ecr-public get-login-password --region us-east-1 \
+            | docker login --username AWS --password-stdin public.ecr.aws
+      - name: Ensure the image repositories exist
+        # A first push to a new runtime fails on ECR Public unless the repository
+        # exists; GHCR creates the package itself.
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: bash tools/bin/ensure-container-repos "${{ matrix.runtime }}"
+      - name: Build, scan and smoke-test every variant
+        # The standard image and, where the family has one, the debug image built
+        # from the same payload. Only bytes that passed all three steps are pushed.
+        run: |
+          for variant in $(bash tools/bin/container-variants "${{ matrix.runtime }}" "${{ matrix.arch }}"); do
+            echo "::group::${variant}"
+            timeout 900 bash tools/bin/build-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --variant "${variant}"
+            bash tools/bin/audit-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --variant "${variant}"
+            timeout 600 bash tools/bin/local-invoke-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --variant "${variant}"
+            echo "::endgroup::"
+          done
+      - name: Check that the variants differ only by the shell
+        run: bash tools/bin/check-container-variants "${{ matrix.runtime }}" "${{ matrix.arch }}"
+      - name: Push the per-architecture images
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          for variant in $(bash tools/bin/container-variants "${{ matrix.runtime }}" "${{ matrix.arch }}"); do
+            bash tools/bin/push-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --variant "${variant}"
+          done
       - name: Report the dry run
         if: ${{ github.event.inputs.dry_run == 'true' }}
         run: |
-          echo "::notice::dry run: ${{ matrix.runtime }} (${{ matrix.arch }}) image was built, scanned and smoke-tested; nothing was pushed."
+          echo "::notice::dry run: ${{ matrix.runtime }} (${{ matrix.arch }}) images were built, scanned and smoke-tested; nothing was pushed."
 
   # Combine the two per-arch images into one multi-arch tag. Done once per
   # runtime, after every architecture has pushed: a manifest list cannot be built
@@ -348,35 +374,55 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Create the multi-arch tags
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_RELEASE_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Log in to Amazon ECR Public
         run: |
-          env_text=$(python3 tools/runtime_lib/runtime_manifest.py env \
-            --runtime "${{ matrix.runtime }}" --arch x86_64)
-          image=$(grep '^CONTAINER_IMAGE=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
-          tag=$(grep '^CONTAINER_TAG=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
-          line=$(grep '^VERSION_LINE=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
+          aws ecr-public get-login-password --region us-east-1 \
+            | docker login --username AWS --password-stdin public.ecr.aws
+      - name: Create the multi-arch tags
+        # Every registry in the manifest gets the same tags, for the standard
+        # image and (where the family has one) the debug image. A dispatch that
+        # targeted one architecture leaves the per-arch tags alone with a notice.
+        run: bash tools/bin/merge-container-tags "${{ matrix.runtime }}"
 
-          # A dispatch can target one architecture; a manifest list needs both.
-          if ! docker buildx imagetools inspect "${image}:${tag}-arm64" >/dev/null 2>&1; then
-            echo "::notice::no arm64 image for ${{ matrix.runtime }}; leaving the per-arch tags as published"
-            exit 0
-          fi
 
-          tags=(--tag "${image}:${tag}" --tag "${image}:${line}")
-          # Moving `latest` is only meaningful for a tagged release: a replayed
-          # older dispatch must not roll it backwards.
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            tags+=(--tag "${image}:latest")
-          fi
-          docker buildx imagetools create "${tags[@]}" \
-            "${image}:${tag}-amd64" "${image}:${tag}-arm64"
-
-          {
-            echo "### Multi-arch image: ${{ matrix.runtime }}"
-            echo
-            docker buildx imagetools inspect "${image}:${tag}"
-            echo
-          } >> "${GITHUB_STEP_SUMMARY}"
+  # SOCI indexes are a Lambda-side optimisation, not a release gate: an image is
+  # already published and usable without one, so a failure here is visible on the
+  # run without blocking the release record.
+  publish-soci:
+    needs:
+      - prepare-matrix
+      - merge-containers
+    if: ${{ always() && needs.merge-containers.result == 'success' && github.event.inputs.dry_run != 'true' }}
+    environment: release
+    runs-on: ubuntu-26.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.merge-matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_RELEASE_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Publish the SOCI index
+        # The script mints its registry token from this role and only acts on ECR
+        # registries: a SOCI index on GHCR is bytes nothing consumes.
+        env:
+          SOCI_VERSION: v0.16.1
+        run: bash tools/bin/publish-soci-index "${{ matrix.runtime }}" --push
 
 
   record-release:
