@@ -6,7 +6,11 @@ process.env.TMPDIR ??= "/tmp";
 process.env.LAMBDA_TASK_ROOT ??= "/var/task";
 
 const RUNTIME_API = process.env.AWS_LAMBDA_RUNTIME_API!;
-const HANDLER = process.env._HANDLER!;
+// Lambda sets _HANDLER; a container image may pass the handler as CMD instead
+// ("CMD": ["app.handler"]), which arrives as the first argument after this
+// script. Exporting it keeps handler code's own _HANDLER lookups working.
+const HANDLER = process.env._HANDLER || process.argv.slice(2)[0] || "";
+if (HANDLER) process.env._HANDLER ??= HANDLER;
 const BASE = `http://${RUNTIME_API}/2018-06-01/runtime`;
 
 const [modulePath, funcName] = HANDLER.includes(".")

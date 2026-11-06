@@ -114,6 +114,34 @@ make container-invoke RUNTIME=pypy311 ARCH=x86_64   # RIE smoke test (or the too
 bash tools/bin/audit-container pypy311 x86_64 # Grype scan of the image
 ```
 
+### Variants: the production image and the debug image
+
+Every distroless runtime publishes two images from one payload:
+
+- **`<version>`** — the production image: no shell, `USER 65532:65532`, and the runtime's
+  entrypoint. This is the one a function uses.
+- **`<version>-debug`** — the *same payload and entrypoint* on
+  `gcr.io/distroless/cc-debian12:debug-nonroot`, which also carries a busybox shell
+  (`/busybox/sh`, already on `PATH`). Same uid, same invocation: what you inspect is what
+  failed. It is not meant to be deployed.
+
+The variant travels as `container.debug_base_image` in the manifest (empty means "this family
+has no debug variant", which is how the `build` profiles are configured: they already have a
+shell). Everything else — entrypoint, user, environment, workdir — is shared, and
+`check-container-variants` tests exactly that claim: the standard image must fail to execute
+`/bin/sh` and `/busybox/sh`, the debug image must succeed, and the two must agree on
+`Entrypoint` and `User`.
+
+```bash
+make container        RUNTIME=pypy311 ARCH=x86_64   # standard
+make container-debug  RUNTIME=pypy311 ARCH=x86_64   # the debug variant
+make container-variants RUNTIME=pypy311 ARCH=x86_64 # assert both claims
+bash tools/bin/container-variants pypy311 x86_64    # standard debug | standard
+```
+
+CI builds the debug variant for every cell that has one and runs the variant check, so a base
+swap that quietly dropped the entrypoint or the user fails there rather than in production.
+
 ### The entrypoint must not need a shell
 
 `gcr.io/distroless/cc-debian12` has no `/bin/sh`, no `/bin/bash` and no `/usr/bin/env`. That
@@ -177,9 +205,32 @@ and running the `imagetools create` line from `release-runtime.yml` against it.
 
 ### Publishing and consuming
 
-`push-container` tags the local image `<version>-<arch-slug>` and pushes it. The release
-`merge-containers` job combines the two per-arch manifests with `docker buildx imagetools
-create` into `<version>` and the version line, plus `latest` on a tagged release:
+Every runtime publishes to **both** registries in `container.registries`: GHCR
+(`ghcr.io/tartaruscode/lambda-runtime-factory/<runtime>`) and Amazon ECR Public
+(`public.ecr.aws/tartaruscode/lambda-runtime-factory/<runtime>`). GHCR is the browsable copy;
+ECR Public exists because a Lambda *function* cannot pull from GHCR at execution time, and
+gives anonymous, high-bandwidth pulls inside AWS.
+
+The alias in an ECR Public path is the registry namespace, and the path after it is the
+repository name: `public.ecr.aws/tartaruscode/lambda-runtime-factory/pypy311` is repository
+`lambda-runtime-factory/pypy311`. A registry has a **default alias** — `tartarusgroup` for this
+account, assigned with its first public repository — plus any **custom aliases** requested in the
+ECR console under Public registry settings, and *any active alias* can be used for pulls. That
+is why the manifest names `tartaruscode`: it matches the project and the GHCR path, so only the
+registry host differs between the two. `ensure-container-repos` creates the repository
+idempotently and fails with the account's real aliases when `tartaruscode` is not among them,
+which is a far better error than a push that goes nowhere.
+
+`push-container --variant debug` uses `<version>-<arch-slug>-debug`, and the release's
+`merge-containers` job calls `merge-container-tags`, which combines the two per-arch images of
+each variant into `<version>`, the version line, and the moving tag — `latest` for the standard
+image, `debug` for the debug one — once per registry. A dispatch that targeted one architecture
+leaves the per-arch tags alone with a notice instead of failing.
+
+SOCI indexes are generated after the merge, by `publish-soci-index`, for ECR registries only:
+Lambda reads them from ECR and uses them to start an image lazily instead of downloading every
+layer first. The `soci` CLI is pinned (`SOCI_VERSION`) and runs with `--content-store soci`, so
+it does not need a containerd daemon.
 
 ```dockerfile
 # A runtime image is a Lambda container image: entrypoint = runtime, CMD = handler.

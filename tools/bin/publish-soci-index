@@ -1,0 +1,111 @@
+#!/bin/bash
+# Generate and publish AWS SOCI (Seekable OCI) indexes for a runtime's images.
+#
+# A SOCI index lets Lambda start a container image lazily: the microVM boots
+# before the image has finished downloading and faults in only the blocks the
+# runtime actually touches, which removes image size from the cold-start path.
+# The index is an OCI artifact that refers to the image manifest, so it is
+# generated after `merge-containers` has created the multi-arch tag.
+#
+# Lambda reads SOCI indexes from Amazon ECR. An image on a registry that is not
+# ECR gets a notice and no index: publishing one there would be bytes nothing
+# consumes.
+#
+#   publish-soci-index <runtime_id> [--push]
+#
+# Env: SOCI_VERSION (pinned), SOCI_USER / SOCI_PASSWORD for `soci push`,
+#      SOCI_STORE_ROOT for the local content store.
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+
+push=0
+positional=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --push) push=1; shift ;;
+        -*) echo "Unknown option: $1" >&2; exit 2 ;;
+        *) positional+=("$1"); shift ;;
+    esac
+done
+
+runtime_id=$(common::require_runtime_id "${positional[0]:-}")
+common::load_runtime_env "${runtime_id}" "${positional[1]:-x86_64}" standard
+
+soci_version="${SOCI_VERSION:-v0.16.1}"
+store_root="${SOCI_STORE_ROOT:-${BUILD_DIR}/soci-store}"
+soci="${SOCI_BIN:-${DOWNLOADS_DIR}/soci-${soci_version}}"
+
+if [[ ! -x "${soci}" ]]; then
+    case "$(uname -m)" in
+        x86_64) soci_arch=amd64 ;;
+        aarch64 | arm64) soci_arch=arm64 ;;
+        *) echo "no soci asset for $(uname -m)" >&2; exit 1 ;;
+    esac
+    asset="soci-snapshotter-${soci_version#v}-linux-${soci_arch}.tar.gz"
+    url="https://github.com/awslabs/soci-snapshotter/releases/download/${soci_version}/${asset}"
+    echo "Downloading ${asset} (${soci_version})"
+    tmp=$(mktemp -d)
+    curl --fail --location --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors \
+        --retry-delay 2 --connect-timeout 30 --output "${tmp}/${asset}" "${url}"
+    tar -xzf "${tmp}/${asset}" -C "${tmp}"
+    install -m 0755 "$(find "${tmp}" -type f -name soci -print -quit)" "${soci}"
+    rm -rf "${tmp}"
+fi
+
+# The self-contained content store keeps this independent of a containerd
+# daemon: the release runners run Docker, not containerd-with-soci-snapshotter.
+soci_store_args=(--content-store soci --root "${store_root}")
+
+# `soci push` needs registry credentials. Rather than putting a token in the
+# workflow, mint one from the AWS role the job already assumed: ECR Public
+# accepts the registry password from `aws ecr-public get-login-password`.
+if [[ -z "${SOCI_PASSWORD:-}" ]] && type -P aws >/dev/null; then
+    SOCI_PASSWORD=$(aws ecr-public get-login-password --region "${AWS_REGION:-us-east-1}" 2>/dev/null || true)
+    if [[ -n "${SOCI_PASSWORD}" ]]; then
+        SOCI_USER="${SOCI_USER:-AWS}"
+    fi
+fi
+
+mapfile -t registries < <(python3 -c 'import json,sys
+for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIES}")
+
+job_summary() {
+    [[ -n "${GITHUB_STEP_SUMMARY:-}" ]] || return 0
+    {
+        echo "#### SOCI index: ${runtime_id}"
+        echo
+        echo "- \`$1\`"
+        echo
+    } >> "${GITHUB_STEP_SUMMARY}"
+}
+
+for registry in "${registries[@]}"; do
+    image="${registry}/${RUNTIME_ID}"
+    case "${image}" in
+        public.ecr.aws/* | *.dkr.ecr.*) ;;
+        *)
+            echo "${runtime_id}: ${image} is not an ECR registry; Lambda reads SOCI indexes from ECR, so no index is published there"
+            continue
+            ;;
+    esac
+
+    reference="${image}:${CONTAINER_TAG}${CONTAINER_TAG_SUFFIX}"
+    echo "soci create --all-platforms ${reference}"
+    # --all-platforms makes one index for the manifest list rather than for the
+    # platform this runner happens to be.
+    "${soci}" create "${soci_store_args[@]}" --all-platforms "${reference}"
+
+    if (( push )); then
+        if [[ -n "${SOCI_USER:-}" ]]; then
+            echo "soci push --user ${SOCI_USER} ${reference}"
+            "${soci}" push "${soci_store_args[@]}" --user "${SOCI_USER}:${SOCI_PASSWORD:-}" "${reference}"
+        else
+            echo "soci push ${reference}"
+            "${soci}" push "${soci_store_args[@]}" "${reference}"
+        fi
+        job_summary "${reference}"
+    else
+        echo "Dry run: index created in ${store_root} for ${reference}; pass --push to publish it"
+    fi
+done

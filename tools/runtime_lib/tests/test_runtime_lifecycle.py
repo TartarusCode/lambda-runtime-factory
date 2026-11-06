@@ -1646,17 +1646,221 @@ def test_the_release_pushes_ghcr_images_and_merges_the_architectures() -> None:
 
     assert publish["permissions"]["packages"] == "write"
     assert steps["Log in to GHCR"]["with"]["registry"] == "ghcr.io"
-    for name in ("Log in to GHCR", "Push the per-architecture image"):
+    for name in ("Log in to GHCR", "Push the per-architecture images"):
         assert "github.event.inputs.dry_run != 'true'" in steps[name]["if"], name
-    assert steps["Smoke-test the container image"]["run"].endswith(
-        '"${{ matrix.arch }}"'
-    )
+
+    # Every variant the runtime has is built, scanned and smoke-tested, and only
+    # those bytes are pushed.
+    build = steps["Build, scan and smoke-test every variant"]["run"]
+    for command in ("container-variants", "build-container", "audit-container", "local-invoke-container"):
+        assert command in build, command
+    assert "--variant" in build
+    push = steps["Push the per-architecture images"]["run"]
+    assert "container-variants" in push and "--variant" in push
 
     merge = jobs["merge-containers"]
     merge_run = next(step for step in merge["steps"] if step.get("name") == "Create the multi-arch tags")["run"]
-    assert "docker buildx imagetools create" in merge_run
-    assert "-amd64" in merge_run and "-arm64" in merge_run
+    assert "merge-container-tags" in merge_run
     assert merge["permissions"]["packages"] == "write"
+
+    # The tag arithmetic lives in the script, which is the part that has to be
+    # right: one multi-arch tag per variant, from the two per-arch images.
+    script = (_REPO_ROOT / "tools" / "bin" / "merge-container-tags").read_text(encoding="utf-8")
+    assert "docker buildx imagetools create" in script
+    assert "-amd64" in script and "-arm64" in script
+    assert "-debug" in script and "latest" in script
+
+
+def test_the_release_publishes_to_ecr_public_and_writes_a_soci_index() -> None:
+    """Lambda functions cannot pull from GHCR, and a SOCI index is what makes a
+    large image start lazily — both are part of the published artifact."""
+    jobs = _workflow("release-runtime.yml")["jobs"]
+    publish = {step.get("name"): step for step in jobs["publish-containers"]["steps"]}
+
+    ecr_login = publish["Log in to Amazon ECR Public"]["run"]
+    assert "aws ecr-public get-login-password" in ecr_login
+    assert "docker login --username AWS" in ecr_login
+    assert "ensure-container-repos" in publish["Ensure the image repositories exist"]["run"]
+    assert "check-container-variants" in publish["Check that the variants differ only by the shell"]["run"]
+
+    soci = jobs["publish-soci"]
+    assert soci["needs"] == ["prepare-matrix", "merge-containers"]
+    step = {step.get("name"): step for step in soci["steps"]}["Publish the SOCI index"]
+    assert "publish-soci-index" in step["run"] and "--push" in step["run"]
+    assert "SOCI_VERSION" in step["env"], "the soci CLI must be pinned"
+
+
+def test_every_runtime_publishes_to_the_primary_registry_and_ecr_public() -> None:
+    for runtime_id in runtime_manifest.list_active_runtime_ids():
+        env = runtime_manifest.runtime_env(runtime_id, "x86_64")
+        registries = json.loads(env["CONTAINER_REGISTRIES"])
+
+        assert env["CONTAINER_REGISTRY"] in registries, runtime_id
+        assert env["CONTAINER_IMAGE"].startswith(env["CONTAINER_REGISTRY"] + "/"), runtime_id
+        assert "public.ecr.aws/tartaruscode/lambda-runtime-factory" in registries, runtime_id
+
+
+def test_the_ecr_repository_name_excludes_the_account_alias() -> None:
+    """ECR Public's alias is the registry namespace, not part of the repository
+    name — creating `tartarusgroup/lambda-runtime-factory/pypy311` would make a
+    repository two levels deeper than the image path that pushes to it."""
+    # The registry list can be overridden in the environment (that is how the
+    # merge and push scripts are pointed at a throwaway registry), so the check
+    # runs without it rather than depending on the caller's shell.
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key != "CONTAINER_REGISTRIES_OVERRIDE"
+    }
+    output = subprocess.run(
+        [
+            "bash",
+            str(_REPO_ROOT / "tools" / "bin" / "ensure-container-repos"),
+            "pypy311",
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=environment,
+    ).stdout
+
+    assert "(repository name lambda-runtime-factory/pypy311)" in output
+    assert "public.ecr.aws/tartaruscode/lambda-runtime-factory/pypy311" in output
+
+
+def test_a_runtime_without_a_shell_variant_says_so() -> None:
+    """A `build` profile already has a shell, so it has one image — and asking for
+    a debug variant is a clean error rather than a silently identical image."""
+    for runtime_id in ("pypy311", "bun13", "deno29", "graalpy312"):
+        variants = subprocess.run(
+            ["bash", str(_REPO_ROOT / "tools" / "bin" / "container-variants"), runtime_id, "x86_64"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        assert variants == ["standard", "debug"], runtime_id
+
+    for runtime_id in ("go126", "rust198"):
+        variants = subprocess.run(
+            ["bash", str(_REPO_ROOT / "tools" / "bin" / "container-variants"), runtime_id, "x86_64"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.split()
+        assert variants == ["standard"], runtime_id
+
+        with pytest.raises(ValueError, match="no debug container variant"):
+            runtime_manifest.runtime_env(runtime_id, "x86_64", variant="debug")
+
+
+def test_the_debug_variant_differs_only_by_its_base_and_tags() -> None:
+    standard = runtime_manifest.runtime_env("pypy311", "x86_64")
+    debug = runtime_manifest.runtime_env("pypy311", "x86_64", variant="debug")
+
+    assert standard["CONTAINER_BASE_IMAGE"] == "gcr.io/distroless/cc-debian12:nonroot"
+    assert debug["CONTAINER_BASE_IMAGE"] == "gcr.io/distroless/cc-debian12:debug-nonroot"
+    assert debug["CONTAINER_TAG_SUFFIX"] == "-debug"
+    assert debug["CONTAINER_LOCAL_IMAGE"].endswith("-x86_64-debug")
+    assert debug["CONTAINER_CONTEXT_DIR"] != standard["CONTAINER_CONTEXT_DIR"]
+
+    # What the image does must not change: a debug image that also changed the
+    # invocation would be debugging a different container.
+    for key in (
+        "CONTAINER_ENTRYPOINT",
+        "CONTAINER_USER",
+        "CONTAINER_ENV",
+        "CONTAINER_PROFILE",
+        "CONTAINER_WORKDIR",
+        "CONTAINER_LAYER_ROOT",
+    ):
+        assert debug[key] == standard[key], key
+
+
+def test_the_debug_dockerfile_keeps_the_production_invocation() -> None:
+    def render(base_image: str, variant: str) -> str:
+        return container_image.render_dockerfile(
+            base_image=base_image,
+            platform="linux/amd64",
+            layer_root="/opt",
+            workdir="/var/task",
+            user="65532:65532",
+            entrypoint=["/opt/pypy/bin/pypy", "/opt/bootstrap"],
+            env={"HOME": "/tmp"},
+            packages=[],
+            sonames=[],
+            profile="distroless",
+            variant=variant,
+        )
+
+    standard = render("gcr.io/distroless/cc-debian12:nonroot", "standard")
+    debug = render("gcr.io/distroless/cc-debian12:debug-nonroot", "debug")
+
+    entrypoint = 'ENTRYPOINT ["/opt/pypy/bin/pypy", "/opt/bootstrap"]'
+    assert entrypoint in standard and entrypoint in debug
+    assert "# Variant: standard" in standard and "# Variant: debug" in debug
+    # The final stage never runs anything: the debug base is the only difference.
+    assert "RUN " not in debug.split("FROM ${BASE_IMAGE}")[1]
+
+
+def test_a_container_can_pass_the_handler_as_cmd() -> None:
+    """Lambda runs a container image as ENTRYPOINT + CMD, so the handler reaches
+    the runtime as an argument when `_HANDLER` is not set. Supporting both is what
+    makes `CMD ["app.handler"]` work in a function image."""
+    for runtime_id in ("pypy311", "pypy312", "graalpy312", "graalpy313"):
+        bootstrap = (
+            _REPO_ROOT / "runtimes" / runtime_id / "bootstrap" / "bootstrap.py3"
+        ).read_text(encoding="utf-8")
+        assert "len(sys.argv) > 1" in bootstrap, runtime_id
+        assert 'os.environ["_HANDLER"] = handler' in bootstrap, runtime_id
+
+    bun = (
+        _REPO_ROOT / "runtimes" / "bun13" / "helpers" / "lambda_runtime_bun" / "runtime.ts"
+    ).read_text(encoding="utf-8")
+    assert "process.argv.slice(2)[0]" in bun
+
+    deno = (
+        _REPO_ROOT / "runtimes" / "deno29" / "helpers" / "lambda_runtime_deno" / "runtime.ts"
+    ).read_text(encoding="utf-8")
+    assert "Deno.args[0]" in deno
+
+    launcher = (_REPO_ROOT / "tools" / "launcher" / "bootstrap.c").read_text(encoding="utf-8")
+    assert "argc > 1" in launcher
+    assert 'setenv("_HANDLER", handler, 1)' in launcher
+
+
+def test_slimming_precompiles_bytecode_and_keeps_the_sbom_metadata() -> None:
+    script = (_REPO_ROOT / "tools" / "bin" / "build-runtime").read_text(encoding="utf-8")
+
+    # Bytecode is compiled by the payload's own interpreter, with hash-based
+    # invalidation so a stale .pyc can never win over an edited source.
+    assert "compileall -b -q -f --invalidation-mode=unchecked-hash" in script
+    # ...and it is opt-in: measured on pypy311 it cost 16 MB and 20 ms of init.
+    assert "PRECOMPILE_BYTECODE:-0" in script
+    # A runtime near the ceiling keeps its sources: the .pyc files are removed
+    # again rather than failing the build.
+    assert "would exceed" in script
+    # Package metadata is what vulnerability scanning reads; it is documented as
+    # never removed and no delete rule targets it.
+    assert "*.dist-info" in script
+    assert "*dist-info*" not in script.split("slim_layer")[0]
+    for line in script.splitlines():
+        if "dist-info" in line:
+            assert "-delete" not in line and "-exec rm" not in line, line
+
+
+def test_the_example_dockerfiles_never_run_a_command_in_the_runtime_stage() -> None:
+    examples = sorted((_REPO_ROOT / "examples" / "docker").glob("*/Dockerfile"))
+    assert examples, "the consumer recipes are part of the deliverable"
+
+    for path in examples:
+        text = path.read_text(encoding="utf-8")
+        assert ("CMD [" in text) or ("ENTRYPOINT [" in text), path
+        # The runtime stage is the last FROM: a RUN there needs a shell the
+        # runtime image deliberately does not have.
+        tail = text[text.rindex("\nFROM "):]
+        assert "RUN " not in tail, f"{path}: the runtime stage cannot run a command"
+
 
 
 def test_the_layer_publish_cell_does_not_build_the_container() -> None:

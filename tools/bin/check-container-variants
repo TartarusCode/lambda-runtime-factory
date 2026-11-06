@@ -1,0 +1,63 @@
+#!/bin/bash
+# Assert that the two image variants are what they claim to be.
+#
+# The value of a `-debug` tag is that it is the *same* image plus a shell: same
+# payload, same entrypoint, same user. The value of the standard tag is that it
+# has no shell at all. Both claims are tested here rather than assumed, because a
+# base swap that silently removes the `USER` or the entrypoint would still build.
+#
+#   check-container-variants <runtime_id> <arch>
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+
+runtime_id=$(common::require_runtime_id "${1:-}")
+arch=$(common::require_arch "${2:-}")
+common::load_runtime_env "${runtime_id}" "${arch}" standard
+
+if [[ "${CONTAINER_PROFILE}" != "distroless" ]]; then
+    echo "${runtime_id} (${arch}): '${CONTAINER_PROFILE}' image already carries a shell; no variant to check"
+    exit 0
+fi
+
+standard_image="${CONTAINER_LOCAL_IMAGE}"
+standard_entrypoint=$(docker image inspect --format '{{json .Config.Entrypoint}}' "${standard_image}")
+standard_user=$(docker image inspect --format '{{.Config.User}}' "${standard_image}")
+
+common::load_runtime_env "${runtime_id}" "${arch}" debug
+debug_image="${CONTAINER_LOCAL_IMAGE}"
+debug_entrypoint=$(docker image inspect --format '{{json .Config.Entrypoint}}' "${debug_image}")
+debug_user=$(docker image inspect --format '{{.Config.User}}' "${debug_image}")
+
+failures=0
+fail() {
+    echo "${runtime_id} (${arch}): $*" >&2
+    failures=$((failures + 1))
+}
+
+# A shell in the production image is the thing distroless exists to avoid.
+for shell in /bin/sh /busybox/sh; do
+    if docker run --rm --entrypoint "${shell}" "${standard_image}" -c true >/dev/null 2>&1; then
+        fail "${standard_image} can execute ${shell}; the production image must have no shell"
+    fi
+done
+
+# The debug image must actually give a shell, and it must be the same artifact
+# otherwise — otherwise it is a different image under a debug name.
+if ! docker run --rm --entrypoint /busybox/sh "${debug_image}" -c 'true' >/dev/null 2>&1; then
+    fail "${debug_image} cannot execute /busybox/sh; the debug variant is not debuggable"
+fi
+
+if [[ "${debug_entrypoint}" != "${standard_entrypoint}" ]]; then
+    fail "entrypoint differs: standard ${standard_entrypoint} vs debug ${debug_entrypoint}"
+fi
+
+if [[ "${debug_user}" != "${standard_user}" ]]; then
+    fail "user differs: standard ${standard_user} vs debug ${debug_user}"
+fi
+
+if (( failures )); then
+    exit 1
+fi
+
+echo "${runtime_id} (${arch}): variants verified (standard has no shell, debug runs /busybox/sh as ${standard_user}, same entrypoint)"

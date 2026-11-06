@@ -9,7 +9,12 @@ process.env.DENO_NO_UPDATE_CHECK ??= "1";
 process.env.LAMBDA_TASK_ROOT ??= "/var/task";
 
 const RUNTIME_API = process.env.AWS_LAMBDA_RUNTIME_API!;
-const HANDLER = process.env._HANDLER!;
+// Lambda sets _HANDLER; a container image may pass the handler as CMD instead
+// ("CMD": ["app.handler"]). Deno.args holds only the script's own arguments, so
+// a runtime flag can never be mistaken for the handler. Exporting it keeps
+// handler code's own _HANDLER lookups working.
+const HANDLER = process.env._HANDLER || Deno.args[0] || "";
+if (HANDLER) process.env._HANDLER ??= HANDLER;
 const BASE = `http://${RUNTIME_API}/2018-06-01/runtime`;
 
 const [modulePath, funcName] = HANDLER.includes(".")

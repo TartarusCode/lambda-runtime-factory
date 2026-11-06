@@ -26,10 +26,21 @@ limit:
 
 **OCI image** — for **every** runtime, including the toolchains a layer cannot carry:
 
-- **Image**: `ghcr.io/tartaruscode/lambda-runtime-factory/<runtime-id>`
+- **Images**: `ghcr.io/tartaruscode/lambda-runtime-factory/<runtime-id>` and
+  `public.ecr.aws/tartaruscode/lambda-runtime-factory/<runtime-id>` — GHCR for browsing, ECR
+  Public because a Lambda function cannot pull from GHCR at execution time and gets anonymous,
+  high-bandwidth pulls from ECR inside AWS. The ECR path needs `tartaruscode` to be an active
+  alias on the registry (the account's default alias is `tartarusgroup`; a custom alias is
+  requested in the console, and either one pulls fine)
 - **Architectures**: one multi-arch manifest for `linux/amd64` and `linux/arm64`
 - **Tags**: `<distribution-version>` (e.g. `1.26.10`), the version line (`1.26`), and
   `latest` on a tagged release
+- **Debug variants**: every distroless runtime also publishes `<version>-debug`,
+  `<line>-debug` and `debug` — the same payload and entrypoint on a base that carries a
+  busybox shell, for inspecting an image that failed to start. The production tags never
+  have a shell.
+- **SOCI indexes**: the release publishes a SOCI index for the ECR Public copy, so Lambda
+  can start the image lazily instead of downloading every layer first
 - **Two shapes**, because a runtime base and a build environment are different things:
   - **Runtime base** (the interpreter runtimes) — `gcr.io/distroless/cc-debian12`: no shell,
     no package manager, minimal OS CVE surface, and a **10 GB** uncompressed limit instead of
@@ -63,7 +74,7 @@ The layers live in AWS account `485809183296`; `make latest` prints the full ARN
 ## Container images
 
 Use a runtime image directly as a Lambda container image. The image's entrypoint starts the
-runtime; `CMD` carries the handler, which Lambda exposes as `_HANDLER`:
+runtime; `CMD` carries the handler, which the runtime reads exactly as it reads `_HANDLER`:
 
 ```dockerfile
 FROM ghcr.io/tartaruscode/lambda-runtime-factory/pypy311:3.11
@@ -78,6 +89,18 @@ docker push <registry>/my-function
 aws lambda create-function --function-name my-function \
   --package-type Image --code ImageUri=<registry>/my-function \
   --role <execution-role-arn>
+```
+
+The image is distroless, so anything installed with `RUN` has to happen in a builder stage —
+see [examples/docker](examples/docker) for recipes covering pure-Python dependencies, a Bun
+bundle and the Go toolchain.
+
+When an image fails to start, use the debug tag: the same payload and entrypoint with a
+busybox shell, so you can look at the real container instead of guessing.
+
+```bash
+docker run --rm -it --entrypoint /busybox/sh \
+  ghcr.io/tartaruscode/lambda-runtime-factory/pypy311:3.11-debug
 ```
 
 The Go and Rust images are **toolchain images**: they carry `go`/`rustc`, not a handler, and

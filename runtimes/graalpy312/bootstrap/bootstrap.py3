@@ -20,7 +20,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 RUNTIME_API_ENDPOINT = "/2018-06-01/runtime"
-HANDLER = os.getenv("_HANDLER")
+
+
+def _resolve_handler() -> str:
+    """Handler from the environment, else from the command line.
+
+    Lambda sets ``_HANDLER``. A container image can pass the handler as ``CMD``
+    instead (``CMD ["app.handler"]``), which arrives as the first argument after
+    this script. Exporting whatever is resolved keeps the handler's own
+    ``os.environ["_HANDLER"]`` lookups working in either shape.
+    """
+    handler = os.getenv("_HANDLER", "")
+    if not handler and len(sys.argv) > 1:
+        handler = sys.argv[1]
+        os.environ["_HANDLER"] = handler
+    return handler
+
+
+HANDLER = _resolve_handler()
 RUNTIME_API = os.getenv("AWS_LAMBDA_RUNTIME_API")
 RUNTIME_CLIENT_TIMEOUT = float(os.getenv("GRAALPY_RUNTIME_API_TIMEOUT", "310"))
 POLL_RETRY_BACKOFF_SECONDS = float(os.getenv("GRAALPY_RUNTIME_POLL_BACKOFF", "0.25"))

@@ -98,8 +98,12 @@ for dirpath, _dirnames, filenames in os.walk(root):
                     skipped += 1
                     continue
             before = os.path.getsize(path)
+            # An executable needs no symbol table to run; a shared object does,
+            # because the dynamic linker resolves through .dynsym, which
+            # --strip-all would remove.
+            flags = "--strip-unneeded" if ".so" in name else "--strip-all"
             result = subprocess.run(
-                ["strip", "--strip-unneeded", path],
+                ["strip", flags, path],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -174,6 +178,111 @@ install_native_bootstrap() {
     echo "Installed the native bootstrap for ${RUNTIME_DIR_NAME} (${ARCH}) at ${output}"
 }
 
+# Sum of the regular files under a directory: what the deployment-package budget
+# counts (the zip's unzipped size).
+payload_bytes() {
+    python3 - "$1" <<'PYEOF'
+import os
+import sys
+
+total = 0
+for dirpath, _dirnames, filenames in os.walk(sys.argv[1]):
+    for name in filenames:
+        path = os.path.join(dirpath, name)
+        if os.path.islink(path):
+            continue
+        try:
+            total += os.path.getsize(path)
+        except OSError:
+            pass
+print(total)
+PYEOF
+}
+
+# Precompile the interpreter's standard library to bytecode.
+#
+# Python parses and compiles every module it imports; shipping the .pyc files
+# moves that work out of the Lambda init path.
+#
+# Off by default, because it was measured and did not pay: on pypy311 x86_64
+# (n=12 cold starts each) the init time was 1693 ms without bytecode and 1713 ms
+# with it, while the payload grew from 90.3 MB to 106.5 MB — the interpreter's own
+# startup, not module compilation, dominates. It stays as an opt-in
+# (PRECOMPILE_BYTECODE=1) for a family where imports are the bottleneck, and any
+# runtime close to the 250 MB ceiling keeps its sources regardless.
+#
+# The payload's own interpreter must do the compiling: a host CPython writes
+# bytecode with a different magic number, which PyPy and GraalPy refuse to load.
+compile_bytecode() {
+    local root=$1
+    if [[ "${PRECOMPILE_BYTECODE:-0}" != "1" ]]; then
+        return 0
+    fi
+
+    local interpreter
+    interpreter=$(python3 - "${CONTAINER_ENTRYPOINT:-[]}" "${LAYER_ROOT}" <<'PYEOF'
+import json
+import sys
+
+entrypoint = json.loads(sys.argv[1] or "[]")
+layer_root = sys.argv[2].rstrip("/")
+first = entrypoint[0] if entrypoint else ""
+print(layer_root + first[len("/opt"):] if first.startswith("/opt/") else "")
+PYEOF
+)
+    if [[ -z "${interpreter}" || ! -x "${interpreter}" ]]; then
+        echo "::warning::no interpreter in the payload to precompile bytecode with; skipping" >&2
+        return 0
+    fi
+
+    local expected_machine
+    case "${ARCH}" in
+        x86_64) expected_machine="x86_64" ;;
+        arm64) expected_machine="aarch64" ;;
+        *) return 0 ;;
+    esac
+    if [[ "$(uname -m)" != "${expected_machine}" ]]; then
+        echo "::warning::host $(uname -m) cannot run the ${ARCH} interpreter; skipping bytecode precompilation" >&2
+        return 0
+    fi
+
+    local before after snapshot
+    before=$(payload_bytes "${root}")
+    snapshot=$(mktemp)
+    find "${root}" -type f -name '*.pyc' -print > "${snapshot}"
+
+    if ! "${interpreter}" -m compileall -b -q -f --invalidation-mode=unchecked-hash "${root}" >/dev/null 2>&1; then
+        echo "::warning::${runtime_id}: compileall could not compile every file (the sources stay in place)" >&2
+    fi
+
+    after=$(payload_bytes "${root}")
+    echo "bytecode: $(find "${root}" -type f -name '*.pyc' | wc -l) .pyc files, $(( (after - before) / 1024 )) KiB added"
+
+    if [[ "${LAYER_PUBLISHABLE}" == "true" && "${after}" -ge "${MAX_UNZIPPED_BYTES:-262144000}" ]]; then
+        local removed
+        removed=$(python3 - "${snapshot}" "${root}" <<'PYEOF'
+import os
+import sys
+
+keep = set(open(sys.argv[1], encoding="utf-8").read().splitlines())
+root = sys.argv[2]
+removed = 0
+for dirpath, _dirnames, filenames in os.walk(root):
+    for name in filenames:
+        if not name.endswith(".pyc"):
+            continue
+        path = os.path.join(dirpath, name)
+        if path not in keep:
+            os.unlink(path)
+            removed += 1
+print(removed)
+PYEOF
+)
+        echo "::warning::${runtime_id} would exceed ${MAX_UNZIPPED_BYTES} bytes with precompiled bytecode; removed ${removed} generated .pyc files" >&2
+    fi
+    rm -f "${snapshot}"
+}
+
 # Trim a payload to what the runtime actually needs at execution time.
 #
 # The 250 MB deployment-package ceiling is on *unzipped* bytes, and upstream
@@ -224,6 +333,10 @@ slim_layer() {
             find "${root}" -type d \( -name jmods -o -name man -o -name docs \) \
                 -prune -exec rm -rf {} + 2>/dev/null || true
             strip_debug_symbols "${root}"
+            # No locale data is pruned: these payloads ship none (glibc provides
+            # it), and the bundled zoneinfo is 52 KiB that timezone-aware code
+            # reads at run time.
+            compile_bytecode "${root}"
             ;;
         go-toolchain)
             # The compiler and stdlib *are* the payload here, so only what a build

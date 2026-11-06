@@ -90,6 +90,28 @@ runs:
       shell: bash
       run: timeout 600 bash tools/bin/local-invoke-container "${{ inputs.runtime }}" "${{ inputs.arch }}"
 
+    - name: Build the debug image
+      # The same payload on a base that carries a busybox shell, so a failing
+      # image can be inspected without shipping a shell in production. Families
+      # with a `build` profile have one image and no variant to build.
+      if: inputs.container == 'true'
+      shell: bash
+      env:
+        LAMBDA_RUNTIME_SUMMARY_DEFERRED: "1"
+      run: |
+        for variant in $(bash tools/bin/container-variants "${{ inputs.runtime }}" "${{ inputs.arch }}"); do
+          if [[ "${variant}" == "debug" ]]; then
+            timeout 900 bash tools/bin/build-container "${{ inputs.runtime }}" "${{ inputs.arch }}" --variant debug
+          fi
+        done
+
+    - name: Check the image variants
+      # Proves the claims rather than assuming them: the standard image has no
+      # shell at all, and the debug image is the same artifact plus one.
+      if: inputs.container == 'true'
+      shell: bash
+      run: bash tools/bin/check-container-variants "${{ inputs.runtime }}" "${{ inputs.arch }}"
+
     - name: Record the package size
       # Always: the summary states this cell's share of the 250 MB deployment
       # budget even when the package cache skipped the build.

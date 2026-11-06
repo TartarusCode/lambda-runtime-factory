@@ -22,12 +22,15 @@ source "$(dirname "$0")/_common.sh"
 
 push=0
 force=0
+variant=standard
 positional=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --push) push=1; shift ;;
         --force) force=1; shift ;;
         --no-cache) LAMBDA_CONTAINER_NO_CACHE=1; shift ;;
+        --variant) variant=$2; shift 2 ;;
+        --debug) variant=debug; shift ;;
         -*) echo "Unknown option: $1" >&2; exit 2 ;;
         *) positional+=("$1"); shift ;;
     esac
@@ -35,7 +38,7 @@ done
 
 runtime_id=$(common::require_runtime_id "${positional[0]:-}")
 arch=$(common::require_arch "${positional[1]:-}")
-common::load_runtime_env "${runtime_id}" "${arch}"
+common::load_runtime_env "${runtime_id}" "${arch}" "${variant}"
 
 if [[ "${CONTAINER_ENABLED}" != "true" ]]; then
     echo "${runtime_id} (${arch}) has no container target (container.enabled=false)" >&2
@@ -50,14 +53,14 @@ if [[ ! -d "${LAYER_ROOT}" || -z "$(ls -A "${LAYER_ROOT}" 2>/dev/null)" ]]; then
         mkdir -p "${LAYER_ROOT}"
         unzip -qo "${PACKAGE_PATH}" -d "${LAYER_ROOT}"
     else
-        common::ensure_runtime_built "${runtime_id}" "${arch}"
-        common::load_runtime_env "${runtime_id}" "${arch}"
+        common::ensure_runtime_built "${runtime_id}" "${arch}" "${variant}"
+        common::load_runtime_env "${runtime_id}" "${arch}" "${variant}"
     fi
 fi
 
 image="${CONTAINER_LOCAL_IMAGE}"
 
-prepare_args=(prepare --runtime "${runtime_id}" --arch "${arch}")
+prepare_args=(prepare --runtime "${runtime_id}" --arch "${arch}" --variant "${variant}")
 if (( force )); then
     prepare_args+=(--force)
 fi
@@ -65,7 +68,7 @@ spec=$(python3 "$(common::repo_root)/tools/runtime_lib/container_image.py" "${pr
 context_dir=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["context_dir"])' <<<"${spec}")
 packages=$(python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["packages"]))' <<<"${spec}")
 
-echo "Building ${image} for ${CONTAINER_PLATFORM} (base ${CONTAINER_BASE_IMAGE}, profile ${CONTAINER_PROFILE})"
+echo "Building ${image} for ${CONTAINER_PLATFORM} (base ${CONTAINER_BASE_IMAGE}, profile ${CONTAINER_PROFILE}, variant ${CONTAINER_VARIANT})"
 if [[ "${CONTAINER_PROFILE}" == "build" ]]; then
     echo "Installing the build environment's packages: ${packages:-none}"
 elif [[ -n "${packages}" ]]; then
@@ -97,7 +100,7 @@ verify_json=$(python3 "$(common::repo_root)/tools/runtime_lib/container_image.py
 unpacked_bytes=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["unpacked_bytes"])' <<<"${verify_json}")
 container_image_bytes=$(python3 "$(common::repo_root)/tools/runtime_lib/container_image.py" \
     record-size --runtime "${runtime_id}" --arch "${arch}" --image "${image}" \
-    --unpacked-bytes "${unpacked_bytes}" \
+    --unpacked-bytes "${unpacked_bytes}" --variant "${variant}" \
     | awk '{ print $(NF-1) }')
 
 echo "${runtime_id} (${arch}): image ${image} holds ${container_image_bytes} bytes unpacked (summed from the exported rootfs)"
