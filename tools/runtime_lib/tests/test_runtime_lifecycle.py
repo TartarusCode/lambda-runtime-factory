@@ -1690,6 +1690,23 @@ def test_the_release_publishes_to_ecr_public_and_writes_a_soci_index() -> None:
     assert "SOCI_VERSION" in step["env"], "the soci CLI must be pinned"
 
 
+def test_soci_publishing_is_opt_in_because_it_needs_containerd() -> None:
+    """`soci create` and `soci push` resolve the image through containerd's image
+    service; --content-store only moves the blobs. A hosted runner has no
+    containerd that holds these images, so the job has to be asked for explicitly
+    rather than turning every release red on its last step."""
+    soci = _workflow("release-runtime.yml")["jobs"]["publish-soci"]
+    assert "inputs.publish_soci" in soci["if"], soci["if"]
+
+    inputs = _triggers("release-runtime.yml")["workflow_dispatch"]["inputs"]
+    assert inputs["publish_soci"]["default"] is False
+
+    script = (_REPO_ROOT / "tools" / "bin" / "publish-soci-index").read_text(encoding="utf-8")
+    assert "containerd" in script and "images import" in script, (
+        "the script has to tell a runner what SOCI needs, instead of failing at the socket"
+    )
+
+
 def test_every_runtime_publishes_to_the_primary_registry_and_ecr_public() -> None:
     for runtime_id in runtime_manifest.list_active_runtime_ids():
         env = runtime_manifest.runtime_env(runtime_id, "x86_64")

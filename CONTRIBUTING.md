@@ -228,9 +228,20 @@ image, `debug` for the debug one — once per registry. A dispatch that targeted
 leaves the per-arch tags alone with a notice instead of failing.
 
 SOCI indexes are generated after the merge, by `publish-soci-index`, for ECR registries only:
-Lambda reads them from ECR and uses them to start an image lazily instead of downloading every
-layer first. The `soci` CLI is pinned (`SOCI_VERSION`) and runs with `--content-store soci`, so
-it does not need a containerd daemon.
+Lambda reads them from ECR and starts an image lazily instead of downloading every layer first.
+The CLI is pinned (`SOCI_VERSION`, v0.16.1).
+
+It is **opt-in** (`publish_soci: true` on a dispatch), because the soci CLI is not
+containerd-free: `create` resolves the image through containerd's image service and `push` reads
+it through the same client, so `--content-store soci` only relocates the blobs. Measured against
+v0.16.1: it dials `/run/containerd/containerd.sock` and fails with `permission denied` even with
+that flag set. Publishing an index therefore needs a containerd that is reachable (under `sudo`
+on a hosted runner, where the socket is root-owned) and that already holds the image —
+`docker save <image> | sudo ctr -n default images import -`. `publish-soci-index` prints exactly
+those steps when the prerequisite is missing, rather than leaving the socket error to speak for
+itself. `soci convert --standalone` is the containerd-free alternative, but it reads and writes
+OCI layouts and does not publish the referrer; pushing that would need oras or crane, which the
+release does not do yet.
 
 ```dockerfile
 # A runtime image is a Lambda container image: entrypoint = runtime, CMD = handler.

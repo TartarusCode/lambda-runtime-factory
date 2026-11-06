@@ -32,6 +32,11 @@ on:
         required: true
         default: false
         type: boolean
+      publish_soci:
+        description: "Publish SOCI indexes (needs a containerd that holds the image; see CONTRIBUTING)"
+        required: true
+        default: false
+        type: boolean
   push:
     tags:
       - "release-*"
@@ -397,7 +402,13 @@ jobs:
     needs:
       - prepare-matrix
       - merge-containers
-    if: ${{ always() && needs.merge-containers.result == 'success' && github.event.inputs.dry_run != 'true' }}
+    # Opt-in, because the soci CLI resolves the image through containerd's image
+    # service: `--content-store soci` only moves the blobs, and `create`/`push`
+    # both dial containerd. A hosted runner builds with Docker and has no
+    # containerd that knows these images, so a default release would go red on its
+    # last step. `publish-soci-index` says exactly what a runner needs when the
+    # prerequisite is missing.
+    if: ${{ always() && needs.merge-containers.result == 'success' && inputs.publish_soci && github.event.inputs.dry_run != 'true' }}
     environment: release
     runs-on: ubuntu-26.04
     timeout-minutes: 20
