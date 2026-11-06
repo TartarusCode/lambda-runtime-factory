@@ -1,0 +1,45 @@
+#!/bin/bash
+# Scan a runtime's distroless image with Grype.
+#
+# The payload scan (audit-runtime) covers the runtime bytes; this covers the
+# image as it ships — base OS packages included — so a CVE in the image's glibc or
+# OpenSSL cannot slip through just because the payload is clean. Same policy as
+# the payload scan: high and above, fixed only.
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+
+best_effort=0
+if [[ "${1:-}" == "--best-effort" ]]; then
+    best_effort=1
+    shift
+fi
+
+runtime_id=$(common::require_runtime_id "${1:-}")
+arch=$(common::require_arch "${2:-}")
+common::load_runtime_env "${runtime_id}" "${arch}"
+
+if ! docker image inspect "${CONTAINER_LOCAL_IMAGE}" >/dev/null 2>&1; then
+    bash "$(common::repo_root)/tools/bin/build-container" "${runtime_id}" "${arch}"
+    common::load_runtime_env "${runtime_id}" "${arch}"
+fi
+
+grype_config="${RUNTIME_DIR}/.grype.yaml"
+grype_config_args=()
+if [[ -f "${grype_config}" ]]; then
+    grype_config_args=(-c "${grype_config}")
+fi
+
+if type -P grype >/dev/null; then
+    grype "${grype_config_args[@]}" -q --fail-on high --only-fixed "docker:${CONTAINER_LOCAL_IMAGE}"
+    exit 0
+fi
+
+message="Install grype to perform container vulnerability scanning: https://github.com/anchore/grype#installation"
+if (( best_effort )); then
+    echo "${message}" >&2
+    exit 0
+fi
+
+echo "${message}" >&2
+exit 1

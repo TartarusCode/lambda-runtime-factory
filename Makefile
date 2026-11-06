@@ -9,7 +9,7 @@ DEV_BUILD_ENV := BUILD_BEST_EFFORT_AUDIT=0
 
 all: validate-runtimes build
 
-.PHONY: all list-runtimes validate-runtimes check build build-all build-all-arches audit audit-all upload upload-all publish publish-all publicize publicize-all latest latest-all unpublish create-buckets local-build local-invoke clean shell check-updates bump bump-latest roll-off test
+.PHONY: all list-runtimes validate-runtimes check build build-all build-all-arches audit audit-all upload upload-all publish publish-all publicize publicize-all latest latest-all unpublish create-buckets local-build local-invoke clean shell check-updates bump bump-latest roll-off test container container-invoke container-audit container-push
 
 list-runtimes:
 	python3 tools/runtime_lib/runtime_manifest.py list
@@ -89,6 +89,18 @@ local-build:
 
 local-invoke:
 	$(LOCAL_AWS_ENV) $(DEV_BUILD_ENV) bash tools/bin/local-invoke-runtime "$(RUNTIME)" "$(ARCH)"
+
+container: validate-runtimes
+	$(DEV_BUILD_ENV) bash tools/bin/build-container "$(RUNTIME)" "$(ARCH)"
+
+container-audit:
+	bash tools/bin/audit-container "$(RUNTIME)" "$(ARCH)"
+
+container-invoke:
+	bash tools/bin/local-invoke-container "$(RUNTIME)" "$(ARCH)"
+
+container-push:
+	bash tools/bin/push-container "$(RUNTIME)" "$(ARCH)"
 
 check-updates:
 	bash tools/bin/bump-runtime check

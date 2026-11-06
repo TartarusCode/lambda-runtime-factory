@@ -79,7 +79,7 @@ runs:
       uses: actions/cache@v6
       with:
         path: ${{ runner.temp }}/lambda-runtime-monorepo/${{ inputs.runtime }}/${{ inputs.arch }}/artifacts
-        key: package-${{ runner.os }}-${{ inputs.runtime }}-${{ inputs.arch }}-${{ hashFiles(format('runtimes/{0}/runtime.json', inputs.runtime), format('runtimes/{0}/checksums/**', inputs.runtime), format('runtimes/{0}/bootstrap/**', inputs.runtime), format('runtimes/{0}/helpers/**', inputs.runtime), 'tools/bin/build-runtime', 'tools/bin/_common.sh', 'tools/runtime_lib/runtime_manifest.py') }}
+        key: package-${{ runner.os }}-${{ inputs.runtime }}-${{ inputs.arch }}-${{ hashFiles(format('runtimes/{0}/runtime.json', inputs.runtime), format('runtimes/{0}/checksums/**', inputs.runtime), format('runtimes/{0}/bootstrap/**', inputs.runtime), format('runtimes/{0}/helpers/**', inputs.runtime), 'tools/bin/build-runtime', 'tools/bin/_common.sh', 'tools/launcher/**', 'tools/runtime_lib/runtime_manifest.py') }}
 
     - name: Decide whether to audit
       id: decide

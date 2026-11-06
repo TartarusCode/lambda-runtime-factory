@@ -30,6 +30,236 @@ verify_sha256() {
     fi
 }
 
+strip_debug_symbols() {
+    local root=$1
+    # Symbols are not needed to execute anything, and upstream ships plenty of
+    # them. Only real ELF objects are touched: strip would refuse a text file, and
+    # on a host whose architecture differs from the target it refuses too — both
+    # are logged and skipped rather than failing the build.
+    python3 - "${root}" <<'PYEOF'
+import os
+import subprocess
+import sys
+
+root = sys.argv[1]
+stripped = skipped = failed = saved = 0
+for dirpath, _dirnames, filenames in os.walk(root):
+    for name in filenames:
+        if ".so" not in name:
+            continue
+        path = os.path.join(dirpath, name)
+        try:
+            with open(path, "rb") as handle:
+                if handle.read(4) != b"\x7fELF":
+                    skipped += 1
+                    continue
+            before = os.path.getsize(path)
+            result = subprocess.run(
+                ["strip", "--strip-unneeded", path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            skipped += 1
+            continue
+        if result.returncode == 0:
+            stripped += 1
+            saved += max(0, before - os.path.getsize(path))
+        else:
+            failed += 1
+print(
+    f"strip: {stripped} ELF objects stripped ({saved} bytes saved), "
+    f"{skipped} non-ELF skipped, {failed} refused (cross-arch or already stripped)"
+)
+PYEOF
+}
+
+strip_elf_files() {
+    # Like strip_debug_symbols, but for known-binary directories (a Go or Rust bin
+    # tree) where the names carry no ".so" to filter on.
+    local dir
+    for dir in "$@"; do
+        [[ -d "${dir}" ]] || continue
+        python3 - "${dir}" <<'PYEOF'
+import os
+import subprocess
+import sys
+
+root = sys.argv[1]
+stripped = skipped = failed = saved = 0
+for dirpath, _dirnames, filenames in os.walk(root):
+    for name in filenames:
+        path = os.path.join(dirpath, name)
+        if os.path.islink(path):
+            continue
+        try:
+            with open(path, "rb") as handle:
+                if handle.read(4) != b"\x7fELF":
+                    skipped += 1
+                    continue
+            before = os.path.getsize(path)
+            result = subprocess.run(
+                ["strip", "--strip-unneeded", path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            skipped += 1
+            continue
+        if result.returncode == 0:
+            stripped += 1
+            saved += max(0, before - os.path.getsize(path))
+        else:
+            failed += 1
+print(f"strip {root}: {stripped} ELF objects stripped ({saved} bytes saved), "
+      f"{skipped} non-ELF skipped, {failed} refused")
+PYEOF
+    done
+}
+
+# Replace the shell bootstrap with a statically linked launcher for the families
+# whose bootstrap is a `#!/bin/sh` exec wrapper.
+#
+# A distroless image has no /bin/sh, so the wrapper can only work on
+# provided.al2023. The launcher is the same exec without a shell, and it works in
+# both places. It is compiled per target arch; when the build host is a different
+# architecture (a local arm64 build on an x86 host) the script stays in place and
+# the build warns, because the resulting image could not run it anyway.
+install_native_bootstrap() {
+    case "${RUNTIME_FAMILY}" in
+        go-toolchain | rust-musl) ;;
+        *) return 0 ;;
+    esac
+
+    local launcher_src="${REPO_ROOT}/tools/launcher/bootstrap.c"
+    if [[ ! -f "${launcher_src}" ]]; then
+        echo "::warning::missing launcher source ${launcher_src}; keeping the shell bootstrap" >&2
+        return 0
+    fi
+
+    local expected_machine
+    case "${ARCH}" in
+        x86_64) expected_machine="x86_64" ;;
+        arm64) expected_machine="aarch64" ;;
+        *) echo "::warning::unknown arch ${ARCH}; keeping the shell bootstrap" >&2; return 0 ;;
+    esac
+
+    if [[ "$(uname -m)" != "${expected_machine}" ]]; then
+        echo "::warning::host $(uname -m) cannot link a ${ARCH} launcher; keeping the shell bootstrap for this cross-arch build" >&2
+        return 0
+    fi
+    if ! type -P cc >/dev/null; then
+        echo "::warning::no C compiler; keeping the shell bootstrap" >&2
+        return 0
+    fi
+
+    local output="${LAYER_ROOT}/${BOOTSTRAP_OUTPUT}"
+    local tmp_output="${output}.compiled"
+    if ! cc -O2 -static -s \
+        -DRUNTIME_DIR_NAME="\"${RUNTIME_DIR_NAME}\"" \
+        -o "${tmp_output}" "${launcher_src}"; then
+        rm -f "${tmp_output}"
+        echo "::warning::could not compile the native bootstrap; keeping the shell bootstrap" >&2
+        return 0
+    fi
+
+    if [[ "$(head -c 4 "${tmp_output}")" != $'\x7fELF' ]]; then
+        rm -f "${tmp_output}"
+        echo "::warning::compiled bootstrap is not an ELF binary; keeping the shell bootstrap" >&2
+        return 0
+    fi
+
+    mv "${tmp_output}" "${output}"
+    chmod +x "${output}"
+    echo "Installed the native bootstrap for ${RUNTIME_DIR_NAME} (${ARCH}) at ${output}"
+}
+
+# Trim a payload to what the runtime actually needs at execution time.
+#
+# The 250 MB deployment-package ceiling is on *unzipped* bytes, and upstream
+# distributions ship stdlib test suites, GUI toolkits, headers, static archives
+# and build-time-only components that a Lambda function never loads.
+#
+# Rule: prune, never rewrite. Package metadata that vulnerability scanning uses to
+# identify a component — `*.dist-info`, `*.egg-info`, `*.json` manifests, license
+# and version files — is never removed here, and the audit runs *after* this so it
+# scans exactly what ships. Set SLIM_LAYER=0 to package the upstream payload as
+# extracted, which is how the byte counts before and after are compared.
+slim_layer() {
+    if [[ "${SLIM_LAYER:-1}" != "1" ]]; then
+        echo "Slimming disabled (SLIM_LAYER=${SLIM_LAYER:-1}): packaging the upstream payload as extracted."
+        return 0
+    fi
+
+    local root="${LAYER_ROOT}/${RUNTIME_DIR_NAME}"
+    if [[ ! -d "${root}" ]]; then
+        return 0
+    fi
+
+    case "${RUNTIME_FAMILY}" in
+        portable-pypy | graalpy)
+            # Stdlib test suites, GUI toolkits and demos: the largest single win,
+            # and nothing a function imports.
+            find "${root}" -type d \
+                \( -name test -o -name tests -o -name idle_test -o -name tkinter \
+                   -o -name turtledemo -o -name ensurepip -o -name idlelib \
+                   -o -name lib2to3 -o -name pydoc_data \) \
+                -prune -exec rm -rf {} + 2>/dev/null || true
+            # The compiled GUI module is the only thing that linked X11, Xft,
+            # fontconfig and freetype; removing the package directory alone leaves
+            # those shared libraries in the payload.
+            find "${root}" -type f -name '_tkinter*.so' -delete 2>/dev/null || true
+            find "${root}" -type d -name '_tkinter' -prune -exec rm -rf {} + 2>/dev/null || true
+            # Portable PyPy bundles Tcl/Tk, and libtk is what pulled X11 and
+            # fontconfig into an otherwise headless interpreter.
+            find "${root}" \( -name 'libtcl*.so*' -o -name 'libtk*.so*' \) -delete 2>/dev/null || true
+            # C headers, pkg-config files and static archives: the interpreter is
+            # already built. `.debug` files are external symbol scripts, not code.
+            find "${root}" -type f \( -name '*.a' -o -name '*.la' -o -name '*.debug' \) \
+                -delete 2>/dev/null || true
+            find "${root}" -type d \( -name include -o -name pkgconfig \) \
+                -prune -exec rm -rf {} + 2>/dev/null || true
+            # Documentation and build-time-only JVM components. License files stay:
+            # this is a redistribution.
+            find "${root}" -type d \( -name jmods -o -name man -o -name docs \) \
+                -prune -exec rm -rf {} + 2>/dev/null || true
+            strip_debug_symbols "${root}"
+            ;;
+        go-toolchain)
+            # The compiler and stdlib *are* the payload here, so only what a build
+            # never reads is dropped: the top-level documentation and tooling
+            # directories, the compiler test suite, test sources and `testdata`
+            # fixtures.
+            #
+            # The pruning is depth-limited on purpose. `doc`, `api`, `misc` and
+            # `obj` are *also* real package directories deeper in the tree
+            # (`src/go/doc` is the stdlib `go/doc` package, `src/cmd/internal/obj`
+            # is imported by the compiler), and `go build` compiles the standard
+            # library from source, so removing them at any depth would break
+            # builds of programs that import them.
+            find "${root}" -maxdepth 1 -type d \
+                \( -name doc -o -name test -o -name api -o -name misc -o -name obj \) \
+                -prune -exec rm -rf {} + 2>/dev/null || true
+            # `testdata` is never an importable package: it is the fixtures a
+            # package's own tests read.
+            find "${root}" -type d -name testdata -prune -exec rm -rf {} + 2>/dev/null || true
+            find "${root}" -type f -name '*_test.go' -delete 2>/dev/null || true
+            strip_elf_files "${root}/bin" "${root}/pkg/tool"
+            ;;
+        rust-musl)
+            # Rust ships documentation, man pages and per-component metadata for
+            # every target it supports; none of it is needed to run rustc.
+            find "${root}" -type d \( -name rust-docs -o -name etc -o -name doc -o -name man \) \
+                -prune -exec rm -rf {} + 2>/dev/null || true
+            strip_debug_symbols "${root}"
+            strip_elf_files "${root}/bin"
+            ;;
+        *)
+            echo "No slimming rules for family '${RUNTIME_FAMILY}': packaging as extracted."
+            ;;
+    esac
+}
+
 rm -rf "${BUILD_DIR}"
 mkdir -p "${LAYER_ROOT}" "${DOWNLOADS_DIR}" "${ARTIFACT_DIR}" "${WORK_DIR}"
 
@@ -89,14 +319,52 @@ fi
 mkdir -p "${LAYER_ROOT}/${HELPER_INSTALL_DIR}"
 cp -R "${HELPER_SOURCE}" "${LAYER_ROOT}/${HELPER_INSTALL_DIR}/"
 
+# Go and Rust bootstrap through `exec` in a shell today; replace that with a
+# compiled launcher so the same payload runs on a shell-less distroless base.
+install_native_bootstrap
+
+# Before the audit and the zip, so both see exactly what ships.
+slim_layer
+
 if [[ "${BUILD_BEST_EFFORT_AUDIT:-1}" == "1" ]]; then
     RUNTIME_BUILD_IN_PROGRESS=1 bash "$(common::repo_root)/tools/bin/audit-runtime" --best-effort "${runtime_id}"
 fi
 
 (
     cd "${LAYER_ROOT}"
-    zip -qr "${PACKAGE_PATH}" .
+    # Deterministic package. The SHA-256 of this zip is both the S3 object key and
+    # the layer-reuse key (Content.CodeSha256), so identical inputs must produce
+    # identical bytes. zip records every entry's mtime and, without -X, the uid/gid
+    # it was written with — and cp/cp -R stamp their copies with "now" — so pin the
+    # mtimes to the zip epoch in UTC and drop the ownership extras.
+    TZ=UTC find . -exec touch -h -t 198001010000.00 {} +
+    TZ=UTC zip -qrX "${PACKAGE_PATH}" .
 )
+
+# --- size accounting and the deployment-package gate ----------------------------
+#
+# AWS caps a deployment package at 250 MB *unzipped*, counting the function and
+# all of its layers together. Discovering that at PublishLayerVersion costs a
+# release run, so package_size.py measures the package, writes build-stats.json
+# next to the artifact and fails here for anything that claims to be publishable.
+python3 "${REPO_ROOT}/tools/runtime_lib/package_size.py" check \
+    --runtime "${runtime_id}" \
+    --arch "${arch}" \
+    --package "${PACKAGE_PATH}" \
+    --stats-out "${ARTIFACT_DIR}/build-stats.json" \
+    --publishable "${LAYER_PUBLISHABLE:-true}" \
+    --max-unzipped-bytes "${MAX_UNZIPPED_BYTES:-262144000}" \
+    --warn-unzipped-bytes "${WARN_UNZIPPED_BYTES:-209715200}"
+
+# The row belongs in the job summary. The composite action defers it so the
+# container image size can be added after the image is built; a standalone build
+# writes it immediately.
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" && "${LAMBDA_RUNTIME_SUMMARY_DEFERRED:-0}" != "1" ]]; then
+    python3 "${REPO_ROOT}/tools/runtime_lib/package_size.py" summary \
+        --runtime "${runtime_id}" \
+        --arch "${arch}" \
+        --summary-file "${GITHUB_STEP_SUMMARY}"
+fi
 
 if [[ -n "${EXPORT_ARTIFACT_DIR}" ]]; then
     mkdir -p "${EXPORT_ARTIFACT_DIR}/${RUNTIME_ID}"

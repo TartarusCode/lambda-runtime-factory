@@ -1,0 +1,111 @@
+#!/bin/bash
+# Build the OCI image for one runtime and architecture.
+#
+# The image is generated from the same ${LAYER_ROOT} the zip layer ships, so the
+# two artifacts cannot drift. The manifest's container.profile picks the shape:
+#
+#   distroless  a runtime base. Everything that needs a shell (staging the
+#               payload, resolving its non-glibc shared libraries, installing
+#               them from Debian 12) happens in a builder stage; the final stage
+#               only gets COPY, ENV, WORKDIR, USER and an exec-form ENTRYPOINT.
+#   build       a build environment for a toolchain. Single stage, with a shell
+#               and a package manager, because a consumer's `RUN go build` needs
+#               both.
+#
+#   build-container <runtime_id> <arch> [--push] [--force] [--tag <tag>]
+#
+# --push publishes <registry>/<runtime>:<version>-<arch>; the release pipeline
+# merges the two per-arch manifests into one multi-arch tag afterwards.
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+
+push=0
+force=0
+positional=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --push) push=1; shift ;;
+        --force) force=1; shift ;;
+        --no-cache) LAMBDA_CONTAINER_NO_CACHE=1; shift ;;
+        -*) echo "Unknown option: $1" >&2; exit 2 ;;
+        *) positional+=("$1"); shift ;;
+    esac
+done
+
+runtime_id=$(common::require_runtime_id "${positional[0]:-}")
+arch=$(common::require_arch "${positional[1]:-}")
+common::load_runtime_env "${runtime_id}" "${arch}"
+
+if [[ "${CONTAINER_ENABLED}" != "true" ]]; then
+    echo "${runtime_id} (${arch}) has no container target (container.enabled=false)" >&2
+    exit 1
+fi
+
+# A package cache hit restores artifacts/ but not the unpacked payload. Rebuild
+# the payload from the zip the cache restored instead of re-downloading upstream.
+if [[ ! -d "${LAYER_ROOT}" || -z "$(ls -A "${LAYER_ROOT}" 2>/dev/null)" ]]; then
+    if [[ -f "${PACKAGE_PATH}" ]]; then
+        echo "Unpacking the cached package into ${LAYER_ROOT}"
+        mkdir -p "${LAYER_ROOT}"
+        unzip -qo "${PACKAGE_PATH}" -d "${LAYER_ROOT}"
+    else
+        common::ensure_runtime_built "${runtime_id}" "${arch}"
+        common::load_runtime_env "${runtime_id}" "${arch}"
+    fi
+fi
+
+image="${CONTAINER_LOCAL_IMAGE}"
+
+prepare_args=(prepare --runtime "${runtime_id}" --arch "${arch}")
+if (( force )); then
+    prepare_args+=(--force)
+fi
+spec=$(python3 "$(common::repo_root)/tools/runtime_lib/container_image.py" "${prepare_args[@]}")
+context_dir=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["context_dir"])' <<<"${spec}")
+packages=$(python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["packages"]))' <<<"${spec}")
+
+echo "Building ${image} for ${CONTAINER_PLATFORM} (base ${CONTAINER_BASE_IMAGE}, profile ${CONTAINER_PROFILE})"
+if [[ "${CONTAINER_PROFILE}" == "build" ]]; then
+    echo "Installing the build environment's packages: ${packages:-none}"
+elif [[ -n "${packages}" ]]; then
+    echo "Staging runtime libraries from Debian 12: ${packages}"
+else
+    echo "The distroless base already provides every shared library the payload needs."
+fi
+
+build_args=(
+    buildx build
+    --platform "${CONTAINER_PLATFORM}"
+    --file "${context_dir}/Dockerfile"
+    --build-arg "BASE_IMAGE=${CONTAINER_BASE_IMAGE}"
+    --label "org.opencontainers.image.revision=${GITHUB_SHA:-$(git -C "$(common::repo_root)" rev-parse HEAD 2>/dev/null || echo unknown)}"
+    --tag "${image}"
+    --load
+)
+if [[ "${LAMBDA_CONTAINER_NO_CACHE:-0}" == "1" ]]; then
+    build_args+=(--no-cache)
+fi
+
+docker "${build_args[@]}" "${context_dir}"
+
+python3 "$(common::repo_root)/tools/runtime_lib/container_image.py" verify --image "${image}" >/dev/null
+container_image_bytes=$(python3 "$(common::repo_root)/tools/runtime_lib/container_image.py" \
+    record-size --runtime "${runtime_id}" --arch "${arch}" --image "${image}" \
+    | awk '{ print $(NF-1) }')
+
+echo "${runtime_id} (${arch}): image ${image} is ${container_image_bytes} bytes uncompressed"
+if (( push )); then
+    bash "$(dirname "$0")/push-container" "${runtime_id}" "${arch}"
+fi
+
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" && "${LAMBDA_RUNTIME_SUMMARY_DEFERRED:-0}" != "1" ]]; then
+    {
+        echo "### Container image: ${runtime_id} (${arch})"
+        echo
+        echo "- \`${CONTAINER_IMAGE}:${CONTAINER_TAG}-${ARCH}\`"
+        echo "- base: \`${CONTAINER_BASE_IMAGE}\`"
+        echo "- uncompressed size: $(( container_image_bytes / 1048576 )) MB"
+        echo
+    } >> "${GITHUB_STEP_SUMMARY}"
+fi
