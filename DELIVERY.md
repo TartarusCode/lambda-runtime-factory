@@ -79,7 +79,10 @@ Beyond the two artifact shapes, every runtime publishes a **debug variant** and,
 - The images go to GHCR **and** Amazon ECR Public. A Lambda function cannot pull from GHCR at
   execution time, so ECR Public is the copy that matters inside AWS.
 - The SOCI index is generated after the multi-arch tag exists, for ECR only: Lambda uses it to
-  start an image lazily, which takes image size out of the cold-start path.
+  start an image lazily, which takes image size out of the cold-start path. It is opt-in
+  (`publish_soci: true`), because the soci CLI resolves images through containerd's image
+  service and a runner with only Docker cannot supply that — `CONTRIBUTING.md` has the exact
+  prerequisite.
 
 ## What the bytecode experiment showed (and why it is off)
 

@@ -53,9 +53,36 @@ if [[ ! -x "${soci}" ]]; then
     rm -rf "${tmp}"
 fi
 
-# The self-contained content store keeps this independent of a containerd
-# daemon: the release runners run Docker, not containerd-with-soci-snapshotter.
+# The self-contained content store keeps blobs out of containerd, but it does not
+# make the CLI containerd-free: `create` and `push` both resolve the image through
+# containerd's image service (`internal.NewClient` -> `containerd.New(address)`),
+# so a containerd that knows this image has to be reachable. Verified against
+# v0.16.1: it dials /run/containerd/containerd.sock and fails with "permission
+# denied" even with `--content-store soci`.
 soci_store_args=(--content-store soci --root "${store_root}")
+: "${CONTAINERD_ADDRESS:=/run/containerd/containerd.sock}"
+: "${CONTAINERD_NAMESPACE:=default}"
+
+containerd_help() {
+    cat >&2 <<EOF
+soci needs a containerd image service, not just a registry: \`create\` looks the
+image up with containerd's ImageService and \`push\` reads it from the same client,
+so --content-store only moves the blobs.
+
+To run this:
+  1. have containerd reachable at ${CONTAINERD_ADDRESS} (with access to the
+     socket — on hosted runners it is root-owned, so run soci under sudo),
+  2. import the image into that containerd, e.g.
+     docker save ${CONTAINER_IMAGE}:${CONTAINER_TAG}${CONTAINER_TAG_SUFFIX} \
+       | sudo ctr --address ${CONTAINERD_ADDRESS} -n ${CONTAINERD_NAMESPACE} images import - ,
+  3. re-run this script.
+
+\`soci convert --standalone\` avoids containerd entirely, but it reads and writes
+OCI layouts: it produces the index locally and does not publish the referrer, so
+it needs something like oras or crane to push. Nothing in the release does that
+yet — see CONTRIBUTING.md.
+EOF
+}
 
 # `soci push` needs registry credentials. Rather than putting a token in the
 # workflow, mint one from the AWS role the job already assumed: ECR Public
@@ -94,15 +121,25 @@ for registry in "${registries[@]}"; do
     echo "soci create --all-platforms ${reference}"
     # --all-platforms makes one index for the manifest list rather than for the
     # platform this runner happens to be.
-    "${soci}" create "${soci_store_args[@]}" --all-platforms "${reference}"
+    if ! create_output=$("${soci}" --address "${CONTAINERD_ADDRESS}" --namespace "${CONTAINERD_NAMESPACE}" \
+        create "${soci_store_args[@]}" --all-platforms "${reference}" 2>&1); then
+        printf '%s\n' "${create_output}" >&2
+        if grep -qiE 'containerd.sock|connection error|permission denied|no such file' <<<"${create_output}"; then
+            containerd_help
+        fi
+        exit 1
+    fi
+    printf '%s\n' "${create_output}"
 
     if (( push )); then
         if [[ -n "${SOCI_USER:-}" ]]; then
             echo "soci push --user ${SOCI_USER} ${reference}"
-            "${soci}" push "${soci_store_args[@]}" --user "${SOCI_USER}:${SOCI_PASSWORD:-}" "${reference}"
+            "${soci}" --address "${CONTAINERD_ADDRESS}" --namespace "${CONTAINERD_NAMESPACE}" \
+                push "${soci_store_args[@]}" --user "${SOCI_USER}:${SOCI_PASSWORD:-}" "${reference}"
         else
             echo "soci push ${reference}"
-            "${soci}" push "${soci_store_args[@]}" "${reference}"
+            "${soci}" --address "${CONTAINERD_ADDRESS}" --namespace "${CONTAINERD_NAMESPACE}" \
+                push "${soci_store_args[@]}" "${reference}"
         fi
         job_summary "${reference}"
     else
