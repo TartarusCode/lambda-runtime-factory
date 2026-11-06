@@ -1757,6 +1757,44 @@ def test_the_ecr_alias_can_be_pointed_at_the_live_one(monkeypatch) -> None:
         runtime_manifest.runtime_env("go126", "x86_64")
 
 
+def test_a_repository_creation_failure_names_the_permission_it_needs(tmp_path) -> None:
+    """Swallowing the AWS error turns a missing IAM action into a 403 from the first
+    blob upload minutes later, with nothing in the log to explain it."""
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    aws = stub / "aws"
+    aws.write_text(
+        "#!/bin/bash\n"
+        "case \"$*\" in\n"
+        "  *describe-registries*) echo '{\"registries\":[{\"aliases\":[\"tartaruscode\"]}]}' ;;\n"
+        "  *describe-repositories*) exit 255 ;;\n"
+        "  *create-repository*) echo 'An error occurred (AccessDeniedException) when calling "
+        "the CreateRepository operation: not authorized' >&2; exit 255 ;;\n"
+        "  *) exit 0 ;;\n"
+        "esac\n",
+        encoding="utf-8",
+    )
+    aws.chmod(0o755)
+
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in ("CONTAINER_REGISTRIES_OVERRIDE", "ECR_PUBLIC_ALIAS")
+    }
+    environment["PATH"] = f"{stub}:{environment.get('PATH', '')}"
+
+    result = subprocess.run(
+        ["bash", str(_REPO_ROOT / "tools" / "bin" / "ensure-container-repos"), "pypy311"],
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode != 0, result.stdout
+    assert "AccessDeniedException" in result.stderr, result.stderr
+    assert "ecr-public:CreateRepository" in result.stderr
+
+
 def test_every_runtime_publishes_to_the_primary_registry_and_ecr_public(monkeypatch) -> None:
     # The tests must not depend on the caller's shell: ECR_PUBLIC_ALIAS rewrites
     # the alias the release publishes under, and CI sets it.

@@ -79,10 +79,14 @@ print(" ".join(json.loads(sys.stdin.read())["registries"][0].get("aliases") or [
 
             if aws ecr-public describe-repositories --repository-names "${repo}" >/dev/null 2>&1; then
                 echo "public.ecr.aws/${alias}/${repo} exists"
-            elif aws ecr-public create-repository --repository-name "${repo}" >/dev/null 2>&1; then
+            elif create_output=$(aws ecr-public create-repository --repository-name "${repo}" 2>&1); then
                 echo "Created public.ecr.aws/${alias}/${repo}"
             else
-                echo "::warning::could not create public.ecr.aws/${alias}/${repo}; the push will report the real reason" >&2
+                # Swallowing this turns a permission problem into a 403 from the
+                # first blob upload, three minutes later, with no cause in the log.
+                printf '%s\n' "${create_output}" >&2
+                echo "::error::could not create public.ecr.aws/${alias}/${repo} (repository name ${repo}). The role needs ecr-public:CreateRepository and ecr-public:DescribeRepositories on *, and the push actions (BatchCheckLayerAvailability, InitiateLayerUpload, UploadLayerPart, CompleteLayerUpload, PutImage) on arn:aws:ecr-public::<account>:repository/${prefix:-<prefix>}*." >&2
+                exit 1
             fi
             ;;
         *.dkr.ecr.*)
