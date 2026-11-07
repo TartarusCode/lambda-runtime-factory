@@ -39,38 +39,38 @@ REPO_DEFAULTS: Dict[str, Any] = {
         "function_logical_id": "HelloFunction",
         "handler": "hello.handler",
     },
-    # Every runtime also ships as a distroless OCI image. A container carries a
-    # 10 GB uncompressed ceiling instead of the 250 MB layer budget, so it is the
-    # delivery path for the toolchains that can never be a layer.
+    # Every runtime ships one OCI image, on the DoD-hardened Iron Bank UBI9 base.
+    # There is deliberately no second base: a distroless image would mean a second
+    # container matrix, a second set of tags, and the `debian:<N>-slim` staging
+    # hack that cherry-picks resolved `.so` files out of Debian and into an image
+    # whose RPM database never learns they exist.
     #
-    # Distroless means no shell, no package manager and no OS userland: the
-    # entrypoint must name a real binary and its arguments. Families that need a
-    # different invocation (an interpreter, or the runtime with flags) override
-    # `entrypoint` in RUNTIME_FAMILY_DEFAULTS below.
+    # Iron Bank UBI9-minimal is the single base. It runs a real shell, so the
+    # entrypoint can be the payload's bootstrap; it carries `microdnf`, so runtime
+    # libraries are installed by RPM (leaving `/var/lib/rpm` and `/etc/ld.so.cache`
+    # consistent, which is what Grype's RHEL backport matching reads); and it is
+    # the base a DoD ATO accepts.
     "container": {
         "enabled": True,
-        # `distroless` is a runtime base: no shell, no package manager, and the
-        # entrypoint must be a real binary in the payload. `build` is a build
-        # environment: the base has a shell and a package manager, so a consumer
-        # can `RUN go build` / `RUN cargo build` in a Dockerfile FROM this image.
-        # A toolchain image is only useful as a build stage, and a distroless base
-        # cannot run a `RUN` step at all.
-        "profile": "distroless",
-        # Upstream distroless supports the current Debian release only; debian12
-        # images are no longer rebuilt, which is how the bookworm base came to ship
-        # an OpenSSL with fixable High and Critical CVEs while trixie has moved on.
-        "base_image": "gcr.io/distroless/cc-debian13:nonroot",
-        # Libraries staged into the image have to come from the same Debian release
-        # as the base, or the payload gets newer glibc's dependencies grafted onto an
-        # older C library. Derived from `base_image` when this is empty.
-        "libs_base_image": "debian:13-slim",
-        # Every runtime also ships a `<tag>-debug` variant on a base that carries a
-        # busybox shell and nothing else, so a failing image can be inspected
-        # (`docker run --rm -it --entrypoint /busybox/sh <image>`) without putting a
-        # shell into the production image. Empty means "no debug variant": the
-        # `build` families already have a shell, so a second copy would be the same
-        # image under another tag.
-        "debug_base_image": "gcr.io/distroless/cc-debian13:debug-nonroot",
+        # `registry1.dso.mil` needs credentials, so a build without them (an
+        # external PR, a fork, a local run) falls back to the upstream Red Hat
+        # registry, which serves the same UBI9-minimal userland. The fallback is a
+        # build-time convenience, never a published artifact.
+        "base_image": "registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal:latest",
+        "fallback_base_image": "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+        # Pinning the digest stops Iron Bank's daily automated rebuild from
+        # silently changing the base under a reproducible build. Empty means
+        # "follow the tag".
+        "base_image_digest": "",
+        # DISA STIG: the container runs as a non-root user with no writable home,
+        # and /opt and /var/task are read-only at run time. 1001 is the
+        # conventional first application UID.
+        "nonroot_uid": 1001,
+        "nonroot_gid": 1001,
+        # UBI9 packages installed with the base's own package manager for a
+        # family's native dependencies. The payload's DT_NEEDED scan adds whatever
+        # else the base does not ship; nothing is ever copied as a bare .so.
+        "packages": ["ca-certificates"],
         # Registries the release publishes to. The first is the primary: it names
         # the image in the docs, the examples and the release record. Amazon ECR
         # Public is here because a Lambda *function* cannot pull from GHCR at
@@ -90,56 +90,33 @@ REPO_DEFAULTS: Dict[str, Any] = {
         "registry": "ghcr.io/tartaruscode/lambda-runtime-factory",
         "workdir": "/var/task",
         "layer_root": "/opt",
+        # One entrypoint for every family: the payload's bootstrap, which applies
+        # the Lambda filesystem contract and execs the runtime. The zip layer ships
+        # the identical file, so the two artifacts cannot disagree about how a
+        # function starts. An interpreter bootstrap is a shebang script naming the
+        # payload's own interpreter; UBI9-minimal has a shell, so a `#!/bin/sh`
+        # wrapper works too.
         "entrypoint": ["/opt/bootstrap"],
-        # Build profiles install these with the base's own package manager; the
-        # distroless profile derives its packages from the payload's DT_NEEDED
-        # scan instead, so this stays empty there.
-        "packages": [],
-        # Symlinks the image needs to make the payload runnable, as
-        # {link_path: target}. Values are formatted with the arch context.
-        "links": {},
-        # A build image has no handler to invoke, so its smoke test runs the
-        # toolchain instead. The output must name the distribution version.
-        "smoke_test": [],
-        # AWS Lambda's filesystem contract: the task code is at /var/task and the
-        # only writable path is /tmp. HOME and TMPDIR point there because the
-        # distroless user (65532) has no writable home of its own.
+        # A toolchain image has no handler to invoke, so its smoke test runs the
+        # toolchain (or the launcher's contract) instead: see `smoke_test` in the
+        # family defaults. An empty mapping means "this image runs a handler".
+        "smoke_test": {},
+        # AWS Lambda's filesystem contract, plus the STIG read-only-rootfs rule:
+        # / is mounted read-only, so every path a runtime might write has to point
+        # under /tmp, the one writable mount.
         "env": {
             "HOME": "/tmp",
             "TMPDIR": "/tmp",
             "LAMBDA_TASK_ROOT": "/var/task",
             "PYTHONUNBUFFERED": "1",
+            "GOCACHE": "/tmp/.cache/go-build",
+            "GOPATH": "/tmp/go",
+            "CARGO_HOME": "/tmp/.cargo",
+            "RUSTUP_HOME": "/tmp/.rustup",
+            "DENO_DIR": "/tmp/.deno",
+            "PYTHONPYCACHEPREFIX": "/tmp/.pycache",
         },
-        "user": "65532:65532",
-        # Iron Bank is the DoD-hardened delivery path: a UBI9 base from
-        # registry1.dso.mil, a non-root UID, and a trust store that carries the
-        # DoD root CAs. It is a *second* image built from the same payload, not a
-        # replacement for the distroless one — distroless is the smallest CVE
-        # surface, Iron Bank is the one a DoD ATO accepts, and a consumer picks.
-        #
-        # registry1.dso.mil needs credentials, so a build without them (an
-        # external PR, a fork, a local run) falls back to the upstream Red Hat
-        # registry, which serves the same UBI9-minimal userland. The fallback is
-        # a build-time convenience, never a published artifact: the release logs
-        # in to Iron Bank and builds from the primary base.
-        "ironbank": {
-            "enabled": True,
-            "base_image": "registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal:latest",
-            "fallback_base_image": "registry.access.redhat.com/ubi9/ubi-minimal:latest",
-            # Pinning the digest stops Iron Bank's daily automated rebuild from
-            # silently changing the base under a reproducible build. Empty means
-            # "follow the tag".
-            "base_image_digest": "",
-            # DISA STIG: the container runs as a non-root user with no writable
-            # home. 1001 is the conventional first application UID.
-            "nonroot_uid": 1001,
-            "nonroot_gid": 1001,
-            # UBI9 packages installed with the base's own package manager for the
-            # family's native dependencies. The payload's DT_NEEDED scan adds
-            # whatever else the base does not ship; nothing is ever copied as a
-            # bare .so, so RPM keeps owning /var/lib/rpm and ld.so.cache.
-            "packages": ["ca-certificates"],
-        },
+        "user": "1001:1001",
     },
 }
 
@@ -147,25 +124,6 @@ CONTAINER_ARCH_SLUGS: Dict[str, str] = {
     "x86_64": "amd64",
     "arm64": "arm64",
 }
-
-# `distroless` images are runtime bases; `build` images are build environments
-# with a shell and a package manager. See the container block in REPO_DEFAULTS.
-CONTAINER_PROFILES = ("distroless", "build")
-
-def debian_slim_for(base_image: str) -> str:
-    """The `debian:<N>-slim` builder that matches a Debian-based base image.
-
-    A library staged into a distroless image has to come from the same Debian release
-    as the base: copying bookworm's libraries into a trixie image (or the reverse)
-    grafts one release's dependencies onto another's C library.
-    """
-    match = re.search(r"debian[-/:]?(?:cc-)?(\d+)", base_image)
-    return f"debian:{match.group(1)}-slim" if match else ""
-
-
-# A runtime publishes a standard image and, when its base is distroless, a
-# `<tag>-debug` variant of the same payload with a busybox shell in it.
-CONTAINER_VARIANTS = ("standard", "debug")
 
 _ECR_PUBLIC_PREFIX = "public.ecr.aws/"
 _ECR_ALIAS = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
@@ -228,10 +186,8 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "helper_install_dir": "pypy/site-packages",
         },
         "container": {
-            # The shebang names the interpreter, but an ENTRYPOINT that names it
-            # explicitly does not depend on a shebang at all — and distroless has
-            # no /usr/bin/env to fall back on.
-            "entrypoint": ["/opt/pypy/bin/pypy", "/opt/bootstrap"],
+            # The bootstrap's shebang names the interpreter, and UBI9-minimal has a
+            # shell, so the shared `/opt/bootstrap` entrypoint runs unchanged.
             "env": {"PYTHONPATH": "/opt/pypy/site-packages"},
         },
     },
@@ -254,11 +210,6 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "bootstrap_output": "bootstrap",
             "helper_source": "helpers/lambda_runtime_bun",
             "helper_install_dir": "bun/lib",
-        },
-        "container": {
-            # No /bin/sh in distroless: invoke Bun on the helper directly. The
-            # helper initializes the environment the old shell bootstrap set up.
-            "entrypoint": ["/opt/bun/bun", "run", "/opt/bun/lib/lambda_runtime_bun/runtime.ts"],
         },
     },
     "deno": {
@@ -283,18 +234,7 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "helper_install_dir": "deno/lib",
         },
         "container": {
-            # The shell bootstrap's permission flags have to travel in argv when
-            # there is no shell to expand them.
-            "entrypoint": [
-                "/opt/deno/deno",
-                "run",
-                "--allow-net",
-                "--allow-env",
-                "--allow-read=/var/task,/opt/deno/lib",
-                "/opt/deno/lib/lambda_runtime_deno/runtime.ts",
-            ],
             "env": {
-                "DENO_DIR": "/tmp/.deno",
                 "DENO_NO_UPDATE_CHECK": "1",
                 "NO_COLOR": "1",
             },
@@ -325,7 +265,6 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "helper_install_dir": "graalpy/lib/python{python_version}/site-packages",
         },
         "container": {
-            "entrypoint": ["/opt/graalpy/bin/graalpy", "/opt/bootstrap"],
             "env": {"PYTHONPATH": "/opt/graalpy/lib/python{python_version}/site-packages"},
         },
     },
@@ -356,24 +295,12 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "helper_install_dir": "go/lambda",
         },
         "container": {
-            # A toolchain image is a build environment, not a runtime: the
-            # documented use is `FROM .../go126:1.26 AS build` followed by
-            # `RUN go build`. Distroless has no /bin/sh, so that RUN step fails
-            # before it starts; debian:12-slim is the same glibc the Go toolchain
-            # is built against and carries a shell.
-            "profile": "build",
-            "base_image": "debian:12-slim",
-            # A build image already ships a shell, so there is no separate debug
-            # variant to publish.
-            "debug_base_image": "",
-            "user": "0:0",
-            "entrypoint": ["/bin/sh"],
-            "smoke_test": ["go", "version"],
+            # No handler in the payload, so the smoke test runs the toolchain:
+            # `go version` must exit 0 and name the distribution version, which
+            # proves the UBI9 image executes it as UID 1001 on a read-only rootfs.
+            "smoke_test": {"argv": ["go", "version"], "expect_version": True},
             "env": {
-                "HOME": "/root",
                 "PATH": "/opt/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                "GOCACHE": "/tmp/go-build",
-                "GOPATH": "/tmp/go",
                 "GOTOOLCHAIN": "local",
             },
         },
@@ -402,36 +329,20 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "helper_install_dir": "rust/lambda",
         },
         "container": {
-            # The musl toolchain's own binaries are dynamically linked against
-            # musl (`NEEDED libc.so`, interpreter /lib/ld-musl-x86_64.so.1), so a
-            # glibc base cannot run rustc at all. Alpine is the musl base, and it
-            # has the shell a `RUN cargo build` needs.
-            "profile": "build",
-            "base_image": "alpine:3.22",
-            # Same as Go: the musl toolchain base already has a shell.
-            "debug_base_image": "",
-            "user": "0:0",
-            "entrypoint": ["/bin/sh"],
-            "smoke_test": ["rustc", "--version"],
-            # libgcc supplies libgcc_s.so.1 (NEEDED by rustc); gcc and musl-dev
-            # supply the `cc` linker the musl target invokes.
-            "packages": ["libgcc", "gcc", "musl-dev"],
-            "links": {
-                # musl's soname is libc.so, but Alpine ships the file as
-                # libc.musl-<arch>.so.1; the loader resolves the soname by name.
-                "/usr/lib/libc.so": "/lib/ld-musl-{musl_arch}.so.1",
-                # The distribution is a component tree, not a merged prefix:
-                # rustc's sysroot is /opt/rust/rustc, and the std it needs lives
-                # in the rust-std component. Without this link every build fails
-                # with E0463 "can't find crate for `std`". Only the target's lib/
-                # is linked: rustc's own rustlib/<target>/bin holds rust-lld.
-                "/opt/rust/rustc/lib/rustlib/{arch_slug}/lib": "/opt/rust/rust-std-{arch_slug}/lib/rustlib/{arch_slug}/lib",
+            # A consumer's handler is a static musl binary at /opt/rust/bin/<handler>,
+            # which the payload's compiled launcher execs. rustc itself is
+            # musl-linked (`/lib/ld-musl-x86_64.so.1`) and UBI9 ships no musl
+            # loader, so the compiler cannot run on this base — verified. The smoke
+            # test therefore proves the entrypoint contract instead: the launcher
+            # runs as UID 1001 on a read-only rootfs and reports the Lambda handler
+            # contract when no handler is supplied.
+            "smoke_test": {
+                "argv": ["/opt/bootstrap"],
+                "expect_exit": 127,
+                "expect_output": "_HANDLER is not set",
             },
             "env": {
-                "HOME": "/root",
                 "PATH": "/opt/rust/cargo/bin:/opt/rust/rustc/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                "CARGO_HOME": "/tmp/cargo",
-                "RUSTUP_HOME": "/tmp/rustup",
             },
         },
     },
@@ -645,9 +556,12 @@ def validate_runtime_data(runtime_id: str, data: Dict[str, Any]) -> None:
         data["container"],
         [
             "enabled",
-            "profile",
             "base_image",
-            "debug_base_image",
+            "fallback_base_image",
+            "base_image_digest",
+            "nonroot_uid",
+            "nonroot_gid",
+            "packages",
             "registry",
             "registries",
             "workdir",
@@ -655,72 +569,48 @@ def validate_runtime_data(runtime_id: str, data: Dict[str, Any]) -> None:
             "entrypoint",
             "env",
             "user",
-            "packages",
-            "links",
             "smoke_test",
         ],
         f"runtime {runtime_id} container",
     )
 
-    if data["container"]["profile"] not in CONTAINER_PROFILES:
-        raise ValueError(
-            f"Runtime {runtime_id} container.profile must be one of "
-            f"{', '.join(sorted(CONTAINER_PROFILES))}, not "
-            f"'{data['container']['profile']}'"
-        )
-
-    # The Iron Bank image is a second artifact from the same payload, so its
-    # coordinates are validated like the distroless ones: a missing base or a
-    # non-numeric UID would only surface inside a Docker build.
-    ironbank = data["container"].get("ironbank")
-    if not isinstance(ironbank, dict):
-        raise ValueError(
-            f"Runtime {runtime_id} container.ironbank must be a mapping "
-            "(see REPO_DEFAULTS in runtime_manifest.py)"
-        )
-    _require_keys(
-        ironbank,
-        [
-            "enabled",
-            "base_image",
-            "fallback_base_image",
-            "base_image_digest",
-            "nonroot_uid",
-            "nonroot_gid",
-            "packages",
-        ],
-        f"runtime {runtime_id} container.ironbank",
-    )
+    # A missing base, a non-numeric UID or a malformed smoke test would only
+    # surface minutes later, inside a Docker build or a runner.
     for key in ("nonroot_uid", "nonroot_gid"):
-        if not isinstance(ironbank[key], int) or ironbank[key] <= 0:
+        value = data["container"][key]
+        if not isinstance(value, int) or value <= 0:
             raise ValueError(
-                f"Runtime {runtime_id} container.ironbank.{key} must be a positive "
-                f"integer, not {ironbank[key]!r}"
+                f"Runtime {runtime_id} container.{key} must be a positive integer, "
+                f"not {value!r}"
             )
 
-    # A distroless image has no shell, so a shell string here can never run: the
-    # entrypoint must already be the argv Docker will exec. A build profile has a
-    # shell, so it may name one.
+    # One entrypoint for every family: the payload's bootstrap, which the zip
+    # layer ships too. It is an argv Docker execs directly, never a shell string.
     if not isinstance(data["container"]["entrypoint"], list) or not data["container"]["entrypoint"]:
         raise ValueError(
-            f"Runtime {runtime_id} container.entrypoint must be a non-empty argv list, "
-            "not a shell string (the distroless base has no /bin/sh)"
+            f"Runtime {runtime_id} container.entrypoint must be a non-empty argv list"
         )
 
-    if data["container"]["profile"] == "distroless" and data["container"]["packages"]:
+    smoke_test = data["container"]["smoke_test"]
+    if not isinstance(smoke_test, dict):
         raise ValueError(
-            f"Runtime {runtime_id} container.packages is only meaningful for the "
-            "'build' profile; a distroless image stages the libraries its payload "
-            "links against instead"
+            f"Runtime {runtime_id} container.smoke_test must be a mapping "
+            "(see RUNTIME_FAMILY_DEFAULTS in runtime_manifest.py)"
         )
-
-    # A build image has no handler to invoke, so the toolchain command is the only
-    # thing that proves the image works. Without it the image ships unverified.
-    if data["container"]["profile"] == "build" and not data["container"]["smoke_test"]:
-        raise ValueError(
-            f"Runtime {runtime_id} container.smoke_test must name the toolchain "
-            "command that proves a build image works (e.g. ['go', 'version'])"
-        )
+    if smoke_test:
+        # An image with no handler has to be proven some other way: the toolchain
+        # command, or the launcher's own contract. Without it the image ships
+        # unverified.
+        if not isinstance(smoke_test.get("argv"), list) or not smoke_test["argv"]:
+            raise ValueError(
+                f"Runtime {runtime_id} container.smoke_test.argv must be a non-empty "
+                "argv list"
+            )
+        if "expect_exit" in smoke_test and not isinstance(smoke_test["expect_exit"], int):
+            raise ValueError(
+                f"Runtime {runtime_id} container.smoke_test.expect_exit must be an "
+                "integer exit code"
+            )
 
     # The release pushes to every registry in the list, and the first one is what
     # the docs and the release record name: an empty list publishes nowhere, and a
@@ -748,13 +638,9 @@ def _absolute(runtime_id: str, relative_path: str) -> Path:
     return runtimes_root() / runtime_id / Path(relative_path)
 
 
-def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH, variant: str = "standard") -> Dict[str, str]:
+def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> Dict[str, str]:
     if arch not in SUPPORTED_ARCHS:
         raise ValueError(f"Unsupported architecture '{arch}'. Supported: {', '.join(SUPPORTED_ARCHS)}")
-    if variant not in CONTAINER_VARIANTS:
-        raise ValueError(
-            f"Unsupported container variant '{variant}'. Supported: {', '.join(CONTAINER_VARIANTS)}"
-        )
 
     data = load_runtime(runtime_id, arch=arch)
     runtime_dir = runtimes_root() / runtime_id
@@ -774,24 +660,11 @@ def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH, variant: str = "stand
     downloads_dir = download_cache_root / runtime_id
     work_dir = build_dir / "work"
     container = data["container"]
-    ironbank = container["ironbank"]
     container_arch = CONTAINER_ARCH_SLUGS.get(arch, arch)
     container_registries = with_ecr_alias([item.rstrip("/") for item in container["registries"]])
     container_registry = with_ecr_alias([container["registry"].rstrip("/")])[0]
     container_image = f"{container_registry}/{runtime_id}"
     container_tag = data["distribution_version"]
-    # A debug image is the same payload on a base that carries a busybox shell.
-    # Only the base and the tags change: the entrypoint, user and environment stay
-    # identical, so what a user inspects is what failed in production.
-    debug_base_image = container.get("debug_base_image", "")
-    debug = variant == "debug"
-    if debug and not debug_base_image:
-        raise ValueError(
-            f"{runtime_id} has no debug container variant: container.debug_base_image is "
-            f"empty (a '{container['profile']}' base already carries a shell)"
-        )
-    container_base_image = debug_base_image if debug else container["base_image"]
-    variant_suffix = "-debug" if debug else ""
 
     env = {
         "REPO_ROOT": str(repo_root()),
@@ -859,17 +732,12 @@ def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH, variant: str = "stand
         # Container coordinates. The entrypoint and environment travel as JSON so
         # the Dockerfile generator cannot drift from what the manifest declares.
         "CONTAINER_ENABLED": "true" if container["enabled"] else "false",
-        "CONTAINER_VARIANT": variant,
-        "CONTAINER_TAG_SUFFIX": variant_suffix,
-        "CONTAINER_DEBUG_ENABLED": "true" if debug_base_image else "false",
-        "CONTAINER_DEBUG_BASE_IMAGE": debug_base_image,
-        "CONTAINER_PROFILE": container["profile"],
-        "CONTAINER_BASE_IMAGE": container_base_image,
-        "CONTAINER_LIBS_BASE_IMAGE": (
-            container.get("libs_base_image") or debian_slim_for(container_base_image)
-        ),
+        "CONTAINER_BASE_IMAGE": container["base_image"],
+        "CONTAINER_FALLBACK_BASE_IMAGE": container["fallback_base_image"],
+        "CONTAINER_BASE_IMAGE_DIGEST": container["base_image_digest"],
+        "CONTAINER_NONROOT_UID": str(container["nonroot_uid"]),
+        "CONTAINER_NONROOT_GID": str(container["nonroot_gid"]),
         "CONTAINER_PACKAGES": json.dumps(container["packages"]),
-        "CONTAINER_LINKS": json.dumps(container["links"], sort_keys=True),
         "CONTAINER_SMOKE_TEST": json.dumps(container["smoke_test"]),
         "CONTAINER_REGISTRY": container_registry,
         "CONTAINER_REGISTRIES": json.dumps(container_registries),
@@ -882,26 +750,10 @@ def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH, variant: str = "stand
         "CONTAINER_USER": container["user"],
         "CONTAINER_ENTRYPOINT": json.dumps(container["entrypoint"]),
         "CONTAINER_ENV": json.dumps(container["env"], sort_keys=True),
-        "CONTAINER_CONTEXT_DIR": str(build_dir / ("container-debug" if debug else "container")),
-        "CONTAINER_LOCAL_IMAGE": (
-            f"lambda-runtime-factory/{runtime_id}:{container_tag}-{arch}{variant_suffix}"
-        ),
-        # The Iron Bank image is a second artifact from the same payload. Its
-        # base, UID and digest travel to the builder so the Dockerfile template
-        # and the manifest cannot disagree about them.
-        "CONTAINER_IRONBANK_ENABLED": "true" if ironbank["enabled"] else "false",
-        "CONTAINER_IRONBANK_BASE_IMAGE": ironbank["base_image"],
-        "CONTAINER_FALLBACK_BASE_IMAGE": ironbank["fallback_base_image"],
-        "CONTAINER_BASE_IMAGE_DIGEST": ironbank["base_image_digest"],
-        "CONTAINER_NONROOT_UID": str(ironbank["nonroot_uid"]),
-        "CONTAINER_NONROOT_GID": str(ironbank["nonroot_gid"]),
-        "CONTAINER_IRONBANK_PACKAGES": json.dumps(list(ironbank["packages"])),
-        "CONTAINER_IRONBANK_CONTEXT_DIR": str(build_dir / "container-ironbank"),
-        "CONTAINER_IRONBANK_LOCAL_IMAGE": (
-            f"lambda-runtime-factory/{runtime_id}:{container_tag}-{arch}-ironbank"
-        ),
+        "CONTAINER_CONTEXT_DIR": str(build_dir / "container"),
+        "CONTAINER_LOCAL_IMAGE": f"lambda-runtime-factory/{runtime_id}:{container_tag}-{arch}",
         # Docker Buildx registry-cache coordinate. Every runner rebuilding the same
-        # base image and the same staged libraries from scratch is what the cache
+        # base image and the same installed packages from scratch is what the cache
         # exists to avoid; the ref is derived here so the workflow, the release and
         # a local run all point at the same tag.
         "CONTAINER_CACHE_REF": f"{container_image}:buildcache-{container_arch}",
@@ -1024,8 +876,8 @@ def manifest_matrix(
     return {"include": entries}
 
 
-def print_shell_env(runtime_id: str, arch: str = DEFAULT_ARCH, variant: str = "standard") -> None:
-    for key, value in runtime_env(runtime_id, arch=arch, variant=variant).items():
+def print_shell_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> None:
+    for key, value in runtime_env(runtime_id, arch=arch).items():
         print(f"{key}={shlex.quote(value)}")
 
 
@@ -1064,12 +916,6 @@ def build_parser() -> argparse.ArgumentParser:
     env_parser = subparsers.add_parser("env")
     env_parser.add_argument("--runtime", required=True)
     env_parser.add_argument("--arch", default=DEFAULT_ARCH)
-    env_parser.add_argument(
-        "--variant",
-        default="standard",
-        choices=CONTAINER_VARIANTS,
-        help="container variant whose coordinates to emit (standard or debug)",
-    )
 
     check_parser = subparsers.add_parser("check")
     check_parser.add_argument("--runtime", required=True)
@@ -1133,12 +979,7 @@ def main() -> None:
         return
 
     if args.command == "env":
-        try:
-            print_shell_env(args.runtime, arch=args.arch, variant=args.variant)
-        except ValueError as error:
-            # A variant the runtime does not have is a user error, not a crash:
-            # the build scripts eval this output and need a one-line message.
-            raise SystemExit(str(error))
+        print_shell_env(args.runtime, arch=args.arch)
         return
 
     if args.command == "check":
