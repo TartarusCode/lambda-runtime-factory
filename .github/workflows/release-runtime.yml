@@ -395,8 +395,15 @@ jobs:
     environment: release
     runs-on: ubuntu-26.04
     timeout-minutes: 15
+    # Job-level permissions replace the workflow map rather than merging with it,
+    # so the OIDC grant has to be repeated here. Without `id-token: write` the
+    # runner cannot mint a token and `configure-aws-credentials` fails with
+    # "Did you mean to set the `id-token` permission?" and then twelve retries of
+    # "Could not load credentials from any providers" — which reads like an account
+    # problem, not a missing grant, and stops the merge before the tags are made.
     permissions:
       contents: read
+      id-token: write
       packages: write
     strategy:
       fail-fast: false

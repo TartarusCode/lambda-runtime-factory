@@ -2273,3 +2273,50 @@ def test_an_unsatisfied_soname_must_be_declared_and_justified() -> None:
     assert set(declared) == {"rust194", "rust198", "rust199"}, declared
     for runtime_id, names in declared.items():
         assert names == ["libc.so"], runtime_id
+
+
+# --- OIDC contract -------------------------------------------------------------
+#
+# A job-level `permissions:` map replaces the workflow-level one instead of merging
+# with it, so a job that assumes an AWS role over OIDC has to grant `id-token:
+# write` itself. The failure is not self-explanatory: the credentials action hints
+# "Did you mean to set the `id-token` permission?" and then retries twelve times
+# with "Could not load credentials from any providers", which reads like an account
+# or role problem. One job lost that grant and the whole multi-arch merge stopped.
+
+_AWS_CREDENTIALS_ACTION = "aws-actions/configure-aws-credentials"
+
+
+def _assumes_an_aws_role(job: dict) -> bool:
+    """Whether a job authenticates to AWS by assuming a role."""
+    for step in job.get("steps") or []:
+        if isinstance(step, dict) and _AWS_CREDENTIALS_ACTION in str(step.get("uses", "")):
+            return True
+    return False
+
+
+def test_every_job_that_assumes_a_role_can_mint_an_oidc_token() -> None:
+    checked = []
+    for path in sorted((_REPO_ROOT / ".github" / "workflows").glob("*.yml")):
+        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        workflow_permissions = doc.get("permissions") or {}
+        for name, job in (doc.get("jobs") or {}).items():
+            if not _assumes_an_aws_role(job):
+                continue
+            # A job-level map replaces the workflow map; a string grants
+            # everything or nothing.
+            effective = job.get("permissions")
+            if effective is None:
+                effective = workflow_permissions
+            if isinstance(effective, str):
+                assert effective == "write-all", (
+                    f"{path.name}:{name} assumes an AWS role but is limited to "
+                    f"`{effective}` permissions"
+                )
+            else:
+                assert isinstance(effective, dict) and effective.get("id-token") == "write", (
+                    f"{path.name}:{name} assumes an AWS role over OIDC but its effective "
+                    f"permissions ({effective!r}) do not grant `id-token: write`"
+                )
+            checked.append((path.name, name))
+    assert checked, "no job assumes an AWS role over OIDC"
