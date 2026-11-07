@@ -352,47 +352,23 @@ jobs:
         # exists; GHCR creates the package itself.
         if: ${{ github.event.inputs.dry_run != 'true' }}
         run: bash tools/bin/ensure-container-repos "${{ matrix.runtime }}"
-      - name: Build, scan and smoke-test every variant
-        # The standard image and, where the family has one, the debug image built
-        # from the same payload. Only bytes that passed all three steps are pushed.
+      - name: Build, scan and smoke-test the image
+        # One image per runtime on the Iron Bank UBI9 base. Only bytes that passed
+        # all three steps are pushed, and the smoke test runs rootless on a
+        # read-only rootfs.
         run: |
           env_text=$(python3 tools/runtime_lib/runtime_manifest.py env \
             --runtime "${{ matrix.runtime }}" --arch "${{ matrix.arch }}")
           cache_ref=$(grep '^CONTAINER_CACHE_REF=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
-          for variant in $(bash tools/bin/container-variants "${{ matrix.runtime }}" "${{ matrix.arch }}"); do
-            echo "::group::${variant}"
-            timeout 900 bash tools/bin/build-container "${{ matrix.runtime }}" "${{ matrix.arch }}" \
-              --variant "${variant}" --cache-from "${cache_ref}${variant#standard}"
-            bash tools/bin/audit-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --variant "${variant}"
-            timeout 600 bash tools/bin/local-invoke-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --variant "${variant}"
-            echo "::endgroup::"
-          done
-      - name: Check that the variants differ only by the shell
-        run: bash tools/bin/check-container-variants "${{ matrix.runtime }}" "${{ matrix.arch }}"
-      - name: Push the per-architecture images
-        if: ${{ github.event.inputs.dry_run != 'true' }}
-        run: |
-          for variant in $(bash tools/bin/container-variants "${{ matrix.runtime }}" "${{ matrix.arch }}"); do
-            bash tools/bin/push-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --variant "${variant}"
-          done
-      - name: Build, scan and smoke-test the Iron Bank image
-        # The second artifact from the same payload: the DoD-hardened UBI9 base,
-        # UID 1001 and a DoD root CA trust store, smoke-tested rootless on a
-        # read-only rootfs. Built unconditionally — without Iron Bank credentials
-        # it uses the Red Hat fallback — so the artifact is covered every release.
-        env:
-          LAMBDA_RUNTIME_SUMMARY_DEFERRED: "1"
-        run: |
-          env_text=$(python3 tools/runtime_lib/runtime_manifest.py env \
-            --runtime "${{ matrix.runtime }}" --arch "${{ matrix.arch }}")
-          cache_ref=$(grep '^CONTAINER_CACHE_REF=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")-ironbank
           timeout 900 bash tools/bin/build-container "${{ matrix.runtime }}" "${{ matrix.arch }}" \
-            --ironbank --cache-from "${cache_ref}"
-          bash tools/bin/audit-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --ironbank
-          timeout 600 bash tools/bin/local-invoke-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --ironbank
-      - name: Push the Iron Bank image
+            --cache-from "${cache_ref}"
+          bash tools/bin/audit-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
+          timeout 600 bash tools/bin/local-invoke-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
+      - name: Check the image contract
+        run: bash tools/bin/check-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
+      - name: Push the per-architecture image
         if: ${{ github.event.inputs.dry_run != 'true' }}
-        run: bash tools/bin/push-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --ironbank
+        run: bash tools/bin/push-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
       - name: Publish the SOCI-enabled copy
         # A second image per architecture, not a tag on the first: SOCI Index
         # Manifest v2 bundles the index into a new image, and Lambda lazy-loads the
@@ -452,9 +428,6 @@ jobs:
         run: |
           arguments=("${{ matrix.runtime }}")
           if [ "${{ inputs.publish_soci }}" = "true" ]; then arguments+=(--soci); fi
-          # The Iron Bank images are a second artifact, so their `-ironbank`
-          # multi-arch tags are created beside the distroless ones.
-          arguments+=(--ironbank)
           bash tools/bin/merge-container-tags "${arguments[@]}"
 
 
@@ -542,9 +515,6 @@ jobs:
               image=$(grep '^CONTAINER_IMAGE=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
               tag=$(grep '^CONTAINER_TAG=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
               echo "- \`${image}:${tag}\`"
-              # The Iron Bank image is a published artifact too, so the record
-              # names it beside the distroless tags.
-              echo "- \`${image}:${tag}-ironbank\`"
             done < "${RUNNER_TEMP}/images.txt"
             echo
           } > "${RUNNER_TEMP}/container-images.md"
