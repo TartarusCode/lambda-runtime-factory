@@ -21,10 +21,17 @@ That is Lambda's deployment-package ceiling, quoted from the quotas page:
 It counts unzipped bytes, it covers the function **and every attached layer** (so splitting a runtime
 across layers does not help; a function may carry at most 5), and it is not adjustable.
 
-After slimming, the numbers are: `graalpy312` 256,817,392 B (98.0% of the ceiling) and `graalpy313`
+After slimming, the numbers were: `graalpy312` 256,817,392 B (98.0% of the ceiling) and `graalpy313`
 250,195,312 B (95.4%) — 3–11 MB left for the function's own code, against a ~225 MB
-`libpythonvm.so` floor that no amount of pruning moves. `rust*` is 1.29 GB. So the ceiling is not a
-tuning problem for six of the twelve runtimes; it is a wall.
+`libpythonvm.so` floor that no amount of pruning moves. `rust*` is 1.29 GB. So the ceiling was not a
+tuning problem for six of the twelve runtimes then in the matrix; it was a wall.
+
+`graalpy312` was dropped rather than carried into the image era. Upstream ended the GraalPy 3.12 line
+at `graal-25.2.4`: every release from `graal-25.3.4` onward publishes only `graalpy3.13-*` assets, and
+that 25.2.4 distribution bundles a JDK (`25.0.4+7-LTS-jvmci-25.2-b20`) with a fixable High CVE and no
+newer 3.12 build to move to. `graalpy313` moved to `graal-25.5.5`, whose bundled JDK is
+`25.0.5.0.3+1-LTS-jvmci-25.5-b26` — past the fix. Carrying an unpatched runtime and ignoring the CVE
+is the one thing the compliance contract exists to prevent.
 
 The second reason is worse. **A layer executes on AWS's `provided.al2023` base, not ours.** The STIG
 user, the read-only rootfs, the injected trust store, the RPM-owned libraries and the absence of a
@@ -130,7 +137,7 @@ Unpacked bytes summed from the exported rootfs, x86_64:
 | `pypy311` | 113,869,671 B |
 | `bun13` | 116,422,312 B |
 | `go127` | 286,425,568 B |
-| `graalpy312` | 359,244,382 B |
+| `graalpy313` | 432,597,639 B (25.5.5) |
 | `rust199` | 1,459,227,066 B |
 
 The size is measured from the exported rootfs rather than `docker image inspect .Size`, because that
