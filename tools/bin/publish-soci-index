@@ -158,8 +158,17 @@ for registry in "${registries[@]}"; do
     # One architecture at a time: a SOCI index describes a single image manifest,
     # and a per-arch tag is exactly one manifest, so nothing has to be resolved
     # per platform and the multi-arch tag is merged afterwards.
+    #
+    # `--platform` is not optional. buildx exports provenance attestations by
+    # default, so the pushed per-arch tag is an OCI *index* holding the image
+    # manifest plus an attestation manifest whose platform is `unknown/unknown`.
+    # `oras cp --to-oci-layout` copies that index verbatim, and `soci convert
+    # --standalone` then refuses the layout with "manifest should have proper
+    # platform". Filtering the pull to this architecture drops the attestation
+    # entry and leaves exactly the one manifest SOCI can convert.
     echo "Pulling ${reference} to an OCI layout"
-    "${oras}" cp "${PLAIN_SOURCE[@]}" --to-oci-layout "${reference}" "${layout}:${CONTAINER_TAG}"
+    "${oras}" cp "${PLAIN_SOURCE[@]}" --platform "linux/${CONTAINER_ARCH}" \
+        --to-oci-layout "${reference}" "${layout}:${CONTAINER_TAG}"
 
     echo "Converting ${reference} to a SOCI-enabled image"
     "${soci}" convert --standalone --format oci-dir "${layout}" "${converted}"

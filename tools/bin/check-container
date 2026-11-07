@@ -1,0 +1,80 @@
+#!/bin/bash
+# Assert that a runtime's image is what it claims to be.
+#
+# The STIG contract is enforced at build time (the Dockerfile sets it) and again
+# here, against the built image, because a base or template change that silently
+# dropped the USER, the entrypoint or the package-manager removal would still
+# build and still push. Everything asserted here is read back from the image:
+#
+#   * the process runs as the manifest's non-root UID
+#   * the entrypoint is the payload's bootstrap
+#   * /opt and /var/task are readable by that UID on a read-only rootfs
+#   * no package manager is left behind, and the RPM database a scanner reads is
+#     still there
+#
+#   check-container <runtime_id> <arch>
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+
+runtime_id=$(common::require_runtime_id "${1:-}")
+arch=$(common::require_arch "${2:-}")
+common::load_runtime_env "${runtime_id}" "${arch}"
+
+image="${CONTAINER_LOCAL_IMAGE}"
+if ! docker image inspect "${image}" >/dev/null 2>&1; then
+    echo "${image} is not built; run build-container first" >&2
+    exit 1
+fi
+
+entrypoint=$(docker image inspect --format '{{json .Config.Entrypoint}}' "${image}")
+user=$(docker image inspect --format '{{.Config.User}}' "${image}")
+workdir=$(docker image inspect --format '{{.Config.WorkingDir}}' "${image}")
+
+failures=0
+fail() {
+    echo "${runtime_id} (${arch}): $*" >&2
+    failures=$((failures + 1))
+}
+
+expected_user="${CONTAINER_NONROOT_UID}:${CONTAINER_NONROOT_GID}"
+if [[ "${user}" != "${expected_user}" ]]; then
+    fail "USER is '${user}', want '${expected_user}' (STIG rootless execution)"
+fi
+if [[ "${entrypoint}" != "${CONTAINER_ENTRYPOINT}" ]]; then
+    fail "entrypoint is '${entrypoint}', want '${CONTAINER_ENTRYPOINT}'"
+fi
+if [[ "${workdir}" != "${CONTAINER_WORKDIR}" ]]; then
+    fail "workdir is '${workdir}', want '${CONTAINER_WORKDIR}'"
+fi
+
+# Run as the image's own UID on a read-only rootfs: this is what a Lambda function
+# actually does, and a payload that is not world-readable would fail right here.
+probe=$(docker run --rm \
+    --platform "${CONTAINER_PLATFORM}" \
+    --read-only \
+    --tmpfs "/tmp:rw,exec,size=64m,uid=${CONTAINER_NONROOT_UID},gid=${CONTAINER_NONROOT_GID}" \
+    --user "${expected_user}" \
+    --entrypoint /bin/sh \
+    "${image}" -c '
+        id -u
+        test -r /opt/bootstrap && echo bootstrap-readable
+        command -v microdnf || echo no-microdnf
+        command -v dnf || echo no-dnf
+        command -v yum || echo no-yum
+        test -d /var/lib/rpm && echo rpmdb-present
+        test -w /tmp && echo tmp-writable
+        test -d /var/task && echo taskdir-present
+    ' 2>&1) || fail "the rootless read-only probe failed to run: ${probe}"
+
+for expected in "bootstrap-readable" "no-microdnf" "no-dnf" "no-yum" "rpmdb-present" "tmp-writable" "taskdir-present"; do
+    if ! grep -qF "${expected}" <<<"${probe}"; then
+        fail "the probe did not report '${expected}' (got: ${probe//$'\n'/ })"
+    fi
+done
+
+if (( failures )); then
+    exit 1
+fi
+
+echo "${runtime_id} (${arch}): image verified (user ${user}, entrypoint ${entrypoint}, no package manager, rpmdb intact, /opt readable on a read-only rootfs)"

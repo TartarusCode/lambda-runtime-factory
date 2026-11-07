@@ -31,9 +31,9 @@ inputs:
     default: "false"
   container:
     description: >-
-      "true" also builds the distroless OCI image from the same payload, scans it
-      and smoke-tests it through aws-lambda-rie. A release cell that publishes the
-      layer only passes "false"; the container publish job owns the image.
+      "true" also builds the OCI image from the same payload, scans it and
+      smoke-tests it rootless on a read-only rootfs. A release cell that publishes
+      the layer only passes "false"; the container publish job owns the image.
     required: false
     default: "true"
 
@@ -47,6 +47,15 @@ runs:
         if ! command -v zip >/dev/null || ! command -v unzip >/dev/null; then
           sudo apt-get update && sudo apt-get install -y zip unzip
         fi
+
+    - name: Set up Docker Buildx
+      # The docker-container driver is what supports registry cache import/export
+      # (`type=registry`), which is how the base pull, the certificate extraction
+      # and the library installation are reused across runs.
+      if: inputs.container == 'true'
+      uses: docker/setup-buildx-action@v3
+      with:
+        driver: docker-container
 
     - name: Build runtime package
       if: inputs.skip-build != 'true'
@@ -67,15 +76,24 @@ runs:
       shell: bash
       run: bash tools/bin/audit-runtime "${{ inputs.runtime }}" "${{ inputs.arch }}"
 
-    - name: Build distroless container image
+    - name: Build the container image
       if: inputs.container == 'true'
       shell: bash
-      # Same payload as the zip layer, different base: distroless removes the
-      # shell the entrypoint used to depend on and gives the artifact the 10 GB
-      # container ceiling instead of the 250 MB layer budget.
+      # Same payload as the zip layer, different ceiling: the image is the delivery
+      # path for the runtimes a layer cannot carry, and on the Iron Bank UBI9 base
+      # it is the artifact a DoD ATO accepts.
       env:
         LAMBDA_RUNTIME_SUMMARY_DEFERRED: "1"
-      run: timeout 900 bash tools/bin/build-container "${{ inputs.runtime }}" "${{ inputs.arch }}"
+      run: |
+        env_text=$(python3 tools/runtime_lib/runtime_manifest.py env \
+          --runtime "${{ inputs.runtime }}" --arch "${{ inputs.arch }}")
+        cache_ref=$(grep '^CONTAINER_CACHE_REF=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
+        cache_args=(--cache-from "${cache_ref}")
+        if [[ "${GITHUB_REF}" == "refs/heads/${{ github.event.repository.default_branch }}" ]]; then
+          cache_args+=(--cache-to "${cache_ref},mode=max,image-manifest=true")
+        fi
+        timeout 900 bash tools/bin/build-container \
+          "${{ inputs.runtime }}" "${{ inputs.arch }}" "${cache_args[@]}"
 
     - name: Audit the container image
       if: inputs.container == 'true' && inputs.audit == 'true'
@@ -83,34 +101,19 @@ runs:
       run: bash tools/bin/audit-container "${{ inputs.runtime }}" "${{ inputs.arch }}"
 
     - name: Smoke-test the container image
-      # A runtime image has no handler of its own; aws-lambda-rie is mounted at
-      # run time, so production bytes stay clean. A toolchain image has no handler
-      # at all, so it runs its own toolchain command instead (container.smoke_test).
+      # Runs as the image's non-root user on a read-only rootfs with /tmp as the
+      # only writable path, through aws-lambda-rie for a runtime image and through
+      # the manifest's own smoke test for a toolchain image.
       if: inputs.container == 'true'
       shell: bash
       run: timeout 600 bash tools/bin/local-invoke-container "${{ inputs.runtime }}" "${{ inputs.arch }}"
 
-    - name: Build the debug image
-      # The same payload on a base that carries a busybox shell, so a failing
-      # image can be inspected without shipping a shell in production. Families
-      # with a `build` profile have one image and no variant to build.
+    - name: Check the image contract
+      # Proves the claims rather than assuming them: non-root UID, the payload's
+      # entrypoint, no package manager left, and an intact RPM database.
       if: inputs.container == 'true'
       shell: bash
-      env:
-        LAMBDA_RUNTIME_SUMMARY_DEFERRED: "1"
-      run: |
-        for variant in $(bash tools/bin/container-variants "${{ inputs.runtime }}" "${{ inputs.arch }}"); do
-          if [[ "${variant}" == "debug" ]]; then
-            timeout 900 bash tools/bin/build-container "${{ inputs.runtime }}" "${{ inputs.arch }}" --variant debug
-          fi
-        done
-
-    - name: Check the image variants
-      # Proves the claims rather than assuming them: the standard image has no
-      # shell at all, and the debug image is the same artifact plus one.
-      if: inputs.container == 'true'
-      shell: bash
-      run: bash tools/bin/check-container-variants "${{ inputs.runtime }}" "${{ inputs.arch }}"
+      run: bash tools/bin/check-container "${{ inputs.runtime }}" "${{ inputs.arch }}"
 
     - name: Record the package size
       # Always: the summary states this cell's share of the 250 MB deployment

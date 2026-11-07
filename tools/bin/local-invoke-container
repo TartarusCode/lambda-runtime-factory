@@ -1,27 +1,30 @@
 #!/bin/bash
 # Smoke-test a runtime's image.
 #
-# A distroless runtime image is exercised through the Lambda Runtime Interface
-# Emulator (RIE): the production image stays clean, RIE is bind-mounted into the
-# container at run time and overrides the entrypoint, exactly as AWS documents for
-# container testing.
+# There is one image per runtime, on the Iron Bank UBI9 base, and two ways to
+# prove it works — both under the STIG contract: the rootfs is mounted read-only,
+# /tmp is the only writable path (a tmpfs owned by the runtime UID), and the
+# process runs as that UID rather than as root.
 #
-# A build image has no handler to invoke, so it is exercised by running the
-# toolchain the image exists to provide (container.smoke_test) and checking that
-# the output names the distribution version. Skipping that check would ship a
-# toolchain image nobody had ever executed.
+# A runtime image is exercised through the Lambda Runtime Interface Emulator
+# (RIE): the published image stays clean, RIE is bind-mounted read-only from the
+# host cache at run time and overrides the entrypoint, exactly as AWS documents
+# for container testing.
+#
+# A toolchain image has no handler to invoke, so it is exercised by the command
+# its manifest declares (`container.smoke_test`): the toolchain itself, or the
+# launcher's own handler contract. Skipping that check would ship an image nobody
+# had ever executed.
 #
 #   local-invoke-container <runtime_id> <arch>
 set -euo pipefail
 
 source "$(dirname "$0")/_common.sh"
 
-variant=standard
 positional=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --variant) variant=$2; shift 2 ;;
-        --debug) variant=debug; shift ;;
+        --ironbank) shift ;;  # no-op: every image is on the Iron Bank base
         -*) echo "Unknown option: $1" >&2; exit 2 ;;
         *) positional+=("$1"); shift ;;
     esac
@@ -29,37 +32,66 @@ done
 
 runtime_id=$(common::require_runtime_id "${positional[0]:-}")
 arch=$(common::require_arch "${positional[1]:-}")
-common::load_runtime_env "${runtime_id}" "${arch}" "${variant}"
+common::load_runtime_env "${runtime_id}" "${arch}"
 
 if [[ "${CONTAINER_ENABLED}" != "true" ]]; then
     echo "${runtime_id} (${arch}) has no container target (container.enabled=false)" >&2
     exit 1
 fi
 
-if ! docker image inspect "${CONTAINER_LOCAL_IMAGE}" >/dev/null 2>&1; then
+image="${CONTAINER_LOCAL_IMAGE}"
+if ! docker image inspect "${image}" >/dev/null 2>&1; then
     bash "$(common::repo_root)/tools/bin/build-container" "${runtime_id}" "${arch}"
     common::load_runtime_env "${runtime_id}" "${arch}"
 fi
 
-if [[ "${CONTAINER_PROFILE}" == "build" ]]; then
+# The STIG contract every invocation below asserts. `--tmpfs` owns /tmp by the
+# runtime UID so the process can actually write there on a read-only rootfs.
+stig_args=(
+    --platform "${CONTAINER_PLATFORM}"
+    --read-only
+    --tmpfs /tmp:rw,exec,size=512m,uid=${CONTAINER_NONROOT_UID},gid=${CONTAINER_NONROOT_GID}
+    --user "${CONTAINER_NONROOT_UID}:${CONTAINER_NONROOT_GID}"
+)
+
+# --- the manifest's own smoke test, for an image with no handler ---------------
+if [[ "${CONTAINER_SMOKE_TEST}" != "{}" && -n "${CONTAINER_SMOKE_TEST}" ]]; then
     mapfile -t smoke < <(
         python3 - "${CONTAINER_SMOKE_TEST}" <<'PY'
 import json
 import sys
 
-for arg in json.loads(sys.argv[1]):
+spec = json.loads(sys.argv[1] or "{}")
+for arg in spec.get("argv") or []:
     print(arg)
 PY
     )
     if (( ${#smoke[@]} == 0 )); then
-        echo "${runtime_id} (${arch}) is a build image with no container.smoke_test" >&2
+        echo "${runtime_id} (${arch}) declares container.smoke_test with no argv" >&2
         exit 1
     fi
-    echo "Running the toolchain smoke test in ${CONTAINER_LOCAL_IMAGE}: ${smoke[*]}"
-    output=$(docker run --rm --platform "${CONTAINER_PLATFORM}" \
-        --entrypoint "${smoke[0]}" "${CONTAINER_LOCAL_IMAGE}" "${smoke[@]:1}")
+    expect_exit=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1] or "{}").get("expect_exit", 0))' "${CONTAINER_SMOKE_TEST}")
+    expect_output=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1] or "{}").get("expect_output", ""))' "${CONTAINER_SMOKE_TEST}")
+    expect_version=$(python3 -c 'import json,sys; print("yes" if json.loads(sys.argv[1] or "{}").get("expect_version") else "no")' "${CONTAINER_SMOKE_TEST}")
+
+    echo "Running the declared smoke test in ${image} as ${CONTAINER_NONROOT_UID} on a read-only rootfs: ${smoke[*]}"
+    set +e
+    output=$(docker run --rm "${stig_args[@]}" \
+        --workdir "${CONTAINER_WORKDIR}" \
+        --entrypoint "${smoke[0]}" "${image}" "${smoke[@]:1}" 2>&1)
+    status=$?
+    set -e
     echo "${output}"
-    if ! grep -qF "${DISTRIBUTION_VERSION}" <<<"${output}"; then
+
+    if (( status != expect_exit )); then
+        echo "${runtime_id} (${arch}): smoke test exited ${status}, expected ${expect_exit}" >&2
+        exit 1
+    fi
+    if [[ -n "${expect_output}" ]] && ! grep -qF "${expect_output}" <<<"${output}"; then
+        echo "${runtime_id} (${arch}): smoke test output did not carry '${expect_output}'" >&2
+        exit 1
+    fi
+    if [[ "${expect_version}" == "yes" ]] && ! grep -qF "${DISTRIBUTION_VERSION}" <<<"${output}"; then
         echo "${runtime_id} (${arch}): the toolchain did not report version ${DISTRIBUTION_VERSION}" >&2
         exit 1
     fi
@@ -127,13 +159,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Starting ${CONTAINER_LOCAL_IMAGE} under aws-lambda-rie on 127.0.0.1:${port}"
+# RIE is bind-mounted read-only from the host cache: the production image never
+# carries the emulator, and the tmpfs is what the entrypoint's runtime may write.
+echo "Starting ${image} under aws-lambda-rie on 127.0.0.1:${port} (user ${CONTAINER_NONROOT_UID}:${CONTAINER_NONROOT_GID}, read-only rootfs)"
 docker run -d --rm --name "${container}" \
-    --platform "${CONTAINER_PLATFORM}" \
+    "${stig_args[@]}" \
     -p "127.0.0.1:${port}:8080" \
-    -v "${rie}:/aws-lambda-rie:ro" \
+    -v "${rie}:/tmp/aws-lambda-rie:ro" \
     -v "${LOCAL_CODE_URI}:/var/task:ro" \
-    --entrypoint /aws-lambda-rie \
+    --entrypoint /tmp/aws-lambda-rie \
     -e "AWS_LAMBDA_FUNCTION_NAME=${LOCAL_FUNCTION_NAME}" \
     -e "AWS_LAMBDA_FUNCTION_VERSION=\$LATEST" \
     -e "AWS_LAMBDA_FUNCTION_MEMORY_SIZE=256" \
@@ -142,7 +176,7 @@ docker run -d --rm --name "${container}" \
     -e "AWS_REGION=us-east-1" \
     -e "LAMBDA_TASK_ROOT=/var/task" \
     -e "_HANDLER=${LOCAL_HANDLER}" \
-    "${CONTAINER_LOCAL_IMAGE}" \
+    "${image}" \
     "${entrypoint[@]}" >/dev/null
 
 endpoint="http://127.0.0.1:${port}/2015-03-31/functions/function/invocations"

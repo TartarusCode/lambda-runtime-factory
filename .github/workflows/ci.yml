@@ -6,9 +6,14 @@ on:
       - main
     paths-ignore:
       - "**.md"
+  # Two tiers. `opened`/`synchronize`/`reopened` feed the fast tier; `labeled`,
+  # `unlabeled` and `ready_for_review` are how a PR graduates to the full matrix
+  # when it gains the `ready-to-merge` label or leaves draft.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
     paths-ignore:
       - "**.md"
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -33,8 +38,22 @@ jobs:
       # The matrix action is resolved from the workspace, so the checkout has to
       # happen here rather than inside it.
       - uses: actions/checkout@v7
+        with:
+          # The fast PR tier diffs the branch against the base branch, which needs
+          # that branch in the history.
+          fetch-depth: 0
       - id: matrix
         uses: ./.github/actions/runtime-matrix
+        with:
+          # The full 24-cell matrix is for a push to main, a workflow_dispatch, or
+          # a PR that left draft and carries `ready-to-merge`. A draft or
+          # unlabelled PR runs only the runtimes whose files changed (one canary
+          # cell when the change is tooling-only), so a WIP commit cannot occupy
+          # every runner.
+          changed-only: >-
+            ${{ github.event_name == 'pull_request' &&
+                (github.event.pull_request.draft == true ||
+                 !contains(github.event.pull_request.labels.*.name, 'ready-to-merge')) }}
 
   repo-checks:
     # Deliberately runs for dependabot PRs too: it is ~10s and it is the only
@@ -103,6 +122,10 @@ jobs:
     env:
       SAM_CLI_TELEMETRY: "0"
       BUILD_BEST_EFFORT_AUDIT: "0"
+      # registry1.dso.mil needs credentials; empty makes build-container fall back
+      # to the Red Hat UBI9 registry, so the Iron Bank artifact is still built and
+      # smoke-tested on an external PR.
+      IRONBANK_TOKEN: ${{ secrets.IRONBANK_TOKEN }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/runtime-build-env
@@ -113,6 +136,13 @@ jobs:
           grype: when-changed
           # Cells only read the week's database; the grype-db job writes it.
           db-refresh: "false"
+      - name: Log in to Iron Bank Registry
+        if: ${{ env.IRONBANK_TOKEN != '' }}
+        uses: docker/login-action@v3
+        with:
+          registry: registry1.dso.mil
+          username: ${{ secrets.IRONBANK_USERNAME }}
+          password: ${{ secrets.IRONBANK_TOKEN }}
       - name: Build and audit runtime package
         uses: ./.github/actions/build-and-audit-runtime
         with:
@@ -128,9 +158,9 @@ jobs:
           # report CVE-database drift that no commit caused. That drift is caught by
           # the weekly audit-runtimes workflow instead of blocking unrelated PRs.
           audit: ${{ steps.build-env.outputs.audit }}
-          # CI exercises both artifacts: the zip layer and the distroless image,
-          # including a scan of the image and a Runtime Interface Emulator smoke
-          # test. A container regression cannot reach a release unseen.
+          # CI exercises both artifacts: the zip layer and the Iron Bank UBI9 image,
+          # including a scan of the image and a rootless, read-only smoke test. A
+          # container regression cannot reach a release unseen.
           container: "true"
       - name: Install SAM CLI
         if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke

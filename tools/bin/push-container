@@ -1,5 +1,5 @@
 #!/bin/bash
-# Push one architecture of a runtime's distroless image to the registry.
+# Push one architecture of a runtime's image to the registry.
 #
 # Kept separate from build-container so a release can build, scan and smoke-test
 # the local image first and only then publish exactly the bytes that passed. The
@@ -7,18 +7,17 @@
 #
 #   push-container <runtime_id> <arch>
 #
-# The tag is <version>-<arch-slug>; the merge job creates <version> and latest
-# from the two per-arch manifests.
+# The tag is <version>-<arch-slug>; the merge job creates <version> and the
+# version line from the two per-arch manifests. There is one image per runtime, so
+# there is no variant suffix.
 set -euo pipefail
 
 source "$(dirname "$0")/_common.sh"
 
-variant=standard
 positional=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --variant) variant=$2; shift 2 ;;
-        --debug) variant=debug; shift ;;
+        --ironbank) shift ;;  # no-op: every image is on the Iron Bank base
         -*) echo "Unknown option: $1" >&2; exit 2 ;;
         *) positional+=("$1"); shift ;;
     esac
@@ -26,7 +25,7 @@ done
 
 runtime_id=$(common::require_runtime_id "${positional[0]:-}")
 arch=$(common::require_arch "${positional[1]:-}")
-common::load_runtime_env "${runtime_id}" "${arch}" "${variant}"
+common::load_runtime_env "${runtime_id}" "${arch}"
 
 if ! docker image inspect "${CONTAINER_LOCAL_IMAGE}" >/dev/null 2>&1; then
     echo "${CONTAINER_LOCAL_IMAGE} is not built; run build-container first" >&2
@@ -37,14 +36,14 @@ mapfile -t registries < <(python3 -c 'import json,sys
 for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIES_OVERRIDE:-${CONTAINER_REGISTRIES}}")
 
 for registry in "${registries[@]}"; do
-    reference="${registry}/${RUNTIME_ID}:${CONTAINER_TAG}-${CONTAINER_ARCH}${CONTAINER_TAG_SUFFIX}"
+    reference="${registry}/${RUNTIME_ID}:${CONTAINER_TAG}-${CONTAINER_ARCH}"
     docker tag "${CONTAINER_LOCAL_IMAGE}" "${reference}"
     docker push "${reference}"
     digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "${reference}" 2>/dev/null || true)
     echo "Pushed ${reference}${digest:+ (${digest})}"
     if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         {
-            echo "#### Container pushed: ${runtime_id} (${arch}, ${CONTAINER_VARIANT})"
+            echo "#### Container pushed: ${runtime_id} (${arch})"
             echo
             echo "- \`${reference}\`"
             echo

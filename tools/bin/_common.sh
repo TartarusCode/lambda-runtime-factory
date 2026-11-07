@@ -22,9 +22,8 @@ common::load_runtime_env() {
     local runtime_id=$1
     local arch
     arch=$(common::require_arch "${2:-}")
-    local variant=${3:-standard}
     eval "$(
-        python3 "$(common::manifest_cli)" env --runtime "${runtime_id}" --arch "${arch}" --variant "${variant}"
+        python3 "$(common::manifest_cli)" env --runtime "${runtime_id}" --arch "${arch}"
     )"
 }
 
@@ -32,14 +31,13 @@ common::ensure_runtime_built() {
     local runtime_id=$1
     local arch
     arch=$(common::require_arch "${2:-}")
-    local variant=${3:-standard}
     if [[ "${RUNTIME_BUILD_IN_PROGRESS:-0}" == "1" ]]; then
         return 0
     fi
 
     if [[ ! -d "${LAYER_ROOT}" || ! -f "${PACKAGE_PATH}" ]]; then
         bash "$(common::repo_root)/tools/bin/build-runtime" "${runtime_id}" "${arch}"
-        common::load_runtime_env "${runtime_id}" "${arch}" "${variant}"
+        common::load_runtime_env "${runtime_id}" "${arch}"
     fi
 }
 

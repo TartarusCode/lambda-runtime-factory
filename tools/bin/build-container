@@ -2,35 +2,41 @@
 # Build the OCI image for one runtime and architecture.
 #
 # The image is generated from the same ${LAYER_ROOT} the zip layer ships, so the
-# two artifacts cannot drift. The manifest's container.profile picks the shape:
+# two artifacts cannot drift. There is one base for every runtime: the
+# DoD-hardened Iron Bank UBI9-minimal, rendered from
+# tools/docker/Dockerfile.ironbank. It runs as UID 1001, is read-only at run time
+# with /tmp as the only writable path, and carries no package manager.
 #
-#   distroless  a runtime base. Everything that needs a shell (staging the
-#               payload, resolving its non-glibc shared libraries, installing
-#               them from Debian 12) happens in a builder stage; the final stage
-#               only gets COPY, ENV, WORKDIR, USER and an exec-form ENTRYPOINT.
-#   build       a build environment for a toolchain. Single stage, with a shell
-#               and a package manager, because a consumer's `RUN go build` needs
-#               both.
-#
-#   build-container <runtime_id> <arch> [--push] [--force] [--tag <tag>]
+#   build-container <runtime_id> <arch> [--push] [--force]
+#                    [--cache-from <ref>] [--cache-to <ref>]
 #
 # --push publishes <registry>/<runtime>:<version>-<arch>; the release pipeline
 # merges the two per-arch manifests into one multi-arch tag afterwards.
+#
+# Base resolution:
+#   * default: container.base_image (registry1.dso.mil)
+#   * USE_FALLBACK_UBI=1, or IRONBANK_TOKEN unset in CI: the Red Hat fallback,
+#     which serves the same UBI9-minimal userland
+#   * BASE_IMAGE_DIGEST (or container.base_image_digest): appended as @<digest>
+#
+# --ironbank is accepted and does nothing: it is the only path there is.
 set -euo pipefail
 
 source "$(dirname "$0")/_common.sh"
 
 push=0
 force=0
-variant=standard
+cache_from=""
+cache_to=""
 positional=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --push) push=1; shift ;;
         --force) force=1; shift ;;
         --no-cache) LAMBDA_CONTAINER_NO_CACHE=1; shift ;;
-        --variant) variant=$2; shift 2 ;;
-        --debug) variant=debug; shift ;;
+        --ironbank) shift ;;  # no-op: every image is on the Iron Bank base
+        --cache-from) cache_from=$2; shift 2 ;;
+        --cache-to) cache_to=$2; shift 2 ;;
         -*) echo "Unknown option: $1" >&2; exit 2 ;;
         *) positional+=("$1"); shift ;;
     esac
@@ -38,7 +44,7 @@ done
 
 runtime_id=$(common::require_runtime_id "${positional[0]:-}")
 arch=$(common::require_arch "${positional[1]:-}")
-common::load_runtime_env "${runtime_id}" "${arch}" "${variant}"
+common::load_runtime_env "${runtime_id}" "${arch}"
 
 if [[ "${CONTAINER_ENABLED}" != "true" ]]; then
     echo "${runtime_id} (${arch}) has no container target (container.enabled=false)" >&2
@@ -53,14 +59,42 @@ if [[ ! -d "${LAYER_ROOT}" || -z "$(ls -A "${LAYER_ROOT}" 2>/dev/null)" ]]; then
         mkdir -p "${LAYER_ROOT}"
         unzip -qo "${PACKAGE_PATH}" -d "${LAYER_ROOT}"
     else
-        common::ensure_runtime_built "${runtime_id}" "${arch}" "${variant}"
-        common::load_runtime_env "${runtime_id}" "${arch}" "${variant}"
+        common::ensure_runtime_built "${runtime_id}" "${arch}"
+        common::load_runtime_env "${runtime_id}" "${arch}"
     fi
 fi
 
-image="${CONTAINER_LOCAL_IMAGE}"
+# registry1.dso.mil needs credentials. A build without them (an external PR, a
+# fork, a local run) uses the Red Hat registry, which serves the same UBI9-minimal
+# userland. The release logs in and builds from the primary base.
+base_image="${CONTAINER_BASE_IMAGE}"
+if [[ "${USE_FALLBACK_UBI:-0}" == "1" ]]; then
+    base_image="${CONTAINER_FALLBACK_BASE_IMAGE}"
+    echo "USE_FALLBACK_UBI=1: building from ${base_image}"
+elif [[ "${GITHUB_ACTIONS:-}" == "true" && -z "${IRONBANK_TOKEN:-}" ]]; then
+    base_image="${CONTAINER_FALLBACK_BASE_IMAGE}"
+    echo "IRONBANK_TOKEN is unset: falling back to ${base_image}"
+fi
+digest="${BASE_IMAGE_DIGEST:-${CONTAINER_BASE_IMAGE_DIGEST}}"
+if [[ -n "${digest}" ]]; then
+    base_image="${base_image%%@*}@${digest}"
+fi
 
-prepare_args=(prepare --runtime "${runtime_id}" --arch "${arch}" --variant "${variant}")
+# A bare ref is a registry cache; a value that already names a type is passed
+# through so a caller can use a local or gha cache instead.
+cache_flag() {  # cache_flag <from|to> <value>
+    local direction=$1 value=$2
+    if [[ -z "${value}" ]]; then
+        return 0
+    fi
+    if [[ "${value}" == type=* ]]; then
+        printf -- '--cache-%s\n%s\n' "${direction}" "${value}"
+    else
+        printf -- '--cache-%s\ntype=registry,ref=%s\n' "${direction}" "${value}"
+    fi
+}
+
+prepare_args=(prepare --runtime "${runtime_id}" --arch "${arch}")
 if (( force )); then
     prepare_args+=(--force)
 fi
@@ -68,39 +102,43 @@ spec=$(python3 "$(common::repo_root)/tools/runtime_lib/container_image.py" "${pr
 context_dir=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["context_dir"])' <<<"${spec}")
 packages=$(python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["packages"]))' <<<"${spec}")
 
-echo "Building ${image} for ${CONTAINER_PLATFORM} (base ${CONTAINER_BASE_IMAGE}, profile ${CONTAINER_PROFILE}, variant ${CONTAINER_VARIANT})"
-if [[ "${CONTAINER_PROFILE}" == "build" ]]; then
-    echo "Installing the build environment's packages: ${packages:-none}"
-elif [[ -n "${packages}" ]]; then
-    echo "Staging runtime libraries from Debian 12: ${packages}"
-else
-    echo "The distroless base already provides every shared library the payload needs."
-fi
+image="${CONTAINER_LOCAL_IMAGE}"
+echo "Building ${image} for ${CONTAINER_PLATFORM} (base ${base_image})"
+echo "Installing UBI9 runtime packages: ${packages:-none}"
 
 build_args=(
     buildx build
     --platform "${CONTAINER_PLATFORM}"
     --file "${context_dir}/Dockerfile"
-    --build-arg "BASE_IMAGE=${CONTAINER_BASE_IMAGE}"
+    --build-arg "BASE_IMAGE=${base_image}"
+    --build-arg "BUILDER_IMAGE=${base_image}"
+    --build-arg "NONROOT_UID=${CONTAINER_NONROOT_UID}"
+    --build-arg "NONROOT_GID=${CONTAINER_NONROOT_GID}"
+    --build-arg "STAGE_PACKAGES=${packages}"
     --label "org.opencontainers.image.revision=${GITHUB_SHA:-$(git -C "$(common::repo_root)" rev-parse HEAD 2>/dev/null || echo unknown)}"
     --tag "${image}"
     --load
 )
+mapfile -t cache_from_args < <(cache_flag from "${cache_from}")
+mapfile -t cache_to_args < <(cache_flag to "${cache_to}")
+build_args+=("${cache_from_args[@]}" "${cache_to_args[@]}")
 if [[ "${LAMBDA_CONTAINER_NO_CACHE:-0}" == "1" ]]; then
     build_args+=(--no-cache)
 fi
 
 docker "${build_args[@]}" "${context_dir}"
 
-# The rootfs export is also the size measurement. `docker image inspect .Size` is
-# the compressed size on a containerd image store and the uncompressed one on the
-# classic overlay2 store, so the same image would be recorded with numbers a
-# factor of three apart depending on the runner.
+# The rootfs export is also the size measurement, and it asserts the Lambda
+# filesystem contract plus the STIG rules: world-writable /tmp, /var/task and /opt
+# present, no package manager left, and the RPM database a scanner reads intact.
+# `docker image inspect .Size` is the compressed size on a containerd image store
+# and the uncompressed one on the classic overlay2 store, so the same image would
+# be recorded with numbers a factor of three apart depending on the runner.
 verify_json=$(python3 "$(common::repo_root)/tools/runtime_lib/container_image.py" verify --image "${image}")
 unpacked_bytes=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["unpacked_bytes"])' <<<"${verify_json}")
 container_image_bytes=$(python3 "$(common::repo_root)/tools/runtime_lib/container_image.py" \
     record-size --runtime "${runtime_id}" --arch "${arch}" --image "${image}" \
-    --unpacked-bytes "${unpacked_bytes}" --variant "${variant}" \
+    --unpacked-bytes "${unpacked_bytes}" \
     | awk '{ print $(NF-1) }')
 
 echo "${runtime_id} (${arch}): image ${image} holds ${container_image_bytes} bytes unpacked (summed from the exported rootfs)"
@@ -113,7 +151,8 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" && "${LAMBDA_RUNTIME_SUMMARY_DEFERRED:-0}" !
         echo "### Container image: ${runtime_id} (${arch})"
         echo
         echo "- \`${CONTAINER_IMAGE}:${CONTAINER_TAG}-${ARCH}\`"
-        echo "- base: \`${CONTAINER_BASE_IMAGE}\`"
+        echo "- base: \`${base_image}\`"
+        echo "- user: \`${CONTAINER_USER}\`, workdir \`${CONTAINER_WORKDIR}\`"
         echo "- unpacked size: $(( container_image_bytes / 1048576 )) MB"
         echo
     } >> "${GITHUB_STEP_SUMMARY}"

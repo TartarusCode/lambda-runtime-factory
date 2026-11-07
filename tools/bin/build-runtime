@@ -124,9 +124,10 @@ PYEOF
 # Replace the shell bootstrap with a statically linked launcher for the families
 # whose bootstrap is a `#!/bin/sh` exec wrapper.
 #
-# A distroless image has no /bin/sh, so the wrapper can only work on
-# provided.al2023. The launcher is the same exec without a shell, and it works in
-# both places. It is compiled per target arch; when the build host is a different
+# The zip layer still needs it: on provided.al2023 the bootstrap is the file Lambda
+# execs, and a compiled launcher starts without an interpreter and forwards
+# signals without an intermediate shell holding PID 1. It works identically inside
+# the UBI9 image. It is compiled per target arch; when the build host is a different
 # architecture (a local arm64 build on an x86 host) the script stays in place and
 # the build warns, because the resulting image could not run it anyway.
 install_native_bootstrap() {
@@ -433,7 +434,8 @@ mkdir -p "${LAYER_ROOT}/${HELPER_INSTALL_DIR}"
 cp -R "${HELPER_SOURCE}" "${LAYER_ROOT}/${HELPER_INSTALL_DIR}/"
 
 # Go and Rust bootstrap through `exec` in a shell today; replace that with a
-# compiled launcher so the same payload runs on a shell-less distroless base.
+# compiled launcher so the payload starts without an interpreter — the same file
+# runs on provided.al2023 and inside the UBI9 image.
 install_native_bootstrap
 
 # Before the audit and the zip, so both see exactly what ships.
@@ -442,6 +444,17 @@ slim_layer
 if [[ "${BUILD_BEST_EFFORT_AUDIT:-1}" == "1" ]]; then
     RUNTIME_BUILD_IN_PROGRESS=1 bash "$(common::repo_root)/tools/bin/audit-runtime" --best-effort "${runtime_id}"
 fi
+
+# --- STIG rootless permissions --------------------------------------------------
+#
+# Lambda mounts a layer read-only and runs the function under an arbitrary
+# non-root UID. Upstream archives carry whatever mode their packager used, and a
+# file that is not world-readable (or a directory that is not world-traversable)
+# is a permission-denied at first import — under a UID the build never saw.
+# `a+rX` adds read for everyone and execute only where a directory (or a file
+# that already had any execute bit) needs it, so no binary loses its mode.
+chmod -R a+rX "${LAYER_ROOT}"
+chmod a+rx "${LAYER_ROOT}/${BOOTSTRAP_OUTPUT}"
 
 (
     cd "${LAYER_ROOT}"

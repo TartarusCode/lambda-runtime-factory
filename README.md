@@ -1,12 +1,13 @@
 # lambda-runtime-factory
 
-AWS Lambda **runtime packages** for the `provided.al2023` runtime — a Lambda layer and a
-distroless OCI image per runtime, built and published from one manifest-driven pipeline. Each
+AWS Lambda **runtime packages** for the `provided.al2023` runtime — a Lambda layer and a hardened
+Iron Bank UBI9 OCI image per runtime, built and published from one manifest-driven pipeline. Each
 runtime is an independent package under `runtimes/`.
 
 ## What gets published
 
-Every runtime is built and scanned, then ships as **two artifacts from the same payload**:
+Every runtime is built and scanned, then ships as **one container image and, where it fits, a
+layer — both from the same payload**:
 
 |  | Lambda layer | Container image |
 | --- | --- | --- |
@@ -18,18 +19,16 @@ Every runtime is built and scanned, then ships as **two artifacts from the same 
 - Uploads are content-addressed, so a layer version always points at the exact bytes it was built
   from, and layers are public (`lambda:GetLayerVersion` to `*`).
 - **Five runtimes ship no layer**: `go126`, `go127`, `rust194`, `rust198` and `rust199` carry a
-  whole upstream toolchain (`layer_publishable: false`). They are still built and scanned, and
-  they publish as images. See [DELIVERY.md](DELIVERY.md).
-- **`-debug` tags** — same payload and entrypoint on a base with a busybox shell, for looking at
-  an image that failed to start. The production tags never contain a shell.
-- **`-soci` tags** — the same image with a SOCI index bundled in, for functions on **Lambda
-  Managed Instances**, which then lazy-load it instead of downloading the whole thing. There is no
-  moving `-soci` tag: that image is immutable by design.
-- **Bases** — interpreter runtimes use `gcr.io/distroless/cc-debian13` (Debian 13/trixie:
-  upstream distroless only rebuilds the current release, so an older tag stops getting security
-  updates; no shell, minimal OS CVE surface, 10 GB limit instead of 250 MB); the Go and Rust
-  toolchains use `debian:12-slim` and `alpine:3.22`, because a `RUN go build` in a builder stage
-  needs a shell.
+  whole upstream toolchain (`layer_publishable: false`). They are still built and scanned, and they
+  publish as images. See [DELIVERY.md](DELIVERY.md).
+- **The base is Iron Bank UBI9** — `registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal`, the
+  DoD-hardened minimal userland, for every runtime. Each image runs as non-root `USER 1001:1001` on a
+  read-only rootfs with `/tmp` as the only writable path, carries no package manager, and bakes any
+  `certs/*.crt` root CA into its trust store. A build without Iron Bank credentials falls back to
+  `registry.access.redhat.com/ubi9/ubi-minimal`, which serves the same userland.
+- **`-soci` tags** — the same image with a SOCI index bundled in, for functions on **Lambda Managed
+  Instances**, which then lazy-load it instead of downloading the whole thing. There is no moving
+  `-soci` tag: that image is immutable by design.
 
 Resolve the current ARN for a layer:
 
@@ -70,32 +69,35 @@ aws lambda create-function --function-name my-function \
   --role <execution-role-arn>
 ```
 
-The image is distroless, so anything installed with `RUN` has to happen in a builder stage —
-see [examples/docker](examples/docker) for recipes covering pure-Python dependencies, a Bun
-bundle and the Go toolchain.
+The image is a **runtime image on the Iron Bank UBI9 base**: it runs as `USER 1001:1001` on a
+read-only rootfs, so anything installed with `RUN` has to happen in *your* builder stage — see
+[examples/docker](examples/docker) for recipes covering pure-Python dependencies, a Bun bundle and
+the Go toolchain.
 
-When an image fails to start, use the debug tag: the same payload and entrypoint with a
-busybox shell, so you can look at the real container instead of guessing.
+The entrypoint is `/opt/bootstrap`, the same file the zip layer ships, so the handler contract is
+identical either way: `CMD` carries the handler name and the runtime reads it exactly as it reads
+`_HANDLER`. Any `certs/*.crt` in this repository is baked into the image's trust store, and
+`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `DENO_CERT` and `NODE_EXTRA_CA_CERTS` all point at the
+resulting bundle.
 
-```bash
-docker run --rm -it --entrypoint /busybox/sh \
-  ghcr.io/tartaruscode/lambda-runtime-factory/pypy311:3.11-debug
-```
+Build it locally with `make container RUNTIME=pypy311` (add `USE_FALLBACK_UBI=1` when you have no
+`registry1.dso.mil` credentials), verify the STIG contract with `make container-check`, and
+smoke-test it with `make container-invoke`.
 
-The Go and Rust images are **toolchain images**: they carry `go`/`rustc`, not a handler, and
-they are build environments rather than runtime bases — `debian:12-slim` and `alpine:3.22`
-(musl), so a `RUN` step has a shell to run in. Use one as a build stage and deliver the
-compiled bootstrap on the OS-only base:
+The Go and Rust images are **toolchain images**: they carry `go`/`rustc`, not a handler. Their
+contract is the same entrypoint — `/opt/bootstrap` execs a compiled handler from
+`/opt/<runtime>/bin/<handler>` — so a consumer copies their built binary there:
 
 ```dockerfile
-FROM ghcr.io/tartaruscode/lambda-runtime-factory/go126:1.26 AS build
-WORKDIR /src
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /out/bootstrap .
+FROM ghcr.io/tartaruscode/lambda-runtime-factory/go126:1.26
 
-FROM public.ecr.aws/lambda/provided:al2023
-COPY --from=build /out/bootstrap ${LAMBDA_RUNTIME_DIR}/bootstrap
+COPY --from=build --chown=1001:1001 /out/bootstrap /opt/go/bin/myhandler
+CMD ["myhandler"]
 ```
+
+One caveat worth knowing before you pick a base for Rust: the Rust distribution is built for musl,
+so `rustc` itself cannot run inside a glibc image (UBI9 ships no musl loader). The image is for
+*running* a static musl handler, not for compiling one — compile in a build stage you control.
 
 ## Runtimes
 
@@ -125,6 +127,8 @@ the ids the current matrix builds.
 runtimes/<runtime-id>/   runtime.json, bootstrap/, helpers/, checksums/, examples/
 tools/bin/               build, audit, upload, publish, local-test entrypoints
 tools/runtime_lib/       family defaults, manifest resolution, bump tooling, tests
+tools/docker/            Dockerfile.ironbank — the canonical Iron Bank stage layout
+certs/                   extra root CAs baked into the Iron Bank images (*.crt)
 .github/workflows/       CI, release, audit and weekly version-bump pipelines
 .github/actions/         shared composite actions: matrix, build environment, build + audit
 ```

@@ -32,6 +32,15 @@ inputs:
       builds and audits those runtimes.
     required: false
     default: "false"
+  changed-only:
+    description: >-
+      "true" narrows the matrix to the runtimes whose files changed against the
+      base branch (or, when only tooling or docs changed, to a single canary
+      cell). This is the fast PR tier: a work-in-progress commit must not occupy
+      all 24 runners before the PR is ready to merge. Requires the caller's
+      checkout to have the base branch in its history (fetch-depth: 0).
+    required: false
+    default: "false"
 
 outputs:
   matrix:
@@ -61,8 +70,25 @@ runs:
         if [[ "${{ inputs.layer-publishable-only }}" == "true" ]]; then
           args+=(--layer-publishable-only)
         fi
+        runtime="${INPUT_RUNTIME:-all}"
+        arch="${INPUT_ARCH:-all}"
+        if [[ "${{ inputs.changed-only }}" == "true" ]]; then
+          base="origin/${GITHUB_BASE_REF:-main}"
+          changed=$(git diff --name-only "${base}...HEAD" 2>/dev/null \
+            | grep '^runtimes/' | cut -d/ -f2 | sort -u | paste -sd, - || true)
+          if [[ -z "${changed}" ]]; then
+            # Nothing under runtimes/ changed (tools, workflows, docs): one canary
+            # cell still proves the shared plumbing builds, without 24 runners.
+            echo "No runtime files changed against ${base}; running the pypy311 canary cell."
+            runtime="pypy311"
+            arch="x86_64"
+          else
+            echo "Changed runtimes against ${base}: ${changed}"
+            runtime="${changed}"
+          fi
+        fi
         matrix=$(python3 tools/runtime_lib/runtime_manifest.py matrix \
-          --runtime "${INPUT_RUNTIME:-all}" \
-          --arch "${INPUT_ARCH:-all}" \
+          --runtime "${runtime}" \
+          --arch "${arch}" \
           "${args[@]}")
         echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"

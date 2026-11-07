@@ -8,8 +8,8 @@ publishes — layer names, regions, architectures and how to consume them — se
 
 - Linux or WSL is required for build and release commands
 - The shared tooling assumes native Linux tools such as `bash`, `tar`, `zip`, `unzip`, `curl`,
-  `sha256sum`, `cc`, and `make`. `cc` links the Go/Rust bootstrap launcher; without it the
-  shell bootstrap is kept (and the distroless image build refuses it)
+  `sha256sum`, `cc`, and `make`. `cc` links the Go/Rust bootstrap launcher; without it the shell
+  bootstrap is kept
 - Docker with BuildKit (`docker buildx`) is required for the container artifact
 - `readelf` (binutils) is used to resolve the payload's shared libraries
 - Transient build work is staged under `${BUILD_ROOT:-$RUNNER_TEMP}` or `/tmp` to avoid slow
@@ -32,7 +32,17 @@ make check RUNTIME=pypy311            # validate the manifest and compile its Py
 make test                             # repo test suite (pytest)
 ```
 
-`upload`/`publish`/`publicize`/`latest` need AWS credentials. Builds and scans do not.
+Container work:
+
+```bash
+make container        RUNTIME=pypy311 ARCH=x86_64   # the Iron Bank UBI9 image
+make container-check  RUNTIME=pypy311 ARCH=x86_64   # assert its STIG contract
+make container-invoke RUNTIME=pypy311 ARCH=x86_64   # smoke test, rootless + read-only
+```
+
+`upload`/`publish`/`publicize`/`latest` need AWS credentials. Builds, scans and container smoke
+tests do not. A local build with no `registry1.dso.mil` credentials uses the Red Hat fallback
+automatically: `USE_FALLBACK_UBI=1 make container …`.
 
 ## The runtime manifest
 
@@ -77,112 +87,128 @@ Every runtime also has a `container` block, merged from `REPO_DEFAULTS` and the 
 ```json
 "container": {
   "enabled": true,
-  "profile": "distroless",
-  "base_image": "gcr.io/distroless/cc-debian13:nonroot",
-  "libs_base_image": "debian:13-slim",
+  "base_image": "registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal:latest",
+  "fallback_base_image": "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+  "base_image_digest": "",
+  "nonroot_uid": 1001,
+  "nonroot_gid": 1001,
+  "packages": ["ca-certificates"],
+  "unsatisfied_sonames": [],
   "registry": "ghcr.io/tartaruscode/lambda-runtime-factory",
+  "registries": ["ghcr.io/tartaruscode/lambda-runtime-factory", "public.ecr.aws/tartaruscode/lambda-runtime-factory"],
   "workdir": "/var/task",
   "layer_root": "/opt",
   "entrypoint": ["/opt/bootstrap"],
-  "packages": [],
-  "links": {},
-  "smoke_test": [],
-  "env": {"HOME": "/tmp", "TMPDIR": "/tmp", "LAMBDA_TASK_ROOT": "/var/task"},
-  "user": "65532:65532"
+  "smoke_test": {},
+  "env": {"HOME": "/tmp", "TMPDIR": "/tmp", "LAMBDA_TASK_ROOT": "/var/task", "GOCACHE": "/tmp/.cache/go-build", "GOPATH": "/tmp/go", "CARGO_HOME": "/tmp/.cargo", "RUSTUP_HOME": "/tmp/.rustup", "DENO_DIR": "/tmp/.deno", "PYTHONPYCACHEPREFIX": "/tmp/.pycache"},
+  "user": "1001:1001"
 }
 ```
 
-`profile` decides what the image *is*, and the two answers are not interchangeable:
+There is **one base**. A family manifest may not redeclare `base_image`, `profile`, `user` or
+`entrypoint` — `test_no_second_container_base_survives_anywhere` refuses it, because a second base
+doubles the container matrix and the tag set for no gain. The only per-family container keys are
+`env` (a `PATH` for the toolchains, a `PYTHONPATH` for the interpreters), `smoke_test` and
+`unsatisfied_sonames`.
 
-- **`distroless`** — a runtime base. No shell, no package manager; the entrypoint must be a
-  binary inside the payload, and the libraries the payload links against are staged from
-  Debian 12. This is the default and what every interpreter runtime uses.
-- **`build`** — a build environment, for a toolchain. A toolchain image is only useful as a
-  Dockerfile build stage, and a `RUN` step needs a shell, so the base is a shell-bearing image
-  (`debian:12-slim`, `alpine:3.22`). The manifest then declares `packages` (installed with the
-  base's own package manager), `links` (symlinks the payload needs to be runnable, e.g. musl's
-  `libc.so` and rustc's sysroot) and `smoke_test` (the toolchain command that proves the image
-  works — a build image has no handler to invoke). `validate-runtimes` refuses a `build`
-  profile without a `smoke_test`, and refuses `packages` on a `distroless` one.
-
-The image is built from the **same** `${LAYER_ROOT}` as the zip layer, so the two artifacts
-cannot drift:
+The image is built from the **same** `${LAYER_ROOT}` as the zip layer, so the two artifacts cannot
+drift, and `build-container` never re-derives the payload — `build-runtime` owns the download, the
+checksum, the extraction, the slimming and the `chmod -R a+rX`:
 
 ```bash
 make build RUNTIME=pypy311 ARCH=x86_64        # payload
 make container RUNTIME=pypy311 ARCH=x86_64    # image from that payload
-make container-invoke RUNTIME=pypy311 ARCH=x86_64   # RIE smoke test (or the toolchain's own)
+make container-check RUNTIME=pypy311 ARCH=x86_64    # assert the STIG contract
+make container-invoke RUNTIME=pypy311 ARCH=x86_64   # smoke test (or the toolchain's own)
 bash tools/bin/audit-container pypy311 x86_64 # Grype scan of the image
 ```
 
-### Variants: the production image and the debug image
+### The stage layout
 
-Every distroless runtime publishes two images from one payload:
+`tools/docker/Dockerfile.ironbank` is the one canonical file, rendered per runtime by
+`container_image.render_dockerfile`: the entrypoint is fixed at `/opt/bootstrap` (the STIG
+contract) and only the payload path, the environment and the labels come from the manifest. Keeping
+the invariants in a reviewable file rather than in Python string concatenation is deliberate —
+`test_ironbank_template_carries_the_stig_invariants` reads the file, not the generator.
 
-- **`<version>`** — the production image: no shell, `USER 65532:65532`, and the runtime's
-  entrypoint. This is the one a function uses.
-- **`<version>-debug`** — the *same payload and entrypoint* on
-  `gcr.io/distroless/cc-debian13:debug-nonroot`, which also carries a busybox shell
-  (`/busybox/sh`, already on `PATH`). Same uid, same invocation: what you inspect is what
-  failed. It is not meant to be deployed.
+Three rules matter when you touch this path:
 
-The variant travels as `container.debug_base_image` in the manifest (empty means "this family
-has no debug variant", which is how the `build` profiles are configured: they already have a
-shell). Everything else — entrypoint, user, environment, workdir — is shared, and
-`check-container-variants` tests exactly that claim: the standard image must fail to execute
-`/bin/sh` and `/busybox/sh`, the debug image must succeed, and the two must agree on
-`Entrypoint` and `User`.
+- **Libraries are installed, never copied.** `container_image.required_ubi_packages` maps the
+  payload's `DT_NEEDED` sonames to UBI9 packages and the image installs them with
+  `microdnf install -y --nodocs --setopt=install_weak_deps=0`. Cherry-picking resolved `.so` files
+  would leave `/var/lib/rpm` without the owning package — so Grype cannot match a RHEL backport and
+  reports a patched library as vulnerable — and `/etc/ld.so.cache` stale. `rpm` and `/var/lib/rpm`
+  therefore stay in the image, and only `microdnf`/`dnf`/`yum` are removed;
+  `container_image.verify_image_layout` fails a build that lost the RPM database.
+  - A soname the base genuinely cannot provide is empty repo-wide. `rust-musl` declares one
+    (`libc.so`, musl's soname, which UBI9 has no package for) in
+    `container.unsatisfied_sonames`, because the binaries needing it are the ones the image's
+    runtime contract does not run. Add a name there only with that kind of reason.
+- **`registry1.dso.mil` needs credentials.** Set `IRONBANK_USERNAME`/`IRONBANK_TOKEN` as repository
+  secrets and the workflows log in; without them (`USE_FALLBACK_UBI=1`, or `IRONBANK_TOKEN` unset in
+  CI) the build uses `registry.access.redhat.com/ubi9/ubi-minimal`, which serves the same userland.
+  `BASE_IMAGE_DIGEST` pins the base so Iron Bank's daily rebuild cannot move it under a reproducible
+  build.
+- **Root CAs come from `certs/*.crt`.** The builder stage copies them into
+  `/etc/pki/ca-trust/source/anchors/` and runs `update-ca-trust extract`; the final stage points
+  every TLS stack at the resulting bundle. An empty directory is valid.
 
-```bash
-make container        RUNTIME=pypy311 ARCH=x86_64   # standard
-make container-debug  RUNTIME=pypy311 ARCH=x86_64   # the debug variant
-make container-variants RUNTIME=pypy311 ARCH=x86_64 # assert both claims
-bash tools/bin/container-variants pypy311 x86_64    # standard debug | standard
+### The STIG contract, and how it is proven
+
+`USER 1001:1001`, `WORKDIR /var/task`, `ENTRYPOINT ["/opt/bootstrap"]`, no package manager, and
+every writable path (`HOME`, `TMPDIR`, `GOCACHE`, `GOPATH`, `CARGO_HOME`, `RUSTUP_HOME`, `DENO_DIR`,
+`PYTHONPYCACHEPREFIX`) under `/tmp`, because `/` is read-only at run time.
+
+Three checks read that back from real bytes rather than trusting the Dockerfile:
+
+- `build-container` runs `container_image.verify_image_layout` on the exported rootfs: `/tmp` is
+  `1777`, `/var/task` and `/opt` exist, no `microdnf`/`dnf`/`yum`, and `/var/lib/rpm` is present.
+- `make container-check` (`tools/bin/check-container`) reads `USER`, `Entrypoint` and `WorkingDir`
+  off the image and then runs a probe as that UID on a read-only rootfs with a uid-owned `/tmp`
+  tmpfs, asserting `/opt/bootstrap` is readable, `/tmp` is writable, `/var/task` exists and the
+  package managers are gone.
+- `local-invoke-container` runs the smoke test under exactly those flags —
+  `--read-only --tmpfs /tmp:rw,exec,size=512m,uid=1001,gid=1001 --user 1001:1001` — with
+  `aws-lambda-rie` bind-mounted read-only from the host cache. The emulator is never baked into a
+  published image.
+
+That same rootfs export measures the image's **unpacked** size, which is what the job summary and
+`build-stats.json` record: `docker image inspect .Size` is the compressed size on a containerd image
+store and the uncompressed one on the classic overlay2 store, so the same image read 82,283,585 B on
+a CI runner and 251,143,202 B on a developer box. The rootfs sum is the number Lambda counts against
+its 10 GB container limit, and it does not depend on the daemon.
+
+### The entrypoint, and the families that have no handler
+
+One entrypoint for every family: `/opt/bootstrap`, the same file the zip layer ships. UBI9-minimal
+has a shell, so a `#!/bin/sh` wrapper works, and an interpreter bootstrap's shebang names the
+payload's own interpreter and is exec'd directly by the kernel.
+
+Per family:
+
+- **pypy / graalpy** — `bootstrap.py3` starts `#!/opt/pypy/bin/pypy` (or graalpy), so a direct
+  `execve` of `/opt/bootstrap` resolves the interpreter. The image carries the layer's
+  `site-packages` on `PYTHONPATH`.
+- **bun / deno** — the bootstrap is a `#!/bin/sh` wrapper that `exec`s the runtime with the helper
+  and its flags. The environment it exports (`HOME=/tmp`, `DENO_DIR=/tmp/.deno`) is also initialized
+  at the top of `helpers/lambda_runtime_*/runtime.ts`, so the zip layer and the image share one code
+  path.
+- **go / rust** — `build-runtime` compiles `tools/launcher/bootstrap.c` into `/opt/bootstrap` with
+  `cc -O2 -static`, replacing the `#!/bin/sh` exec wrapper. The same ELF runs on `provided.al2023`
+  and inside the image. If the build host is a different architecture, the script is kept and the
+  build warns.
+
+An image whose runtime has no handler to invoke declares its own smoke test instead
+(`container.smoke_test`), which runs under the same rootless read-only flags:
+
+```json
+// go-toolchain: the distribution is glibc-linked, so it runs on this base
+"smoke_test": {"argv": ["go", "version"], "expect_version": true}
+
+// rust-musl: rustc is musl-linked and this base ships no musl loader, so the
+// launcher's own handler contract is what gets asserted
+"smoke_test": {"argv": ["/opt/bootstrap"], "expect_exit": 127, "expect_output": "_HANDLER is not set"}
 ```
-
-CI builds the debug variant for every cell that has one and runs the variant check, so a base
-swap that quietly dropped the entrypoint or the user fails there rather than in production.
-
-### The entrypoint must not need a shell
-
-`gcr.io/distroless/cc-debian13` has no `/bin/sh`, no `/bin/bash` and no `/usr/bin/env`. That
-makes the entrypoint part of the contract:
-
-- **pypy / graalpy** — `["/opt/pypy/bin/pypy", "/opt/bootstrap"]` (the interpreter, then the
-  script). The shebang is still there for the zip layer, but the image does not rely on it.
-- **bun / deno** — the runtime binary itself, with the helper and its flags in argv:
-  `["/opt/deno/deno", "run", "--allow-net", …, "/opt/deno/lib/lambda_runtime_deno/runtime.ts"]`.
-  The environment the shell bootstrap used to export (`HOME=/tmp`, `DENO_DIR=/tmp/.deno`) is
-  initialized at the top of `helpers/lambda_runtime_*/runtime.ts`, so the zip layer and the
-  image share one code path.
-- **go / rust** — `build-runtime` compiles `tools/launcher/bootstrap.c` into `/opt/bootstrap`
-  with `cc -O2 -static`, replacing the `#!/bin/sh` exec wrapper. The same ELF runs on
-  `provided.al2023` and on distroless, which is what the *layer* needs. Their images are
-  `build` profiles and do not use it: a toolchain image is a build stage, so its entrypoint is
-  `/bin/sh` and the toolchain is on `PATH`. If the build host is a different architecture, the
-  script is kept and the build warns.
-
-`container_image.assert_native_entrypoint` enforces this before the Docker build: a shebang
-script or a missing path fails with a message naming the file.
-
-### Shared libraries and the filesystem contract
-
-The base ships glibc, libm, libpthread, librt, libgcc, libstdc++, OpenSSL and ca-certificates —
-not zlib, bzip2 or ncurses. `container_image.py` scans the payload's `DT_NEEDED` entries,
-maps anything the base lacks to a Debian package (`PACKAGE_FOR_SONAME`), and generates a
-`debian:<N>-slim` builder stage — the same release the base is built from, `debian:13-slim` for
-trixie — that copies those `.so` files into the final image's
-`/usr/lib/<triplet>`. An unmapped soname fails the build with its name instead of producing an
-image that cannot `dlopen`. The final stage only uses `COPY`, `ENV`, `WORKDIR`, `USER` and
-`ENTRYPOINT` — never `RUN`, which would need a shell.
-
-`/tmp` is `1777` in the base and `/var/task` is the `WORKDIR`; `build-container` verifies both
-(plus `/opt`) from the exported rootfs before reporting success, because Lambda's contract
-requires them. That same export measures the image's **unpacked** size, which is what the job
-summary and `build-stats.json` record: `docker image inspect .Size` is the compressed size on a
-containerd image store and the uncompressed one on the classic overlay2 store, so the same image
-read 82,283,585 B on a CI runner and 251,143,202 B on a developer box. The rootfs sum is the
-number Lambda counts against its 10 GB container limit, and it does not depend on the daemon.
 
 ### Building arm64 on an x86 host
 
@@ -191,7 +217,7 @@ with `exec format error`. Docker Desktop registers it, a plain `dockerd` does no
 
 ```bash
 docker run --privileged --rm tonistiigi/binfmt --install arm64
-docker run --rm --platform linux/arm64 alpine:3.22 uname -m    # aarch64
+docker run --rm --platform linux/arm64 registry.access.redhat.com/ubi9/ubi-minimal uname -m  # aarch64
 ```
 
 Emulation is slow, and for a GraalVM-based payload also a little flaky: GraalPy's first
@@ -229,11 +255,11 @@ alias segment of the `public.ecr.aws/...` entries only, so the manifest keeps na
 docs and the image URIs use, and flipping over when the alias is approved is a settings change
 rather than a commit. Empty or unset means "use the manifest".
 
-`push-container --variant debug` uses `<version>-<arch-slug>-debug`, and the release's
-`merge-containers` job calls `merge-container-tags`, which combines the two per-arch images of
-each variant into `<version>`, the version line, and the moving tag — `latest` for the standard
-image, `debug` for the debug one — once per registry. A dispatch that targeted one architecture
-leaves the per-arch tags alone with a notice instead of failing.
+`push-container` tags the per-arch image `<version>-<arch-slug>` (and `-soci` for the SOCI copy),
+and the release's `merge-containers` job calls `merge-container-tags`, which combines the per-arch
+images into `<version>`, the version line, and the moving tag — `latest`, on a tagged release. A
+dispatch that targeted one architecture leaves the per-arch tags alone with a notice instead of
+failing.
 
 SOCI publishing produces a **second image per architecture**, not a tag on the published one:
 `soci convert --standalone` packages the index into a new image (SOCI Index Manifest v2), and
@@ -292,24 +318,44 @@ Requirements:
 
 ## CI
 
-`.github/workflows/ci.yml` runs on every push to `main` and every PR (docs-only changes are
-skipped):
+`.github/workflows/ci.yml` runs on every push to `main`, every PR (docs-only changes are
+skipped) and on demand via `workflow_dispatch`. It has **two tiers**, so a work-in-progress commit
+does not occupy all 24 runners:
 
-- `repo-checks` (once): manifest validation, `bash -n` over `tools/bin/`, a compile check per
-  runtime and the online archive-URL check, plus the test suite
+- **Fast tier** — a draft PR, or a PR whose labels do not include `ready-to-merge`, runs only the
+  cells whose files changed under `runtimes/` (computed by the `runtime-matrix` action from
+  `git diff --name-only origin/<base>...HEAD`), or a single `pypy311` canary cell when nothing
+  under `runtimes/` changed at all.
+- **Full tier** — a push to `main`, a `workflow_dispatch`, or a PR that left draft and carries
+  `ready-to-merge` runs the full 24-cell matrix.
+
+Between the two:
+
+- `repo-checks` (once, < 1 min): manifest validation, `bash -n` over `tools/bin/`, a compile check
+  per runtime and the online archive-URL check, plus the test suite
 - `grype-db` (once): refreshes and caches the ~2.8GB vulnerability database for the matrix
 - `runtime-checks` (matrix): builds every runtime × architecture, scans the ones whose pinned
-  payload changed, and on x86 runs the local SAM smoke test
+  payload changed, builds the Iron Bank image, scans and smoke-tests it, and checks its STIG
+  contract (`check-container`); on x86 it additionally runs the local SAM smoke test
 - caches: upstream runtime downloads, the built package, the Grype binary and database
 - artifacts: built zips upload on **push to `main` only**, `retention-days: 7`
 - superseded PR runs cancel via workflow concurrency
 
+Docker Buildx is set up with the `docker-container` driver, and every image build passes
+`--cache-from type=registry,ref=$CONTAINER_CACHE_REF`
+(`ghcr.io/tartaruscode/lambda-runtime-factory/<runtime>:buildcache-<arch>`, derived in the
+manifest so no caller invents its own). Only the default branch adds `--cache-to …,mode=max`, so a
+PR's cache never lands on a ref nothing else can read. That is what makes the base pull, the
+certificate extraction and the library installation cheap on a re-run.
+
 Three composite actions in `.github/actions/` hold the whole per-cell procedure so the workflows
 cannot drift apart:
 
-- `runtime-matrix` — the build/publish matrix, generated from the manifest list
+- `runtime-matrix` — the build/publish matrix, generated from the manifest list (and narrowed to
+  the changed runtimes for the fast tier)
 - `runtime-build-env` — the download, package, Grype-binary and Grype-database caches
-- `build-and-audit-runtime` — archive tooling, `make build`, `tools/bin/audit-runtime`
+- `build-and-audit-runtime` — archive tooling, Buildx setup, `make build`, `tools/bin/audit-runtime`,
+  and the image build, scan, smoke test and STIG contract check
 
 `.github/workflows/audit-runtimes.yml` runs the same matrix weekly to catch CVE-database drift,
 and `.github/workflows/check-updates.yml` opens the weekly version-bump PR.
