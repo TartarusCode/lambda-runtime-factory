@@ -124,12 +124,12 @@ PYEOF
 # Replace the shell bootstrap with a statically linked launcher for the families
 # whose bootstrap is a `#!/bin/sh` exec wrapper.
 #
-# The zip layer still needs it: on provided.al2023 the bootstrap is the file Lambda
-# execs, and a compiled launcher starts without an interpreter and forwards
-# signals without an intermediate shell holding PID 1. It works identically inside
-# the UBI9 image. It is compiled per target arch; when the build host is a different
-# architecture (a local arm64 build on an x86 host) the script stays in place and
-# the build warns, because the resulting image could not run it anyway.
+# `/opt/bootstrap` is the file the container entrypoint execs, and a compiled
+# launcher starts without an interpreter and forwards signals without an
+# intermediate shell holding PID 1. It is compiled per target arch; when the build
+# host is a different architecture (a local arm64 build on an x86 host) the script
+# stays in place and the build warns, because the resulting image could not run it
+# anyway.
 install_native_bootstrap() {
     case "${RUNTIME_FAMILY}" in
         go-toolchain | rust-musl) ;;
@@ -179,8 +179,8 @@ install_native_bootstrap() {
     echo "Installed the native bootstrap for ${RUNTIME_DIR_NAME} (${ARCH}) at ${output}"
 }
 
-# Sum of the regular files under a directory: what the deployment-package budget
-# counts (the zip's unzipped size).
+# Sum of the regular files under a directory: the payload size the image copies,
+# recorded in build-stats.json.
 payload_bytes() {
     python3 - "$1" <<'PYEOF'
 import os
@@ -416,12 +416,11 @@ cp -R "${HELPER_SOURCE}" "${LAYER_ROOT}/${HELPER_INSTALL_DIR}/"
 # runs on provided.al2023 and inside the UBI9 image.
 install_native_bootstrap
 
-# Before the audit and the zip, so both see exactly what ships.
+# Before the payload is described, so the manifest records what ships.
 slim_layer
 
-# No vulnerability scan here any more: the authoritative scan runs against the
-# image (generate-compliance-artifacts), because the RPM database is half of what
-# makes a finding mean anything.
+# The vulnerability scan runs against the image (generate-compliance-artifacts),
+# because the RPM database is half of what makes a finding mean anything.
 
 # --- STIG rootless permissions --------------------------------------------------
 #

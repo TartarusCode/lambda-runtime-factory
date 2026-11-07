@@ -1,13 +1,12 @@
 /*
  * Shell-free bootstrap for the Go and Rust runtime families.
  *
- * The zip layer on provided.al2023 used to ship a `#!/bin/sh` bootstrap that
- * exec'd /opt/<runtime>/bin/$_HANDLER. A distroless container has no /bin/sh, so
- * build-runtime compiles this launcher instead: one statically linked binary that
- * runs unchanged on Amazon Linux 2023 and on gcr.io/distroless/cc-debian12.
+ * `/opt/bootstrap` is what the container entrypoint execs, and a `#!/bin/sh`
+ * wrapper would need an interpreter on the image and would hold PID 1 in a shell.
+ * build-runtime compiles this launcher instead: one statically linked binary.
  *
- * It does exactly what the shell did: apply the Lambda filesystem contract and
- * exec the handler named by _HANDLER, without spawning an interpreter.
+ * It applies the Lambda filesystem contract and execs the handler named by
+ * _HANDLER, without spawning an interpreter.
  *
  * Compiled per runtime with -DRUNTIME_DIR_NAME="go" / "rust".
  */
@@ -31,9 +30,8 @@
 int main(int argc, char **argv) {
     /* Lambda sets _HANDLER; a container image may instead pass the handler as
      * CMD (`CMD ["app.handler"]`), which reaches us as the first argument after
-     * the entrypoint. Accepting both keeps one payload usable as a zip layer and
-     * as a container image, and exporting it keeps the handler code's own
-     * getenv("_HANDLER") working either way. */
+     * the entrypoint. Accepting both lets the same payload start either way, and
+     * exporting it keeps the handler code's own getenv("_HANDLER") working. */
     const char *handler = getenv("_HANDLER");
     if ((handler == NULL || handler[0] == '\0') && argc > 1) {
         handler = argv[1];

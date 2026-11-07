@@ -6,20 +6,25 @@
 # tools/runtime_lib/container_image.py renders it per runtime, substituting the
 # @@...@@ placeholders with the labels and the payload path the runtime manifest
 # declares. Keeping the layout here (rather than in Python string concatenation)
-# is what makes the STIG invariants reviewable:
+# is what makes the STIG invariants reviewable.
 #
-#   * Stage 1 (builder) injects the DoD/enterprise root CAs and extracts the
-#     trust store.
-#   * Stage 2 (runtime) is the shipped image. Library dependencies are installed
-#     with the base's own package manager — never by copying resolved files —
-#     so `/var/lib/rpm` and `/etc/ld.so.cache` stay consistent and Grype's RHEL
-#     backport detection keeps working. The package manager is removed again
-#     before the image ships. The process runs as UID 1001 on a read-only rootfs
-#     with /tmp as the only writable path.
+# ---------------------------------------------------------------------------
+# ORDERING IS A CACHE CONTRACT
+# ---------------------------------------------------------------------------
+# Everything above the first runtime-specific instruction must be byte-identical
+# for every runtime on an architecture, so BuildKit can reuse one OS layer for
+# all of them instead of each cell pulling ubi9-minimal and running the install
+# itself. Concretely: no @@...@@ placeholder, no runtime ARG and no LABEL
+# may appear above the shared setup, because each of those changes the cache key
+# and invalidates the layer that costs the most to build.
 #
-# The base is registry1.dso.mil (Iron Bank). A build without Iron Bank
-# credentials falls back to registry.access.redhat.com, which serves the same
-# UBI9-minimal userland; the release always builds from the primary base.
+# test_dockerfile_keeps_the_shared_os_layer_above_every_runtime_specific_instruction
+# pins this, so a future edit cannot quietly reintroduce the per-runtime rebuild.
+#
+# Stage 2 is therefore two halves:
+#   * shared setup  — trust store, TLS env, the library floor, package-manager
+#                     removal, the RPM/os-release assertion, /var/task
+#   * per-runtime   — labels, payload, environment, workdir, user
 ARG BASE_IMAGE="registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal:latest"
 ARG BUILDER_IMAGE="${BASE_IMAGE}"
 
@@ -39,13 +44,11 @@ RUN if [ -d /etc/pki/ca-trust/source/anchors ] && [ "$(ls -A /etc/pki/ca-trust/s
     fi
 
 # ---------------------------------------------------------------------------
-# Stage 2: hardened STIG rootless runtime
+# Stage 2: hardened STIG rootless runtime — shared setup
 # ---------------------------------------------------------------------------
 FROM ${BASE_IMAGE} AS runtime
 ARG NONROOT_UID=1001
 ARG NONROOT_GID=1001
-
-@@LABELS@@
 
 # The extracted trust store, with the injected CAs baked in.
 COPY --from=builder /etc/pki/ca-trust/extracted /etc/pki/ca-trust/extracted
@@ -57,27 +60,26 @@ ENV SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt \
     DENO_CERT=/etc/pki/tls/certs/ca-bundle.crt \
     NODE_EXTRA_CA_CERTS=/etc/pki/tls/certs/ca-bundle.crt
 
-# The layer payload lives at /opt, exactly as Lambda mounts a layer — and it is
-# the same ${LAYER_ROOT} tree build-runtime produced, owned by the runtime UID so
-# a read-only mount is the only thing standing between the function and its own
-# payload.
-COPY --chown=${NONROOT_UID}:${NONROOT_GID} layer/ @@LAYER_ROOT@@/
-
-# STIG: every file readable and every directory traversable by any UID, because
-# Lambda runs the function under a UID the build never saw.
-RUN chmod -R a+rX @@LAYER_ROOT@@
-
-# Runtime library dependencies, installed by the base's own package manager so
-# RPM's file database and the dynamic-linker cache are maintained by RPM itself.
+# The runtime library floor, installed by the base's own package manager so RPM's
+# file database and the dynamic-linker cache are maintained by RPM itself.
 # Copying resolved `.so` files by hand would leave `/var/lib/rpm` without the
 # owning package (Grype then cannot match a RHEL backport and reports false
 # positives) and `/etc/ld.so.cache` stale.
-ARG STAGE_PACKAGES=""
-RUN if [ -n "${STAGE_PACKAGES}" ]; then \
-        microdnf install -y --nodocs --setopt=install_weak_deps=0 ${STAGE_PACKAGES} && \
-        microdnf clean all && \
-        rm -rf /var/cache/dnf /var/log/*; \
-    fi
+#
+# The list is the union of every runtime's `DT_NEEDED` requirements, which today
+# is exactly this set for all of them — container_image.prepare refuses a runtime
+# whose needs fall outside it, so this stays one shared layer rather than growing
+# a per-runtime install below.
+RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 \
+        ca-certificates \
+        zlib \
+        libffi \
+        expat \
+        libxcrypt-compat \
+        bzip2-libs \
+        xz-libs && \
+    microdnf clean all && \
+    rm -rf /var/cache/dnf /var/log/*
 
 # A runtime image has no use for a package manager, and STIG wants none. Removing
 # only packages that are actually installed keeps the transaction from aborting on
@@ -96,6 +98,9 @@ RUN for pkg in microdnf dnf yum; do \
 # builds and still runs — it just produces an SBOM with no lineage, which is the
 # compliance artifact this image exists for. Assert both here, where the cause is
 # still visible, instead of discovering it in a scan report.
+#
+# /var/task is created here, owned by the runtime UID, so its ownership does not
+# depend on a later WORKDIR creating it as root.
 RUN set -eu; \
     rpmdb=""; \
     for candidate in /var/lib/rpm /usr/lib/sysimage/rpm; do \
@@ -112,7 +117,26 @@ RUN set -eu; \
         echo "/etc/os-release is missing, so a scanner cannot identify the distribution" >&2; \
         exit 1; \
     fi; \
+    mkdir -p /var/task && chown "${NONROOT_UID}:${NONROOT_GID}" /var/task; \
     echo "RPM lineage: ${rpmdb} ($(ls "${rpmdb}" | wc -l) entries), os-release present"
+
+# ---------------------------------------------------------------------------
+# Everything below is runtime-specific: labels carry the version and the runtime
+# id, and the payload differs per runtime. Nothing here may move above the shared
+# setup without losing the cache reuse.
+# ---------------------------------------------------------------------------
+
+@@LABELS@@
+
+# The payload is the ${LAYER_ROOT} tree build-runtime staged — including the
+# /opt/runtime-manifest.json that records which upstream bytes it came from — and
+# it is owned by the runtime UID so a read-only mount is the only thing standing
+# between the function and its own payload.
+COPY --chown=${NONROOT_UID}:${NONROOT_GID} layer/ @@LAYER_ROOT@@/
+
+# STIG: every file readable and every directory traversable by any UID, because
+# Lambda runs the function under a UID the build never saw.
+RUN chmod -R a+rX @@LAYER_ROOT@@
 
 @@ENV@@
 

@@ -1,8 +1,8 @@
 #!/bin/bash
 # Build the OCI image for one runtime and architecture.
 #
-# The image is generated from the same ${LAYER_ROOT} the zip layer ships, so the
-# two artifacts cannot drift. There is one base for every runtime: the
+# The image is generated from the ${LAYER_ROOT} payload that build-runtime staged,
+# so the two steps cannot drift. There is one base for every runtime: the
 # DoD-hardened Iron Bank UBI9-minimal, rendered from
 # tools/docker/Dockerfile. It runs as UID 1001, is read-only at run time
 # with /tmp as the only writable path, and carries no package manager.
@@ -49,17 +49,11 @@ if [[ "${CONTAINER_ENABLED}" != "true" ]]; then
     exit 1
 fi
 
-# A package cache hit restores artifacts/ but not the unpacked payload. Rebuild
-# the payload from the zip the cache restored instead of re-downloading upstream.
+# The payload is the build input, so it has to exist before the image build reads
+# it; a cache hit restores artifacts/ only.
 if [[ ! -d "${LAYER_ROOT}" || -z "$(ls -A "${LAYER_ROOT}" 2>/dev/null)" ]]; then
-    if [[ -f "${PACKAGE_PATH}" ]]; then
-        echo "Unpacking the cached package into ${LAYER_ROOT}"
-        mkdir -p "${LAYER_ROOT}"
-        unzip -qo "${PACKAGE_PATH}" -d "${LAYER_ROOT}"
-    else
-        common::ensure_runtime_built "${runtime_id}" "${arch}"
-        common::load_runtime_env "${runtime_id}" "${arch}"
-    fi
+    common::ensure_runtime_built "${runtime_id}" "${arch}"
+    common::load_runtime_env "${runtime_id}" "${arch}"
 fi
 
 # registry1.dso.mil needs credentials. A build without them (an external PR, a
@@ -102,7 +96,7 @@ packages=$(python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["pac
 
 image="${CONTAINER_LOCAL_IMAGE}"
 echo "Building ${image} for ${CONTAINER_PLATFORM} (base ${base_image})"
-echo "Installing UBI9 runtime packages: ${packages:-none}"
+echo "Installing the shared UBI9 library floor: ${packages:-none}"
 
 build_args=(
     buildx build
@@ -112,14 +106,44 @@ build_args=(
     --build-arg "BUILDER_IMAGE=${base_image}"
     --build-arg "NONROOT_UID=${CONTAINER_NONROOT_UID}"
     --build-arg "NONROOT_GID=${CONTAINER_NONROOT_GID}"
-    --build-arg "STAGE_PACKAGES=${packages}"
     --label "org.opencontainers.image.revision=${GITHUB_SHA:-$(git -C "$(common::repo_root)" rev-parse HEAD 2>/dev/null || echo unknown)}"
     --tag "${image}"
+    # --load keeps the image in the local daemon: `docker image inspect`,
+    # `syft docker:<tag>` and the rootless smoke test all read it from there, and
+    # none of them can consume a cache-only export.
     --load
 )
-mapfile -t cache_from_args < <(cache_flag from "${cache_from}")
-mapfile -t cache_to_args < <(cache_flag to "${cache_to}")
-build_args+=("${cache_from_args[@]}" "${cache_to_args[@]}")
+
+# BuildKit cache.
+#
+# In GitHub Actions the `gha` backend is scoped per branch, needs no registry
+# login, and is what makes the shared base layer worthwhile: the base scope is
+# deliberately runtime-independent, so the cells on one architecture reuse
+# a single `ubi9-minimal` pull plus `microdnf install` layer instead of each cell
+# building it. Writes to the base scope are identical across cells and the
+# cache service keys them by layer digest, so the duplicate writes converge rather
+# than fighting.
+#
+# Outside Actions (a developer box) there is no cache service, so the explicit
+# `--cache-from`/`--cache-to` flags carry a registry ref instead.
+cache_mode="${CONTAINER_BUILD_CACHE:-}"
+if [[ -z "${cache_mode}" && "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    cache_mode="gha"
+fi
+
+if [[ "${cache_mode}" == "gha" ]]; then
+    echo "BuildKit cache: type=gha (ubi9-base-${CONTAINER_ARCH}, runtime-${runtime_id}-${CONTAINER_ARCH})"
+    build_args+=(
+        --cache-from "type=gha,scope=ubi9-base-${CONTAINER_ARCH}"
+        --cache-from "type=gha,scope=runtime-${runtime_id}-${CONTAINER_ARCH}"
+        --cache-to "type=gha,mode=max,scope=ubi9-base-${CONTAINER_ARCH}"
+        --cache-to "type=gha,mode=max,scope=runtime-${runtime_id}-${CONTAINER_ARCH}"
+    )
+else
+    mapfile -t cache_from_args < <(cache_flag from "${cache_from}")
+    mapfile -t cache_to_args < <(cache_flag to "${cache_to}")
+    build_args+=("${cache_from_args[@]}" "${cache_to_args[@]}")
+fi
 if [[ "${LAMBDA_CONTAINER_NO_CACHE:-0}" == "1" ]]; then
     build_args+=(--no-cache)
 fi

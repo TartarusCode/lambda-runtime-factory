@@ -105,6 +105,23 @@ PACKAGE_FOR_SONAME_UBI: Dict[str, str] = {
 }
 
 
+# The UBI9 packages every runtime image installs, identical for every runtime so
+# the Dockerfile can keep them in the single layer BuildKit reuses across cells. The
+# set is the union of every runtime's DT_NEEDED requirements; `prepare` refuses a
+# payload that needs anything else, and
+# test_the_library_floor_matches_the_dockerfile_and_the_manifest keeps this list,
+# the Dockerfile's install line and the manifest default from drifting apart.
+RUNTIME_LIBRARY_FLOOR = (
+    "bzip2-libs",
+    "ca-certificates",
+    "expat",
+    "libffi",
+    "libxcrypt-compat",
+    "xz-libs",
+    "zlib",
+)
+
+
 class ContainerError(RuntimeError):
     """A container build input is missing or a library cannot be resolved."""
 
@@ -293,7 +310,7 @@ def prepare(runtime_id: str, arch: str, *, force: bool = False) -> Dict[str, Any
         )
 
     # The image entrypoints at the payload's bootstrap, so the payload must carry
-    # one. It is the same file the zip layer ships.
+    # one.
     bootstrap = layer_root / env["BOOTSTRAP_OUTPUT"]
     if not bootstrap.exists():
         raise ContainerError(
@@ -331,10 +348,11 @@ def prepare(runtime_id: str, arch: str, *, force: bool = False) -> Dict[str, Any
         for cert in sorted(repo_certs.glob("*.crt")):
             shutil.copy2(cert, certs_dir / cert.name)
 
-    # Which UBI9 packages to install. The manifest declares an explicit floor
-    # (ca-certificates); the payload's DT_NEEDED scan adds any soname the base does
-    # not ship. The names go into a `microdnf install` build arg — no file is ever
-    # cherry-picked, so RPM keeps owning /var/lib/rpm and ld.so.cache.
+    # Which UBI9 packages to install. The manifest declares an explicit floor; the
+    # payload's DT_NEEDED scan can only ever confirm it, because the floor is what
+    # the Dockerfile installs in the one layer every runtime shares. A runtime that
+    # needed something else would cost every cell the whole ubi9 base pull, so it is
+    # an error rather than a per-runtime install.
     sonames = scan_payload_sonames(layer_root)
     provided = payload_library_names(layer_root)
     declared = json.loads(env.get("CONTAINER_PACKAGES") or "[]")
@@ -345,6 +363,16 @@ def prepare(runtime_id: str, arch: str, *, force: bool = False) -> Dict[str, Any
         provided_by_payload=provided,
         unsatisfied=unsatisfied,
     )
+    outside_floor = sorted(set(packages) - set(RUNTIME_LIBRARY_FLOOR))
+    if outside_floor:
+        raise ContainerError(
+            f"{runtime_id} ({arch}) needs {', '.join(outside_floor)}, which is outside the "
+            "shared runtime library floor. Add it to RUNTIME_LIBRARY_FLOOR in "
+            "tools/runtime_lib/container_image.py and to the first `microdnf install` in "
+            "tools/docker/Dockerfile, and to container.packages in the manifest defaults: the "
+            "floor is the layer every runtime shares, so a runtime-specific install would "
+            "make every cell rebuild the base."
+        )
 
     labels = {
         "org.opencontainers.image.title": f"lambda-runtime-factory {runtime_id}",
