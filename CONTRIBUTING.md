@@ -1,7 +1,7 @@
 # Developing lambda-runtime-factory
 
 Building, testing, releasing and extending the runtime packages. For what the repository
-publishes — layer names, regions, architectures and how to consume them — see the
+publishes — tag names, registries, architectures and how to verify them — see the
 [README](README.md).
 
 ## Build environment
@@ -22,27 +22,26 @@ publishes — layer names, regions, architectures and how to consume them — se
 
 ```bash
 make list-runtimes                    # the ids the current matrix builds
-make build RUNTIME=pypy311            # build the layer package
-make audit RUNTIME=pypy311            # Grype scan of the built package
-make upload RUNTIME=pypy311           # push the package to S3
-make publish RUNTIME=pypy311          # create the Lambda layer version
-make publicize RUNTIME=pypy311        # publish and grant public permissions
-make latest RUNTIME=pypy311           # print the current layer version ARNs
+make build RUNTIME=pypy311            # stage the payload
 make check RUNTIME=pypy311            # validate the manifest and compile its Python
 make test                             # repo test suite (pytest)
 ```
 
-Container work:
+Image and supply-chain work:
 
 ```bash
 make container        RUNTIME=pypy311 ARCH=x86_64   # the Iron Bank UBI9 image
 make container-check  RUNTIME=pypy311 ARCH=x86_64   # assert its STIG contract
 make container-invoke RUNTIME=pypy311 ARCH=x86_64   # smoke test, rootless + read-only
+make compliance       RUNTIME=pypy311 ARCH=x86_64   # SBOMs, Grype report, provenance
+make container-push   RUNTIME=pypy311 ARCH=x86_64   # push the per-arch image
+make attest           RUNTIME=pypy311 ARCH=x86_64   # cosign sign + attach the bundle
 ```
 
-`upload`/`publish`/`publicize`/`latest` need AWS credentials. Builds, scans and container smoke
-tests do not. A local build with no `registry1.dso.mil` credentials uses the Red Hat fallback
-automatically: `USE_FALLBACK_UBI=1 make container …`.
+Nothing here needs AWS credentials. The smoke test, the scan and the push use the registry you are
+logged in to; a build with no `registry1.dso.mil` credentials uses the Red Hat fallback automatically
+(`USE_FALLBACK_UBI=1 make container …`). `make attest` needs an OIDC token for keyless signing, so it
+only signs in CI — locally it says so and exits 0.
 
 ## The runtime manifest
 
@@ -50,8 +49,8 @@ Each runtime package declares its build and release contract in `runtimes/<id>/r
 the runtime family, its version or distribution identifier, and any override of the family
 defaults. Most details are derived from `RUNTIME_FAMILY_DEFAULTS` in
 `tools/runtime_lib/runtime_manifest.py`, so a runtime that follows an established family layout
-keeps a very small manifest. Anything derived (layer name, regions, S3 prefix, paths, bootstrap
-and helper locations) can be inspected with:
+keeps a very small manifest. Anything derived (tag names, registries, paths, bootstrap and helper
+locations) can be inspected with:
 
 ```bash
 make list-runtimes
@@ -60,25 +59,13 @@ python3 tools/runtime_lib/runtime_manifest.py env --runtime pypy311 --arch x86_6
 ```
 
 The manifest list is the single source of truth for the CI and release matrices — both call
-`runtime_manifest.py matrix` through the same composite action.
+`runtime_manifest.py matrix` through the same composite action, and both run all 12 runtimes. There
+is no per-runtime opt-out: one artifact per runtime means nothing to narrow.
 
-Deployment regions and the S3 bucket base name are repo-level settings in `REPO_DEFAULTS`, not
-per-runtime fields. A runtime manifest that redeclares them silently wins over the global value,
-because the manifest is merged last.
-
-One field is neither derived nor a version: `layer_publishable` (removed) used to mark a runtime whose package
-cannot be delivered as a Lambda layer, because a deployment package is capped at 250 MB
-unzipped — the function plus every layer attached to it. It is still built and scanned
-everywhere; only the publish matrix skips it. Because it is resolved from the *merged*
-manifest, declaring it on a family in `RUNTIME_FAMILY_DEFAULTS` covers every line of that
-family, including lines a version bump has not generated yet. See [DELIVERY.md](DELIVERY.md).
-
-The same view carries the byte budget: `max_unzipped_bytes` (262144000) and
-`warn_unzipped_bytes` (209715200) live in `REPO_DEFAULTS` and are exported to the build as
-`MAX_UNZIPPED_BYTES` and `WARN_UNZIPPED_BYTES`, alongside `LAYER_PUBLISHABLE`. The build
-measures the package, writes `build-stats.json` next to the artifact and appends a row to the
-job summary; an oversized package that claims to be publishable fails the build instead of
-failing a release at `PublishLayerVersion`.
+There is no byte budget any more. The 250 MB unzipped ceiling applied to Lambda layers, and the
+layer is gone; the image has a 10 GB limit that no runtime approaches. `build-stats.json` now records
+the staged payload size, and the number that matters — the unpacked image size — is measured from the
+exported rootfs by `build-container` and recorded in `container.json`.
 
 ## Container images
 
@@ -111,9 +98,9 @@ doubles the container matrix and the tag set for no gain. The only per-family co
 `env` (a `PATH` for the toolchains, a `PYTHONPATH` for the interpreters), `smoke_test` and
 `unsatisfied_sonames`.
 
-The image is built from the **same** `${LAYER_ROOT}` as the zip layer, so the two artifacts cannot
-drift, and `build-container` never re-derives the payload — `build-runtime` owns the download, the
-checksum, the extraction, the slimming and the `chmod -R a+rX`:
+The image is built from the **same** `${LAYER_ROOT}` that `build-runtime` staged, so the two steps
+cannot drift, and `build-container` never re-derives the payload — it reads what the build produced,
+including the `/opt/runtime-manifest.json` that records where those bytes came from.
 
 ```bash
 make build RUNTIME=pypy311 ARCH=x86_64        # payload
@@ -180,9 +167,8 @@ its 10 GB container limit, and it does not depend on the daemon.
 
 ### The entrypoint, and the families that have no handler
 
-One entrypoint for every family: `/opt/bootstrap`, the same file the zip layer ships. UBI9-minimal
-has a shell, so a `#!/bin/sh` wrapper works, and an interpreter bootstrap's shebang names the
-payload's own interpreter and is exec'd directly by the kernel.
+One entrypoint for every family: `/opt/bootstrap`, which applies the Lambda filesystem contract and
+execs the runtime.
 
 Per family:
 
@@ -191,7 +177,7 @@ Per family:
   `site-packages` on `PYTHONPATH`.
 - **bun / deno** — the bootstrap is a `#!/bin/sh` wrapper that `exec`s the runtime with the helper
   and its flags. The environment it exports (`HOME=/tmp`, `DENO_DIR=/tmp/.deno`) is also initialized
-  at the top of `helpers/lambda_runtime_*/runtime.ts`, so the zip layer and the image share one code
+  at the top of `helpers/lambda_runtime_*/runtime.ts`, so the bootstrap and the helper share one code
   path.
 - **go / rust** — `build-runtime` compiles `tools/launcher/bootstrap.c` into `/opt/bootstrap` with
   `cc -O2 -static`, replacing the `#!/bin/sh` exec wrapper. The same ELF runs on `provided.al2023`
