@@ -1,24 +1,24 @@
 #!/bin/bash
-# Scan a runtime's distroless image with Grype.
+# Scan a runtime's image with Grype.
 #
-# The payload scan (audit-runtime) covers the runtime bytes; this covers the
-# image as it ships — base OS packages included — so a CVE in the image's glibc or
-# OpenSSL cannot slip through just because the payload is clean. Same policy as
-# the payload scan: high and above, fixed only.
+# The payload scan (audit-runtime) covers the runtime bytes; this covers the image
+# as it ships — base OS packages included — so a CVE in the base's glibc, OpenSSL
+# or zlib cannot slip through just because the payload is clean. Same policy as the
+# payload scan: high and above, fixed only.
+#
+# The RPM database is what makes this meaningful on a UBI9 base: a RHEL backport is
+# matched through the installed package's release, which is exactly what a
+# hand-copied `.so` would destroy.
 set -euo pipefail
 
 source "$(dirname "$0")/_common.sh"
 
 best_effort=0
-variant=standard
-ironbank=0
 positional=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --best-effort) best_effort=1; shift ;;
-        --variant) variant=$2; shift 2 ;;
-        --debug) variant=debug; shift ;;
-        --ironbank) ironbank=1; shift ;;
+        --ironbank) shift ;;  # no-op: every image is on the Iron Bank base
         -*) echo "Unknown option: $1" >&2; exit 2 ;;
         *) positional+=("$1"); shift ;;
     esac
@@ -26,23 +26,11 @@ done
 
 runtime_id=$(common::require_runtime_id "${positional[0]:-}")
 arch=$(common::require_arch "${positional[1]:-}")
-common::load_runtime_env "${runtime_id}" "${arch}" "${variant}"
+common::load_runtime_env "${runtime_id}" "${arch}"
 
-# The Iron Bank image is a second artifact with its own base and its own CVE
-# surface, so it is scanned as bytes, not assumed clean because the distroless
-# image is.
-local_image="${CONTAINER_LOCAL_IMAGE}"
-build_args=()
-if (( ironbank )); then
-    local_image="${CONTAINER_IRONBANK_LOCAL_IMAGE}"
-    build_args=(--ironbank)
-else
-    build_args=(--variant "${variant}")
-fi
-
-if ! docker image inspect "${local_image}" >/dev/null 2>&1; then
-    bash "$(common::repo_root)/tools/bin/build-container" "${runtime_id}" "${arch}" "${build_args[@]}"
-    common::load_runtime_env "${runtime_id}" "${arch}" "${variant}"
+if ! docker image inspect "${CONTAINER_LOCAL_IMAGE}" >/dev/null 2>&1; then
+    bash "$(common::repo_root)/tools/bin/build-container" "${runtime_id}" "${arch}"
+    common::load_runtime_env "${runtime_id}" "${arch}"
 fi
 
 grype_config="${RUNTIME_DIR}/.grype.yaml"
@@ -52,7 +40,7 @@ if [[ -f "${grype_config}" ]]; then
 fi
 
 if type -P grype >/dev/null; then
-    grype "${grype_config_args[@]}" -q --fail-on high --only-fixed "docker:${local_image}"
+    grype "${grype_config_args[@]}" -q --fail-on high --only-fixed "docker:${CONTAINER_LOCAL_IMAGE}"
     exit 0
 fi
 

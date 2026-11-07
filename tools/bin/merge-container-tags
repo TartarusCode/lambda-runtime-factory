@@ -1,29 +1,27 @@
 #!/bin/bash
-# Combine the per-arch images of each variant into one multi-arch tag, per
-# registry.
+# Combine the per-arch images of a runtime into one multi-arch tag, per registry.
 #
 # A manifest list cannot be built from an image that does not exist, so this runs
 # after both architectures have pushed. Every registry in the manifest gets the
 # same tags, and a partial dispatch (one arch) leaves the per-arch tags alone with
 # a notice rather than failing.
 #
-#   merge-container-tags <runtime_id>
+#   merge-container-tags <runtime_id> [--soci]
 #
-# Tags per variant: <version>, the version line, and a moving tag on a tagged
-# release — `latest` for the standard image, `debug` for the debug one.
+# Tags: <version>, the version line, and a moving `latest` on a tagged release.
+# There is one image per runtime, so there is no variant suffix to combine.
 set -euo pipefail
 
 source "$(dirname "$0")/_common.sh"
 
 runtime_id=$(common::require_runtime_id "${1:-}")
-common::load_runtime_env "${runtime_id}" "${ARCH:-x86_64}" standard
+common::load_runtime_env "${runtime_id}" "${ARCH:-x86_64}"
 
 soci=0
-ironbank=0
 for argument in "${@:2}"; do
     case "${argument}" in
         --soci) soci=1 ;;
-        --ironbank) ironbank=1 ;;
+        --ironbank) ;;  # no-op: every image is on the Iron Bank base
         *) echo "Unknown option: ${argument}" >&2; exit 2 ;;
     esac
 done
@@ -33,74 +31,35 @@ line="${VERSION_LINE}"
 
 mapfile -t registries < <(python3 -c 'import json,sys
 for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIES_OVERRIDE:-${CONTAINER_REGISTRIES}}")
-mapfile -t variants < <(bash "$(dirname "$0")/container-variants" "${runtime_id}" x86_64)
 
 for registry in "${registries[@]}"; do
     image="${registry}/${RUNTIME_ID}"
-    for variant in "${variants[@]}"; do
-        if [[ "${variant}" == "debug" ]]; then
-            suffix="-debug"
-            moving="debug"
-        else
-            suffix=""
-            moving="latest"
-        fi
+    arm_tag="${image}:${tag}-arm64"
+    if ! docker buildx imagetools inspect "${arm_tag}" >/dev/null 2>&1; then
+        echo "::notice::${runtime_id}: no ${arm_tag}; leaving the per-arch tags as published"
+        continue
+    fi
 
-        arm_tag="${image}:${tag}-arm64${suffix}"
-        if ! docker buildx imagetools inspect "${arm_tag}" >/dev/null 2>&1; then
-            echo "::notice::${runtime_id} (${variant}): no ${arm_tag}; leaving the per-arch tags as published"
-            continue
-        fi
+    tags=(--tag "${image}:${tag}" --tag "${image}:${line}")
+    # A moving `latest` is only meaningful for a tagged release: a replayed older
+    # dispatch must not roll the moving tag backwards.
+    if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+        tags+=(--tag "${image}:latest")
+    fi
 
-        tags=(--tag "${image}:${tag}${suffix}" --tag "${image}:${line}${suffix}")
-        # Moving `latest`/`debug` is only meaningful for a tagged release: a
-        # replayed older dispatch must not roll the moving tag backwards.
-        if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
-            tags+=(--tag "${image}:${moving}")
-        fi
+    echo "Merging ${image}:${tag} from the two per-arch images"
+    docker buildx imagetools create "${tags[@]}" \
+        "${image}:${tag}-amd64" "${arm_tag}"
 
-        echo "Merging ${image}:${tag}${suffix} from the two per-arch images"
-        docker buildx imagetools create "${tags[@]}" \
-            "${image}:${tag}-amd64${suffix}" "${arm_tag}"
-
-        if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-            {
-                echo "### Multi-arch image: ${runtime_id} (${variant})"
-                echo
-                echo '```'
-                docker buildx imagetools inspect "${image}:${tag}${suffix}"
-                echo '```'
-                echo
-            } >> "${GITHUB_STEP_SUMMARY}"
-        fi
-    done
-
-    # The Iron Bank images merge the same way, under their own `-ironbank` tags.
-    # No moving tag: a consumer pinning `<line>-ironbank` is exactly the point of
-    # a hardened base, and a moving tag would silently change their userland.
-    if (( ironbank )); then
-        iron_arm="${image}:${tag}-arm64-ironbank"
-        if ! docker buildx imagetools inspect "${iron_arm}" >/dev/null 2>&1; then
-            echo "::notice::${runtime_id} (ironbank): no ${iron_arm}; leaving the per-arch Iron Bank images as published"
-            continue
-        fi
-
-        echo "Merging ${image}:${tag}-ironbank from the two per-arch Iron Bank images"
-        docker buildx imagetools create \
-            --tag "${image}:${tag}-ironbank" \
-            --tag "${image}:${line}-ironbank" \
-            "${image}:${tag}-amd64-ironbank" "${iron_arm}"
-
-        if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-            {
-                echo "### Multi-arch Iron Bank image: ${runtime_id}"
-                echo
-                echo '```'
-                docker buildx imagetools inspect "${image}:${tag}-ironbank"
-                echo '```'
-                echo
-            } >> "${GITHUB_STEP_SUMMARY}"
-        fi
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+        {
+            echo "### Multi-arch image: ${runtime_id}"
+            echo
+            echo '```'
+            docker buildx imagetools inspect "${image}:${tag}"
+            echo '```'
+            echo
+        } >> "${GITHUB_STEP_SUMMARY}"
     fi
 
     # The SOCI-enabled images merge the same way, but they are indexes rather than
