@@ -71,6 +71,12 @@ REPO_DEFAULTS: Dict[str, Any] = {
         # family's native dependencies. The payload's DT_NEEDED scan adds whatever
         # else the base does not ship; nothing is ever copied as a bare .so.
         "packages": ["ca-certificates"],
+        # Sonames the payload needs that this base genuinely cannot provide. Empty
+        # by default, because an unsatisfied soname is a defect and the build must
+        # say so with the soname in the message. A family may declare one here —
+        # with the reason in its own comment — when the binaries that need it are
+        # ones the image's contract does not run.
+        "unsatisfied_sonames": [],
         # Registries the release publishes to. The first is the primary: it names
         # the image in the docs, the examples and the release record. Amazon ECR
         # Public is here because a Lambda *function* cannot pull from GHCR at
@@ -341,6 +347,11 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
                 "expect_exit": 127,
                 "expect_output": "_HANDLER is not set",
             },
+            # `libc.so` is musl's soname — resolved by the musl loader, which this
+            # base does not ship and UBI9 has no package for. The toolchain binaries
+            # that need it (`rustc`) are the ones the runtime contract does not run;
+            # a consumer's static musl handler needs neither musl nor glibc.
+            "unsatisfied_sonames": ["libc.so"],
             "env": {
                 "PATH": "/opt/rust/cargo/bin:/opt/rust/rustc/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             },
@@ -562,6 +573,7 @@ def validate_runtime_data(runtime_id: str, data: Dict[str, Any]) -> None:
             "nonroot_uid",
             "nonroot_gid",
             "packages",
+            "unsatisfied_sonames",
             "registry",
             "registries",
             "workdir",
@@ -611,6 +623,15 @@ def validate_runtime_data(runtime_id: str, data: Dict[str, Any]) -> None:
                 f"Runtime {runtime_id} container.smoke_test.expect_exit must be an "
                 "integer exit code"
             )
+
+    unsatisfied = data["container"]["unsatisfied_sonames"]
+    if not isinstance(unsatisfied, list) or any(
+        not isinstance(name, str) for name in unsatisfied
+    ):
+        raise ValueError(
+            f"Runtime {runtime_id} container.unsatisfied_sonames must be a list of "
+            "soname strings"
+        )
 
     # The release pushes to every registry in the list, and the first one is what
     # the docs and the release record name: an empty list publishes nowhere, and a
@@ -738,6 +759,7 @@ def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> Dict[str, str]:
         "CONTAINER_NONROOT_UID": str(container["nonroot_uid"]),
         "CONTAINER_NONROOT_GID": str(container["nonroot_gid"]),
         "CONTAINER_PACKAGES": json.dumps(container["packages"]),
+        "CONTAINER_UNSATISFIED_SONAMES": json.dumps(container["unsatisfied_sonames"]),
         "CONTAINER_SMOKE_TEST": json.dumps(container["smoke_test"]),
         "CONTAINER_REGISTRY": container_registry,
         "CONTAINER_REGISTRIES": json.dumps(container_registries),

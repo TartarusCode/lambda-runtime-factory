@@ -167,21 +167,32 @@ def payload_library_names(layer_root: Path) -> set[str]:
 
 
 def required_ubi_packages(
-    sonames: Iterable[str], *, provided_by_payload: Iterable[str] = ()
+    sonames: Iterable[str],
+    *,
+    provided_by_payload: Iterable[str] = (),
+    unsatisfied: Iterable[str] = (),
 ) -> List[str]:
-    """Map sonames to the UBI9 packages that provide what the base does not."""
+    """Map sonames to the UBI9 packages that provide what the base does not.
+
+    ``unsatisfied`` names the sonames a family has explicitly declared this base
+    cannot provide (see ``container.unsatisfied_sonames``). Anything else that is
+    neither in the base nor shipped by the payload fails the build with the soname
+    in the message, because that is a defect and not a decision.
+    """
     payload = set(provided_by_payload)
+    tolerated = set(unsatisfied)
     missing = [
         name
         for name in sonames
-        if name not in UBI_PROVIDED and name not in payload
+        if name not in UBI_PROVIDED and name not in payload and name not in tolerated
     ]
     unknown = [name for name in missing if name not in PACKAGE_FOR_SONAME_UBI]
     if unknown:
         raise ContainerError(
             "The UBI9-minimal base does not provide these shared libraries and no "
             f"UBI9 package is mapped for them: {', '.join(unknown)}. Add them to "
-            "PACKAGE_FOR_SONAME_UBI in tools/runtime_lib/container_image.py."
+            "PACKAGE_FOR_SONAME_UBI in tools/runtime_lib/container_image.py, or "
+            "declare them in container.unsatisfied_sonames with the reason."
         )
     return sorted({PACKAGE_FOR_SONAME_UBI[name] for name in missing})
 
@@ -191,6 +202,7 @@ def ironbank_packages(
     sonames: Iterable[str],
     *,
     provided_by_payload: Iterable[str] = (),
+    unsatisfied: Iterable[str] = (),
 ) -> List[str]:
     """The UBI9 packages an image installs.
 
@@ -200,7 +212,13 @@ def ironbank_packages(
     """
     return sorted(
         set(declared)
-        | set(required_ubi_packages(sonames, provided_by_payload=provided_by_payload))
+        | set(
+            required_ubi_packages(
+                sonames,
+                provided_by_payload=provided_by_payload,
+                unsatisfied=unsatisfied,
+            )
+        )
     )
 
 
@@ -320,7 +338,13 @@ def prepare(runtime_id: str, arch: str, *, force: bool = False) -> Dict[str, Any
     sonames = scan_payload_sonames(layer_root)
     provided = payload_library_names(layer_root)
     declared = json.loads(env.get("CONTAINER_PACKAGES") or "[]")
-    packages = ironbank_packages(declared, sonames, provided_by_payload=provided)
+    unsatisfied = json.loads(env.get("CONTAINER_UNSATISFIED_SONAMES") or "[]")
+    packages = ironbank_packages(
+        declared,
+        sonames,
+        provided_by_payload=provided,
+        unsatisfied=unsatisfied,
+    )
 
     labels = {
         "org.opencontainers.image.title": f"lambda-runtime-factory {runtime_id}",

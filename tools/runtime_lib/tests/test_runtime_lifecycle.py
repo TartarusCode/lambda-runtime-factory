@@ -2233,3 +2233,22 @@ def test_the_release_publishes_to_ecr_public_and_writes_a_soci_index() -> None:
     assert "SOCI_VERSION" in soci["env"], "the soci CLI must be pinned"
     assert "ORAS_VERSION" in soci["env"], "oras moves the OCI layout, so it is pinned too"
     assert "publish-soci" not in jobs, "the separate SOCI job was folded into the image jobs"
+
+
+def test_an_unsatisfied_soname_must_be_declared_and_justified() -> None:
+    """An unsatisfied soname is a defect by default — the build fails with its
+    name. A family can declare one instead, and only the musl toolchain does."""
+    with pytest.raises(container_image.ContainerError, match=r"libc\.so"):
+        container_image.required_ubi_packages(["libc.so"])
+
+    assert container_image.required_ubi_packages(["libc.so"], unsatisfied=["libc.so"]) == []
+
+    declared = {
+        runtime_id: runtime_manifest.load_runtime(runtime_id)["container"]["unsatisfied_sonames"]
+        for runtime_id in runtime_manifest.list_active_runtime_ids()
+        if runtime_manifest.load_runtime(runtime_id)["container"]["unsatisfied_sonames"]
+    }
+    assert declared, "the rust family should declare its musl soname"
+    assert set(declared) == {"rust194", "rust198", "rust199"}, declared
+    for runtime_id, names in declared.items():
+        assert names == ["libc.so"], runtime_id
