@@ -259,28 +259,6 @@ PYEOF
     after=$(payload_bytes "${root}")
     echo "bytecode: $(find "${root}" -type f -name '*.pyc' | wc -l) .pyc files, $(( (after - before) / 1024 )) KiB added"
 
-    if [[ "${LAYER_PUBLISHABLE}" == "true" && "${after}" -ge "${MAX_UNZIPPED_BYTES:-262144000}" ]]; then
-        local removed
-        removed=$(python3 - "${snapshot}" "${root}" <<'PYEOF'
-import os
-import sys
-
-keep = set(open(sys.argv[1], encoding="utf-8").read().splitlines())
-root = sys.argv[2]
-removed = 0
-for dirpath, _dirnames, filenames in os.walk(root):
-    for name in filenames:
-        if not name.endswith(".pyc"):
-            continue
-        path = os.path.join(dirpath, name)
-        if path not in keep:
-            os.unlink(path)
-            removed += 1
-print(removed)
-PYEOF
-)
-        echo "::warning::${runtime_id} would exceed ${MAX_UNZIPPED_BYTES} bytes with precompiled bytecode; removed ${removed} generated .pyc files" >&2
-    fi
     rm -f "${snapshot}"
 }
 
@@ -456,45 +434,56 @@ fi
 chmod -R a+rX "${LAYER_ROOT}"
 chmod a+rx "${LAYER_ROOT}/${BOOTSTRAP_OUTPUT}"
 
-(
-    cd "${LAYER_ROOT}"
-    # Deterministic package. The SHA-256 of this zip is both the S3 object key and
-    # the layer-reuse key (Content.CodeSha256), so identical inputs must produce
-    # identical bytes. zip records every entry's mtime and, without -X, the uid/gid
-    # it was written with — and cp/cp -R stamp their copies with "now" — so pin the
-    # mtimes to the zip epoch in UTC and drop the ownership extras.
-    TZ=UTC find . -exec touch -h -t 198001010000.00 {} +
-    TZ=UTC zip -qrX "${PACKAGE_PATH}" .
-)
-
-# --- size accounting and the deployment-package gate ----------------------------
+# --- self-describing payload -----------------------------------------------------
 #
-# AWS caps a deployment package at 250 MB *unzipped*, counting the function and
-# all of its layers together. Discovering that at PublishLayerVersion costs a
-# release run, so package_size.py measures the package, writes build-stats.json
-# next to the artifact and fails here for anything that claims to be publishable.
-python3 "${REPO_ROOT}/tools/runtime_lib/package_size.py" check \
-    --runtime "${runtime_id}" \
-    --arch "${arch}" \
-    --package "${PACKAGE_PATH}" \
-    --stats-out "${ARTIFACT_DIR}/build-stats.json" \
-    --publishable "${LAYER_PUBLISHABLE:-true}" \
-    --max-unzipped-bytes "${MAX_UNZIPPED_BYTES:-262144000}" \
-    --warn-unzipped-bytes "${WARN_UNZIPPED_BYTES:-209715200}"
+# The image ships this file at /opt/runtime-manifest.json, so a consumer who
+# pulls it can see which upstream bytes it came from without consulting this
+# repository — and generate-compliance-artifacts reads the same record instead of
+# re-deriving it.
+upstream_sha256=$(checksum_for)
+python3 - "${LAYER_ROOT}/runtime-manifest.json" "${runtime_id}" "${RUNTIME_FAMILY}" \
+    "${DISTRIBUTION_VERSION}" "${arch}" "${ARCHIVE_URL}" "${upstream_sha256}" <<'PYEOF'
+import json
+import sys
 
-# The row belongs in the job summary. The composite action defers it so the
-# container image size can be added after the image is built; a standalone build
-# writes it immediately.
-if [[ -n "${GITHUB_STEP_SUMMARY:-}" && "${LAMBDA_RUNTIME_SUMMARY_DEFERRED:-0}" != "1" ]]; then
-    python3 "${REPO_ROOT}/tools/runtime_lib/package_size.py" summary \
-        --runtime "${runtime_id}" \
-        --arch "${arch}" \
-        --summary-file "${GITHUB_STEP_SUMMARY}"
-fi
+path, runtime_id, family, version, arch, url, sha256 = sys.argv[1:8]
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(
+        {
+            "runtime_id": runtime_id,
+            "runtime_family": family,
+            "distribution_version": version,
+            "arch": arch,
+            "upstream_archive_url": url,
+            "upstream_sha256": sha256,
+        },
+        handle,
+        indent=2,
+        sort_keys=True,
+    )
+    handle.write("\n")
+PYEOF
+chmod a+r "${LAYER_ROOT}/runtime-manifest.json"
 
-if [[ -n "${EXPORT_ARTIFACT_DIR}" ]]; then
-    mkdir -p "${EXPORT_ARTIFACT_DIR}/${RUNTIME_ID}"
-    cp "${PACKAGE_PATH}" "${EXPORT_ARTIFACT_DIR}/${RUNTIME_ID}/"
-fi
+payload_size=$(payload_bytes "${LAYER_ROOT}")
+echo "Staged ${runtime_id} (${arch}) payload: ${payload_size} bytes under ${LAYER_ROOT}"
 
-echo "Built ${runtime_id} runtime package at ${PACKAGE_PATH}"
+# The image is the artifact. Nothing is zipped, uploaded or published from here:
+# build-container reads this tree and generate-compliance-artifacts inspects the
+# image it produces.
+python3 - "${runtime_id}" "${arch}" "${payload_size}" "${ARTIFACT_DIR}/build-stats.json" <<'PYEOF'
+import json
+import sys
+
+runtime_id, arch, payload_bytes, stats_path = sys.argv[1:5]
+with open(stats_path, "w", encoding="utf-8") as handle:
+    json.dump(
+        {"runtime_id": runtime_id, "arch": arch, "payload_bytes": int(payload_bytes)},
+        handle,
+        indent=2,
+        sort_keys=True,
+    )
+    handle.write("\n")
+PYEOF
+
+echo "Built ${runtime_id} payload at ${LAYER_ROOT}"

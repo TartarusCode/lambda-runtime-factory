@@ -4,12 +4,11 @@ RUNTIME ?= pypy311
 ARCH ?= x86_64
 ARCHES := x86_64 arm64
 RUNTIMES := $(shell python3 tools/runtime_lib/runtime_manifest.py list)
-LOCAL_AWS_ENV := env -u AWS_PROFILE -u AWS_DEFAULT_PROFILE AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_SESSION_TOKEN=test AWS_REGION=us-east-1
 DEV_BUILD_ENV := BUILD_BEST_EFFORT_AUDIT=0
 
 all: validate-runtimes build
 
-.PHONY: all list-runtimes validate-runtimes check build build-all build-all-arches audit audit-all upload upload-all publish publish-all publicize publicize-all latest latest-all unpublish create-buckets local-build local-invoke clean shell check-updates bump bump-latest roll-off test container container-check container-invoke container-audit container-push container-merge container-soci container-repos
+.PHONY: all list-runtimes validate-runtimes check build build-all build-all-arches audit compliance attest test container container-check container-invoke container-audit container-push container-merge container-soci container-repos clean check-updates bump bump-latest roll-off
 
 list-runtimes:
 	python3 tools/runtime_lib/runtime_manifest.py list
@@ -23,6 +22,9 @@ test:
 check:
 	bash tools/bin/check-runtime "$(RUNTIME)" "$(ARCH)"
 
+# Stage the payload: verify the upstream archive, extract, slim, record
+# /opt/runtime-manifest.json and normalize the STIG permissions. Nothing is
+# zipped — the image is the artifact.
 build: validate-runtimes
 	$(DEV_BUILD_ENV) bash tools/bin/build-runtime "$(RUNTIME)" "$(ARCH)"
 
@@ -38,63 +40,23 @@ build-all-arches: validate-runtimes
 		done; \
 	done
 
-audit:
-	bash tools/bin/audit-runtime "$(RUNTIME)" "$(ARCH)"
+# SBOMs (SPDX + CycloneDX), a Grype report produced from that SPDX document, and
+# the provenance manifest. `audit` is the historical name for the same thing.
+compliance: validate-runtimes
+	bash tools/bin/generate-compliance-artifacts "$(RUNTIME)" "$(ARCH)"
 
-audit-all:
-	@for runtime in $(RUNTIMES); do \
-		bash tools/bin/audit-runtime "$$runtime" "$(ARCH)"; \
-	done
+audit: compliance
 
-upload:
-	bash tools/bin/upload-runtime "$(RUNTIME)" "$(ARCH)"
-
-upload-all:
-	@for runtime in $(RUNTIMES); do \
-		bash tools/bin/upload-runtime "$$runtime" "$(ARCH)"; \
-	done
-
-publish:
-	bash tools/bin/publish-runtime "$(RUNTIME)" "$(ARCH)"
-
-publish-all:
-	@for runtime in $(RUNTIMES); do \
-		bash tools/bin/publish-runtime "$$runtime" "$(ARCH)"; \
-	done
-
-publicize:
-	bash tools/bin/publish-runtime --publicize "$(RUNTIME)" "$(ARCH)"
-
-publicize-all:
-	@for runtime in $(RUNTIMES); do \
-		bash tools/bin/publish-runtime --publicize "$$runtime" "$(ARCH)"; \
-	done
-
-latest:
-	bash tools/bin/latest-runtime "$(RUNTIME)" "$(ARCH)"
-
-latest-all:
-	@for runtime in $(RUNTIMES); do \
-		bash tools/bin/latest-runtime "$$runtime" "$(ARCH)"; \
-	done
-
-unpublish:
-	bash tools/bin/unpublish-runtime "$(VERSION)" "$(RUNTIME)" "$(ARCH)"
-
-create-buckets:
-	bash tools/bin/create-buckets "$(RUNTIME)" "$(ARCH)"
-
-local-build:
-	$(DEV_BUILD_ENV) bash tools/bin/local-build-runtime "$(RUNTIME)" "$(ARCH)"
-
-local-invoke:
-	$(LOCAL_AWS_ENV) $(DEV_BUILD_ENV) bash tools/bin/local-invoke-runtime "$(RUNTIME)" "$(ARCH)"
+# Keyless cosign signing and OCI artifact attachment. Needs an OIDC token, so this
+# only works in CI unless a key is supplied.
+attest:
+	bash tools/bin/attest-container "$(RUNTIME)" "$(ARCH)"
 
 container: validate-runtimes
 	$(DEV_BUILD_ENV) bash tools/bin/build-container "$(RUNTIME)" "$(ARCH)"
 
-# Proves the single image's contract against the built bytes: non-root UID, the
-# payload's entrypoint, no package manager, rpmdb intact.
+# Proves the image's contract against the built bytes: non-root UID, the payload's
+# entrypoint, no package manager, rpmdb intact.
 container-check:
 	bash tools/bin/check-container "$(RUNTIME)" "$(ARCH)"
 
@@ -109,8 +71,7 @@ container-soci:
 container-repos:
 	bash tools/bin/ensure-container-repos "$(RUNTIME)"
 
-container-audit:
-	bash tools/bin/audit-container "$(RUNTIME)" "$(ARCH)"
+container-audit: compliance
 
 container-invoke:
 	bash tools/bin/local-invoke-container "$(RUNTIME)" "$(ARCH)"
@@ -132,6 +93,3 @@ roll-off:
 
 clean:
 	bash tools/bin/clean-runtime "$(RUNTIME)"
-
-shell:
-	docker run --rm -v "${PWD}":/opt public.ecr.aws/sam/build-provided.al2023 sh

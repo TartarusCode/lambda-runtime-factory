@@ -503,7 +503,7 @@ def record_size(
     *,
     unpacked_bytes: Optional[int] = None,
 ) -> Optional[int]:
-    """Write the built image size next to the package stats and return the bytes.
+    """Write the built image size into build-stats.json and return the bytes.
 
     ``unpacked_bytes``, measured from the exported rootfs, is preferred: it means
     the same thing on every daemon. The fallback reads the daemon's own number,
@@ -511,6 +511,8 @@ def record_size(
     — the same image then reads roughly three times smaller than on the classic
     overlay2 store, so the fallback is labelled rather than passed off as the
     unpacked size.
+
+    There is no package to measure any more: the image is the artifact.
     """
     source = "rootfs-export"
     size = unpacked_bytes
@@ -532,20 +534,8 @@ def record_size(
     if stats_path.exists():
         stats = json.loads(stats_path.read_text(encoding="utf-8"))
 
-    # A cached package restored without its sidecar still has the artifact, and
-    # the summary row needs both halves to be meaningful.
-    if "unzipped_bytes" not in stats:
-        packages = sorted(artifact_dir.glob("*.zip"), key=lambda path: path.stat().st_size)
-        if packages:
-            import package_size  # noqa: PLC0415 - sibling module, avoids an import cycle
-
-            stats.update(package_size.measure(packages[-1]))
-
     stats.setdefault("runtime_id", runtime_id)
     stats.setdefault("arch", arch)
-    stats.setdefault("max_unzipped_bytes", int(env["MAX_UNZIPPED_BYTES"]))
-    stats.setdefault("warn_unzipped_bytes", int(env["WARN_UNZIPPED_BYTES"]))
-    stats.setdefault("layer_publishable", env["LAYER_PUBLISHABLE"] == "true")
     stats["container_image_bytes"] = size
     stats["container_image_bytes_measured"] = source
     stats["container_image"] = image

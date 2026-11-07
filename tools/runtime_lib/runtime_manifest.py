@@ -23,12 +23,6 @@ REPO_DEFAULTS: Dict[str, Any] = {
     "lambda": {
         "compatible_runtimes": ["provided.al2023"],
     },
-    # A deployment package is capped at 250 MB unzipped, and that ceiling covers
-    # the function plus every layer attached to it. These are repo-wide so the
-    # build and the publish matrix cannot disagree about the limit.
-    "layer_publishable": True,
-    "max_unzipped_bytes": 262144000,
-    "warn_unzipped_bytes": 209715200,
     "release": {
         "bucket_base_name": "tartarus-runtimes",
         "regions": ["us-east-1"],
@@ -279,12 +273,6 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "x86_64": "linux-amd64",
             "arm64": "linux-arm64",
         },
-        # Deliberately not a layer, and not because of the byte budget: after
-        # slimming, Go 1.26 measures ~176 MB unzipped, which fits. A layer is the
-        # wrong shape for a toolchain — the bootstrap expects a compiled handler
-        # under /opt/go/bin, and a consumer's code lives read-only at /var/task.
-        # The Go image is the published artifact; see DELIVERY.md.
-        "layer_publishable": False,
         "artifact": {
             "archive_name": "go{distribution_version}.{arch_slug}.tar.gz",
             "archive_url": "https://go.dev/dl/go{distribution_version}.{arch_slug}.tar.gz",
@@ -316,9 +304,6 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "x86_64": "x86_64-unknown-linux-musl",
             "arm64": "aarch64-unknown-linux-musl",
         },
-        # Same delivery-shape answer as Go: the Rust distribution is a toolchain,
-        # not a handler host, and it is far over the layer budget anyway.
-        "layer_publishable": False,
         "artifact": {
             "archive_name": "rust-{distribution_version}-{arch_slug}.tar.gz",
             "archive_url": "https://static.rust-lang.org/dist/rust-{distribution_version}-{arch_slug}.tar.gz",
@@ -397,21 +382,6 @@ def list_active_runtime_ids() -> List[str]:
     return [runtime_id for runtime_id in list_runtime_ids() if not is_deprecated(runtime_id)]
 
 
-def is_layer_publishable(runtime_id: str) -> bool:
-    """Return whether the runtime's package can be published as a Lambda layer.
-
-    A deployment package is capped at 250 MB unzipped, and that limit covers the
-    function plus every layer attached to it — so a runtime shipping a whole
-    upstream toolchain cannot be delivered as a layer no matter how it is split.
-    Such a runtime is still built and audited like any other; it is only kept out
-    of the publish matrix, so a release does not fail on an AWS quota instead of
-    publishing.
-
-    Resolved through ``load_runtime``, so the answer comes from the merged view:
-    a family default in RUNTIME_FAMILY_DEFAULTS declares it once for every line,
-    including lines that do not exist yet.
-    """
-    return bool(load_runtime(runtime_id).get("layer_publishable", True))
 
 
 def _require_keys(data: Dict[str, Any], keys: Iterable[str], context: str) -> None:
@@ -724,11 +694,6 @@ def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> Dict[str, str]:
         "LAYER_NAME": data["lambda"]["layer_name"],
         "LAYER_DESCRIPTION": data["lambda"]["description"],
         "COMPATIBLE_RUNTIMES": " ".join(data["lambda"]["compatible_runtimes"]),
-        # The publish decision and its byte budget travel to the build script, so
-        # the size gate and the publish matrix can never disagree about either.
-        "LAYER_PUBLISHABLE": "true" if data.get("layer_publishable", True) else "false",
-        "MAX_UNZIPPED_BYTES": str(data.get("max_unzipped_bytes", 262144000)),
-        "WARN_UNZIPPED_BYTES": str(data.get("warn_unzipped_bytes", 209715200)),
         "BUCKET_BASE_NAME": data["release"]["bucket_base_name"],
         "RELEASE_REGIONS": " ".join(data["release"]["regions"]),
         "S3_KEY_PREFIX": data["release"]["s3_key_prefix"],
@@ -865,14 +830,13 @@ def manifest_matrix(
     runtime_ids: Iterable[str] | None = None,
     archs: Iterable[str] | None = None,
     include_deprecated: bool = False,
-    layer_publishable_only: bool = False,
 ) -> Dict[str, Any]:
     """Return the CI build matrix, optionally filtered to specific runtimes/arches.
 
     Deprecated runtimes are excluded (so the matrix cannot grow without bound)
-    unless explicitly requested with include_deprecated. The build matrix keeps
-    every publishable-by-nothing runtime, because CI's job is to build and audit
-    them; only the publish matrix narrows further with layer_publishable_only.
+    unless explicitly requested with include_deprecated. Every remaining runtime
+    appears in both workflows: there is one artifact per runtime now, so there is
+    nothing left to narrow.
     """
     selected = list(runtime_ids) if runtime_ids is not None else list_runtime_ids()
     selected_archs = list(archs) if archs is not None else SUPPORTED_ARCHS
@@ -884,8 +848,6 @@ def manifest_matrix(
         # a new go/rust line walked straight back into the publish matrix.
         data = load_runtime(runtime_id)
         if data.get("deprecated") and not include_deprecated:
-            continue
-        if layer_publishable_only and not data.get("layer_publishable", True):
             continue
         skip_local = data.get("local_testing", {}).get("skip_local_invoke", False)
         for arch in selected_archs:
@@ -919,11 +881,6 @@ def build_parser() -> argparse.ArgumentParser:
     matrix_parser.add_argument("--arch", help="Architecture, or 'all'")
     matrix_parser.add_argument(
         "--include-deprecated", action="store_true", help="Also emit deprecated runtimes"
-    )
-    matrix_parser.add_argument(
-        "--layer-publishable-only",
-        action="store_true",
-        help="Only runtimes that can be published as a layer (the publish matrix)",
     )
 
     validate_parser = subparsers.add_parser("validate")
@@ -983,7 +940,6 @@ def main() -> None:
             runtime_ids,
             archs,
             include_deprecated=args.include_deprecated,
-            layer_publishable_only=args.layer_publishable_only,
         )))
         return
 

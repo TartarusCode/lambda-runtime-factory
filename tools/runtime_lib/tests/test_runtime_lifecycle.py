@@ -16,7 +16,6 @@ import yaml
 
 import bump_version
 import container_image
-import package_size
 import runtime_manifest
 
 
@@ -671,19 +670,6 @@ def test_the_sam_image_is_warmed_at_the_tag_sam_resolves() -> None:
     assert "public.ecr.aws/sam/build-provided.al2023:latest-${{ matrix.arch }}" in warm["run"]
 
 
-def test_local_invoke_asserts_the_handler_answered() -> None:
-    """A green verify step must mean the handler ran, not just that no known failure
-    string appeared, and it must not rebuild what the previous step built."""
-    script = (_REPO_ROOT / "tools" / "bin" / "local-invoke-runtime").read_text(encoding="utf-8")
-
-    assert "|| true" not in script, "the sam local invoke exit status must not be discarded"
-    assert "invoke_status" in script, "the exit status must be checked"
-    assert "statusCode" in script and "hello world" in script, (
-        "the response must be asserted, not only the absence of failure text"
-    )
-    assert "LOCAL_BUILD_TEMPLATE" in script, (
-        "the SAM build must be skipped when `make local-build` already produced it"
-    )
 
 
 def test_the_ci_build_is_skipped_when_the_package_is_cached() -> None:
@@ -951,84 +937,14 @@ def _publish_package_path(tmp_path: Path) -> Path:
     raise AssertionError("runtime_manifest env did not report PACKAGE_PATH")
 
 
-def _run_publish_runtime(
-    tmp_path: Path,
-    *,
-    publicize: bool = False,
-    existing_version: str = "",
-    permission_error: str = "",
-) -> tuple[subprocess.CompletedProcess, str]:
-    """Run `publish-runtime` with a stubbed aws CLI. Returns (result, aws calls)."""
-    package = _publish_package_path(tmp_path)
-    package.parent.mkdir(parents=True, exist_ok=True)
-    package.write_bytes(b"layer bytes\n")
-
-    fake_bin = tmp_path / "fake-bin"
-    fake_bin.mkdir()
-    aws = fake_bin / "aws"
-    aws.write_text(_FAKE_AWS, encoding="utf-8")
-    aws.chmod(0o755)
-
-    log = tmp_path / "aws-calls.log"
-    env = dict(
-        os.environ,
-        PATH=f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
-        # The package is already on disk; do not let the helper build it.
-        RUNTIME_BUILD_IN_PROGRESS="1",
-        BUILD_ROOT=str(tmp_path),
-        FAKE_AWS_LOG=str(log),
-        FAKE_AWS_EXISTING_VERSION=existing_version,
-        FAKE_AWS_PERMISSION_ERROR=permission_error,
-    )
-
-    args = ["bash", "tools/bin/publish-runtime"]
-    if publicize:
-        args.append("--publicize")
-    args += ["pypy311", "x86_64"]
-
-    result = subprocess.run(args, cwd=_REPO_ROOT, env=env, capture_output=True, text=True)
-    return result, log.read_text(encoding="utf-8") if log.exists() else ""
 
 
-def test_republishing_unchanged_bytes_reuses_the_existing_version(tmp_path: Path) -> None:
-    """The layer itself already carries these bytes, so nothing is published."""
-    result, calls = _run_publish_runtime(tmp_path, existing_version="7")
-
-    assert result.returncode == 0, result.stderr
-    assert "reusing it" in result.stdout
-    assert "publish-layer-version" not in calls, (
-        "a re-run of a release must not mint another layer version"
-    )
 
 
-def test_a_layer_that_does_not_exist_yet_is_published(tmp_path: Path) -> None:
-    """The content-hash lookup fails when the layer has no versions; that is not
-    fatal, and the version is published."""
-    result, calls = _run_publish_runtime(tmp_path)
-
-    assert result.returncode == 0, result.stderr
-    assert "list-layer-versions" in calls
-    assert "publish-layer-version" in calls
-    assert "Content.CodeSha256" in calls, "reuse must be decided by the content hash"
 
 
-def test_publicizing_an_already_public_version_is_not_a_failure(tmp_path: Path) -> None:
-    result, _ = _run_publish_runtime(
-        tmp_path, publicize=True, existing_version="7", permission_error="ResourceConflictException"
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert "already set" in result.stdout
 
 
-def test_a_real_permission_error_still_fails(tmp_path: Path) -> None:
-    """Only the duplicate-statement conflict is tolerated."""
-    result, _ = _run_publish_runtime(
-        tmp_path, publicize=True, existing_version="7", permission_error="AccessDeniedException"
-    )
-
-    assert result.returncode != 0
-    assert "AccessDeniedException" in result.stderr
 
 
 # --- Documentation contract ----------------------------------------------------
@@ -1148,22 +1064,6 @@ def test_a_tagged_release_publicizes_its_layers() -> None:
 # CI as well would let their packages rot unnoticed.
 
 
-def test_unpublishable_runtimes_are_flagged_out_of_the_publish_matrix() -> None:
-    build = {entry["runtime"] for entry in runtime_manifest.manifest_matrix()["include"]}
-    publish = {
-        entry["runtime"]
-        for entry in runtime_manifest.manifest_matrix(layer_publishable_only=True)["include"]
-    }
-    flagged = {
-        runtime_id
-        for runtime_id in runtime_manifest.list_runtime_ids()
-        if not runtime_manifest.is_layer_publishable(runtime_id)
-    }
-
-    assert flagged, "nothing is flagged, so this guard cannot catch a regression"
-    assert not (flagged & publish), f"flagged runtimes are still published: {sorted(flagged & publish)}"
-    assert flagged <= build, "a flagged runtime must still be built and audited by CI"
-    assert build - flagged == publish
 
 
 def test_the_release_matrix_asks_for_publishable_runtimes_only() -> None:
@@ -1192,24 +1092,6 @@ def test_an_empty_publish_matrix_is_refused_not_silently_green() -> None:
 # same runtime and arch produced aff7a46c… and b0dd53dd… from identical inputs.
 
 
-def test_the_package_zip_is_deterministic() -> None:
-    script = (_REPO_ROOT / "tools" / "bin" / "build-runtime").read_text(encoding="utf-8")
-    # Match the zip invocation only: "unzip -qo" also contains "zip -".
-    zip_line = next(
-        line.strip()
-        for line in script.splitlines()
-        if "zip -" in line and "unzip" not in line
-    )
-    # zip takes combined short options (zip -qrX), so inspect the flag cluster
-    # rather than looking for the literal "-X".
-    flags = zip_line.split("zip -", 1)[1].split()[0]
-
-    assert "TZ=UTC" in zip_line, "stored timestamps must not depend on the machine's zone"
-    assert "X" in flags, "zip -X must drop the ownership extras; the uid differs per environment"
-    assert "touch -h -t" in script, (
-        "entry mtimes must be pinned before zipping — cp and cp -R stamp their copies "
-        "with the build time, which is what moved the hash on every run"
-    )
 
 
 # --- Deployment-package budget ---------------------------------------------------
@@ -1221,33 +1103,8 @@ def test_the_package_zip_is_deterministic() -> None:
 # 2.7 MB over, which is exactly the failure AWS reported.
 
 
-def test_the_size_budget_travels_to_the_build_script() -> None:
-    assert runtime_manifest.REPO_DEFAULTS["layer_publishable"] is True
-    assert runtime_manifest.REPO_DEFAULTS["max_unzipped_bytes"] == 262144000
-    assert runtime_manifest.REPO_DEFAULTS["warn_unzipped_bytes"] == 209715200
-
-    for runtime_id, expected in (("pypy311", "true"), ("go126", "false")):
-        env = runtime_manifest.runtime_env(runtime_id, arch="x86_64")
-        assert env["LAYER_PUBLISHABLE"] == expected, runtime_id
-        assert env["MAX_UNZIPPED_BYTES"] == "262144000"
-        assert env["WARN_UNZIPPED_BYTES"] == "209715200"
 
 
-def test_a_family_default_excludes_a_whole_family() -> None:
-    """A runtime line generated by a version bump must not walk back into the
-    publish matrix, so the exclusion belongs to the family, not to the manifest."""
-    for runtime_id in runtime_manifest.list_runtime_ids():
-        family = runtime_manifest.load_runtime(runtime_id)["runtime_family"]
-        if family not in ("go-toolchain", "rust-musl"):
-            continue
-
-        raw = json.loads(
-            runtime_manifest.runtime_manifest_path(runtime_id).read_text(encoding="utf-8")
-        )
-        assert runtime_manifest.is_layer_publishable(runtime_id) is False, runtime_id
-        assert "layer_publishable" not in raw, (
-            f"{runtime_id}: declare the exclusion on the family so a new line inherits it"
-        )
 
 
 def test_layer_slimming_never_prunes_package_metadata() -> None:
@@ -1263,87 +1120,8 @@ def test_layer_slimming_never_prunes_package_metadata() -> None:
     assert "SLIM_LAYER" in slim, "the A/B switch is how the before/after byte counts are compared"
 
 
-def test_the_size_reporter_writes_the_budget_row(tmp_path: Path) -> None:
-    env = runtime_manifest.runtime_env("bun13", arch="x86_64")
-    artifact_dir = Path(env["ARTIFACT_DIR"])
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    stats = artifact_dir / "build-stats.json"
-    stats.write_text(
-        json.dumps(
-            {
-                "runtime_id": "bun13",
-                "arch": "x86_64",
-                "zipped_bytes": 35979139,
-                "unzipped_bytes": 92754962,
-                "max_unzipped_bytes": 262144000,
-                "warn_unzipped_bytes": 209715200,
-                "layer_publishable": True,
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    summary = tmp_path / "summary.md"
-    reporter = _REPO_ROOT / ".github" / "actions" / "build-and-audit-runtime" / "report-package-size.sh"
-
-    try:
-        subprocess.run(
-            ["bash", str(reporter), "bun13", "x86_64"],
-            check=True,
-            cwd=_REPO_ROOT,
-            capture_output=True,
-            text=True,
-            env={**os.environ, "GITHUB_STEP_SUMMARY": str(summary)},
-        )
-    finally:
-        stats.unlink()
-
-    row = summary.read_text(encoding="utf-8")
-    assert "| Runtime | Arch | Zipped (MB) |" in row
-    assert "| Container Image (MB) |" in row
-    assert "| `bun13` | `x86_64` | 34.3 | 92754962 / 88.5 | 35.4% | 161.5 | yes | n/a |" in row
 
 
-def test_the_size_row_carries_the_container_image(tmp_path: Path) -> None:
-    """The layer budget and the image size are the two halves of the artifact
-    decision, so they belong in one row."""
-    env = runtime_manifest.runtime_env("bun13", arch="x86_64")
-    artifact_dir = Path(env["ARTIFACT_DIR"])
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    stats = artifact_dir / "build-stats.json"
-    stats.write_text(
-        json.dumps(
-            {
-                "runtime_id": "bun13",
-                "arch": "x86_64",
-                "zipped_bytes": 35979139,
-                "unzipped_bytes": 92754962,
-                "max_unzipped_bytes": 262144000,
-                "warn_unzipped_bytes": 209715200,
-                "layer_publishable": True,
-                "container_image_bytes": 116426951,
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    summary = tmp_path / "summary.md"
-    reporter = _REPO_ROOT / ".github" / "actions" / "build-and-audit-runtime" / "report-package-size.sh"
-
-    try:
-        subprocess.run(
-            ["bash", str(reporter), "bun13", "x86_64"],
-            check=True,
-            cwd=_REPO_ROOT,
-            capture_output=True,
-            text=True,
-            env={**os.environ, "GITHUB_STEP_SUMMARY": str(summary)},
-        )
-    finally:
-        stats.unlink()
-
-    row = summary.read_text(encoding="utf-8")
-    assert "| `bun13` | `x86_64` | 34.3 | 92754962 / 88.5 | 35.4% | 161.5 | yes | 111.0 |" in row
 
 
 def test_the_unpacked_size_is_summed_from_the_rootfs_listing() -> None:
@@ -1405,22 +1183,6 @@ def test_the_javascript_helpers_initialize_the_environment_themselves() -> None:
     assert 'process.env.HOME ??= "/tmp"' in deno
 
 
-def test_the_container_publish_matrix_covers_every_runtime() -> None:
-    """Containers are the delivery path for the runtimes a layer cannot carry, so
-    the publish matrix must not inherit the layer filter."""
-    jobs = _workflow("release-runtime.yml")["jobs"]
-    steps = jobs["prepare-matrix"]["steps"]
-    containers = next(step for step in steps if step.get("id") == "containers")
-
-    assert containers["with"]["layer-publishable-only"] == "false"
-
-    containers_matrix = {
-        entry["runtime"]
-        for entry in runtime_manifest.manifest_matrix(layer_publishable_only=False)["include"]
-    }
-    assert set(runtime_manifest.list_active_runtime_ids()) <= containers_matrix
-    for toolchain in ("go126", "go127", "rust194", "rust198", "rust199"):
-        assert toolchain in containers_matrix, f"{toolchain} must publish an image"
 
 
 def test_soci_publishing_is_opt_in_and_needs_no_containerd() -> None:
@@ -1545,9 +1307,6 @@ def test_slimming_precompiles_bytecode_and_keeps_the_sbom_metadata() -> None:
     assert "compileall -b -q -f --invalidation-mode=unchecked-hash" in script
     # ...and it is opt-in: measured on pypy311 it cost 16 MB and 20 ms of init.
     assert "PRECOMPILE_BYTECODE:-0" in script
-    # A runtime near the ceiling keeps its sources: the .pyc files are removed
-    # again rather than failing the build.
-    assert "would exceed" in script
     # Package metadata is what vulnerability scanning reads; it is documented as
     # never removed and no delete rule targets it.
     assert "*.dist-info" in script
@@ -1577,79 +1336,8 @@ def test_the_layer_publish_cell_does_not_build_the_container() -> None:
     assert call["container"] == "false"
 
 
-def test_a_version_bump_keeps_layer_publishability(
-    fake_root: Path, mocker: pytest.MockFixture
-) -> None:
-    """A bump rewrites the raw manifest, so a flag declared there has to survive
-    it; otherwise a rescue (graalpy312) silently walks back out of the matrix."""
-    _write_manifest(
-        fake_root,
-        "graalpy312",
-        "graalpy",
-        "25.2.4",
-        python_version="3.12",
-        layer_publishable=True,
-    )
-    mocker.patch.object(
-        bump_version,
-        "fetch_checksums",
-        return_value=[
-            ("aaa", "graalpy3.12-25.3.0-linux-amd64.tar.gz"),
-            ("bbb", "graalpy3.12-25.3.0-linux-aarch64.tar.gz"),
-        ],
-    )
-    # The release tag resolver reads the GitHub releases index to learn that
-    # `25.3.0` ships those assets; stub it so the test stays offline.
-    mocker.patch.object(
-        bump_version,
-        "_http_get",
-        return_value=json.dumps(
-            [
-                {
-                    "tag_name": "graal-25.3.0",
-                    "assets": [
-                        {"name": "graalpy3.12-25.3.0-linux-amd64.tar.gz"},
-                        {"name": "graalpy3.12-25.3.0-linux-aarch64.tar.gz"},
-                    ],
-                }
-            ]
-        ).encode("utf-8"),
-    )
-
-    bump_version.bump_runtime("graalpy312", "25.3.0")
-
-    raw = json.loads((fake_root / "graalpy312" / "runtime.json").read_text(encoding="utf-8"))
-    assert raw["distribution_version"] == "25.3.0"
-    assert raw["layer_publishable"] is True
 
 
-def test_a_new_line_inherits_the_family_exclusion(
-    fake_root: Path, mocker: pytest.MockFixture
-) -> None:
-    """The Go/Rust exclusion is a family default, so a generated line must land
-    outside the publish matrix without repeating the flag in its manifest."""
-    _write_manifest(
-        fake_root,
-        "go126",
-        "go-toolchain",
-        "1.26.10",
-        version_line="1.26",
-        local_testing={"handler": "handler"},
-    )
-    mocker.patch.object(
-        bump_version,
-        "fetch_checksums",
-        return_value=[
-            ("aaa", "go1.27.0.linux-amd64.tar.gz"),
-            ("bbb", "go1.27.0.linux-arm64.tar.gz"),
-        ],
-    )
-
-    new_id = bump_version.add_runtime_line("go-toolchain", "1.27.0")
-
-    raw = json.loads((fake_root / new_id / "runtime.json").read_text(encoding="utf-8"))
-    assert "layer_publishable" not in raw, "declare the exclusion once, on the family"
-    assert runtime_manifest.is_layer_publishable(new_id) is False
 
 
 def test_the_container_build_documents_a_consumer_dockerfile() -> None:
@@ -1662,52 +1350,10 @@ def test_the_container_build_documents_a_consumer_dockerfile() -> None:
     assert "FROM ghcr.io/tartaruscode/lambda-runtime-factory/" in contributing
 
 
-def test_an_oversized_publishable_package_fails_the_gate() -> None:
-    """The failure belongs in the build, not at PublishLayerVersion in a release."""
-    verdict = package_size.budget(
-        {
-            "runtime_id": "graalpy312",
-            "arch": "x86_64",
-            "zipped_bytes": 104501179,
-            "unzipped_bytes": 262144001,
-        },
-        publishable=True,
-    )
-
-    assert verdict["level"] == "error"
-    assert "262144001" in verdict["message"]
-    assert verdict["percent_of_quota"] > 100
 
 
-def test_an_oversized_unpublishable_package_is_only_recorded() -> None:
-    """A toolchain image has no ceiling to breach; its size is information."""
-    verdict = package_size.budget(
-        {
-            "runtime_id": "rust199",
-            "arch": "arm64",
-            "zipped_bytes": 250000000,
-            "unzipped_bytes": 700000000,
-        },
-        publishable=False,
-    )
-
-    assert verdict["level"] == "ok"
-    assert verdict["layer_publishable"] is False
 
 
-def test_a_narrow_margin_warns_without_failing() -> None:
-    verdict = package_size.budget(
-        {
-            "runtime_id": "graalpy312",
-            "arch": "x86_64",
-            "zipped_bytes": 104501179,
-            "unzipped_bytes": 256802903,
-        },
-        publishable=True,
-    )
-
-    assert verdict["level"] == "warning"
-    assert verdict["headroom_mb"] < 10
 
 
 def test_the_iron_bank_template_carries_the_stig_invariants() -> None:
@@ -1768,86 +1414,20 @@ def test_local_invoke_never_bakes_the_emulator_into_the_image() -> None:
         assert "aws-lambda-rie" not in text, name
 
 
-def test_build_runtime_normalizes_stig_permissions_before_zipping() -> None:
+def test_build_runtime_normalizes_stig_permissions_before_staging() -> None:
     script = (_REPO_ROOT / "tools" / "bin" / "build-runtime").read_text(encoding="utf-8")
 
     chmod_index = script.index("chmod -R a+rX")
-    zip_index = script.index('zip -qrX "${PACKAGE_PATH}"')
-    assert chmod_index < zip_index, "permissions must be normalized before the payload is zipped"
+    manifest_index = script.index("runtime-manifest.json")
+    assert chmod_index < manifest_index, "normalize before describing the payload"
     assert 'chmod a+rx "${LAYER_ROOT}/${BOOTSTRAP_OUTPUT}"' in script
+    # The image is the artifact, so nothing here zips or publishes.
+    assert "zip -qrX" not in script
+    assert "PACKAGE_PATH" not in script
 
 
-def test_the_build_stats_sidecar_carries_the_exact_byte_budget(tmp_path: Path) -> None:
-    """The gate is a byte comparison, so the sidecar has to state the bytes —
-    not just a rounded percentage."""
-    package = tmp_path / "pkg.zip"
-    with zipfile.ZipFile(package, "w") as archive:
-        archive.writestr("bootstrap", b"x" * 1024)
-
-    stats_out = tmp_path / "build-stats.json"
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(_REPO_ROOT / "tools" / "runtime_lib" / "package_size.py"),
-            "check",
-            "--runtime", "pypy311",
-            "--arch", "x86_64",
-            "--package", str(package),
-            "--stats-out", str(stats_out),
-            "--publishable", "true",
-        ],
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr
-
-    stats = json.loads(stats_out.read_text(encoding="utf-8"))
-    assert stats["unzipped_bytes"] == 1024
-    assert stats["headroom_bytes"] == 262144000 - 1024
-    assert stats["percent_of_quota"] == 0.0
-    assert stats["level"] == "ok"
-    assert stats["layer_publishable"] is True
 
 
-def test_the_size_row_states_the_target_artifacts(tmp_path: Path) -> None:
-    env = runtime_manifest.runtime_env("bun13", arch="x86_64")
-    artifact_dir = Path(env["ARTIFACT_DIR"])
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    stats = artifact_dir / "build-stats.json"
-    summary = tmp_path / "summary.md"
-    reporter = _REPO_ROOT / ".github" / "actions" / "build-and-audit-runtime" / "report-package-size.sh"
-
-    def run(payload: dict) -> str:
-        stats.write_text(json.dumps(payload) + "\n", encoding="utf-8")
-        if summary.exists():
-            summary.unlink()
-        subprocess.run(
-            ["bash", str(reporter), "bun13", "x86_64"],
-            check=True,
-            cwd=_REPO_ROOT,
-            capture_output=True,
-            text=True,
-            env={**os.environ, "GITHUB_STEP_SUMMARY": str(summary)},
-        )
-        return summary.read_text(encoding="utf-8")
-
-    try:
-        row = run({
-            "runtime_id": "bun13", "arch": "x86_64", "zipped_bytes": 35979139,
-            "unzipped_bytes": 92754962, "max_unzipped_bytes": 262144000,
-            "warn_unzipped_bytes": 209715200, "layer_publishable": True,
-        })
-        assert "| Targets |" in row
-        assert "Layer + Iron Bank Container" in row
-
-        row = run({
-            "runtime_id": "bun13", "arch": "x86_64", "zipped_bytes": 35979139,
-            "unzipped_bytes": 92754962, "max_unzipped_bytes": 262144000,
-            "warn_unzipped_bytes": 209715200, "layer_publishable": False,
-        })
-        assert "Iron Bank Container Only" in row
-    finally:
-        stats.unlink()
 
 
 def test_the_soci_conversion_filters_the_pull_to_one_architecture() -> None:
@@ -2122,11 +1702,12 @@ def test_check_container_verifies_the_built_image() -> None:
     assert "--read-only" in script
 
 
-def test_build_container_has_one_base_path_and_a_noop_ironbank_flag() -> None:
+def test_build_container_has_one_base_path_and_no_variant_flags() -> None:
     script = (_REPO_ROOT / "tools" / "bin" / "build-container").read_text(encoding="utf-8")
 
     assert "--variant" not in script and "--debug" not in script
-    assert "--ironbank) shift ;;" in script, "the old flag must stay harmless"
+    # The flag is gone with the second base: there is nothing to select.
+    assert "--ironbank" not in script
     assert "USE_FALLBACK_UBI" in script
     assert "IRONBANK_TOKEN" in script, "a CI build without the token must fall back"
     assert "BASE_IMAGE_DIGEST" in script

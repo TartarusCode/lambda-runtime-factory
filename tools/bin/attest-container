@@ -1,0 +1,84 @@
+#!/bin/bash
+# Sign a runtime image and attach its compliance bundle to the digest.
+#
+# Keyless: `cosign sign` uses the GitHub Actions OIDC token, exchanges it at Fulcio
+# for a short-lived certificate and records the signature in Rekor. There is no
+# long-lived key to leak, and the certificate names the workflow that produced the
+# image — which is the property an ATO reviewer is actually asking about.
+#
+#   attest-container <runtime_id> <arch> [--key <path>]
+#
+# Outside CI (or without `id-token: write`) there is no OIDC token, so the script
+# records that and exits 0 rather than pretending it signed anything. A local build
+# still produces the artifacts; it just cannot attest them.
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+
+key=""
+positional=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --key) key=${2:-}; shift 2 ;;
+        -*) echo "Unknown option: $1" >&2; exit 2 ;;
+        *) positional+=("$1"); shift ;;
+    esac
+done
+
+runtime_id=$(common::require_runtime_id "${positional[0]:-}")
+arch=$(common::require_arch "${positional[1]:-}")
+common::load_runtime_env "${runtime_id}" "${arch}"
+
+if ! type -P cosign >/dev/null; then
+    echo "Install cosign to sign and attest: https://docs.sigstore.dev/cosign/installation/" >&2
+    exit 1
+fi
+
+compliance_dir="${ARTIFACT_DIR}/compliance"
+stem="${compliance_dir}/${runtime_id}-${arch}"
+for artifact in "${stem}.spdx.json" "${stem}.cdx.json" "${stem}.grype.json" "${stem}.provenance.json"; do
+    if [[ ! -f "${artifact}" ]]; then
+        echo "Missing ${artifact}: run generate-compliance-artifacts first" >&2
+        exit 1
+    fi
+done
+
+sign_args=(sign --yes)
+if [[ -n "${key}" ]]; then
+    sign_args=(sign --yes --key "${key}")
+elif [[ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" && -z "${SIGSTORE_ID_TOKEN:-}" ]]; then
+    echo "::notice::no OIDC token in this environment, so ${runtime_id} (${arch}) was not signed; keyless signing runs in CI"
+    exit 0
+fi
+
+references=()
+mapfile -t registries < <(python3 -c 'import json,sys
+for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIES_OVERRIDE:-${CONTAINER_REGISTRIES}}")
+for registry in "${registries[@]}"; do
+    references+=("${registry}/${RUNTIME_ID}:${CONTAINER_TAG}-${CONTAINER_ARCH}")
+done
+
+for reference in "${references[@]}"; do
+    echo "Signing ${reference}"
+    cosign "${sign_args[@]}" "${reference}"
+
+    # The SBOM is attached in both formats because consumers disagree about which
+    # one they ingest; `cosign download sbom` returns the SPDX document.
+    cosign attach sbom --sbom "${stem}.spdx.json" --type spdxjson "${reference}"
+    oras attach --artifact-type application/vnd.cyclonedx+json \
+        "${reference}" "${stem}.cdx.json:application/vnd.cyclonedx+json" >/dev/null
+    oras attach --artifact-type application/vnd.grype.report.v1+json \
+        "${reference}" "${stem}.grype.json:application/vnd.grype.report.v1+json" >/dev/null
+    oras attach --artifact-type application/vnd.lambda-runtime.provenance.v1+json \
+        "${reference}" "${stem}.provenance.json:application/vnd.lambda-runtime.provenance.v1+json" >/dev/null
+
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+        {
+            echo "#### Signed and attested: ${runtime_id} (${arch})"
+            echo
+            echo "- \`${reference}\`"
+            echo "- SBOMs, CVE report and provenance attached to the digest"
+            echo
+        } >> "${GITHUB_STEP_SUMMARY}"
+    fi
+done

@@ -19,7 +19,6 @@
 #     which serves the same UBI9-minimal userland
 #   * BASE_IMAGE_DIGEST (or container.base_image_digest): appended as @<digest>
 #
-# --ironbank is accepted and does nothing: it is the only path there is.
 set -euo pipefail
 
 source "$(dirname "$0")/_common.sh"
@@ -34,7 +33,6 @@ while [[ $# -gt 0 ]]; do
         --push) push=1; shift ;;
         --force) force=1; shift ;;
         --no-cache) LAMBDA_CONTAINER_NO_CACHE=1; shift ;;
-        --ironbank) shift ;;  # no-op: every image is on the Iron Bank base
         --cache-from) cache_from=$2; shift 2 ;;
         --cache-to) cache_to=$2; shift 2 ;;
         -*) echo "Unknown option: $1" >&2; exit 2 ;;
