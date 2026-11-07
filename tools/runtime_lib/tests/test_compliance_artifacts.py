@@ -185,11 +185,50 @@ def test_the_job_summary_row_reads_the_bundle_it_reports(tmp_path: Path) -> None
     assert result.returncode == 0, result.stderr
 
     text = summary.read_text(encoding="utf-8")
-    assert "| Runtime | Arch | Base Image |" in text
+    assert text.count("| Runtime | Arch |") == 1, "a table header per row fragments the table"
+    assert text.count("| --- | --- | --- | --- | --- | --- | --- |") == 1, "one separator per table"
     assert "`pypy311`" in text and "`x86_64`" in text
-    assert "IronBank" in text, "the row must say which base was published"
+    assert "Iron Bank" in text, "the row must say which base was published"
+    assert "4.0" in text, "the unpacked size is binary megabytes"
     assert "124 + 8" in text, "the SBOM package split is the compliance evidence"
     assert "0/1/14/1" in text
+    assert "| pass |" in text, "the smoke test is the one claim that must never be assumed"
+
+
+def test_every_cell_adds_a_row_to_the_same_table(tmp_path: Path) -> None:
+    """A job that reports several cells appends rows to one table: a second
+    header would render as a second table, and a markdown table needs its blank
+    line and separator exactly once."""
+    (tmp_path / "container.json").write_text(
+        json.dumps({"base_image_ref": "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+                    "unpacked_size_bytes": 1048576, "read_only_rootfs_verified": True}),
+        encoding="utf-8",
+    )
+    summary = tmp_path / "summary.md"
+    script = _REPO_ROOT / ".github" / "actions" / "build-and-audit-runtime" / "report-package-size.sh"
+
+    def report(runtime: str, arch: str, artifact_dir: Path) -> None:
+        result = subprocess.run(
+            ["bash", str(script), runtime, arch],
+            capture_output=True,
+            text=True,
+            env={"ARTIFACT_DIR": str(artifact_dir), "GITHUB_STEP_SUMMARY": str(summary),
+                 "PATH": "/usr/bin:/bin"},
+            cwd=_REPO_ROOT,
+        )
+        assert result.returncode == 0, result.stderr
+
+    report("pypy311", "x86_64", tmp_path)
+    report("pypy311", "arm64", tmp_path)
+    report("rust199", "arm64", tmp_path / "absent")
+
+    text = summary.read_text(encoding="utf-8")
+    assert text.count("| Runtime | Arch |") == 1
+    assert text.count("| --- | --- | --- | --- | --- | --- | --- |") == 1, "one separator per table"
+    assert text.count("| `pypy311` |") == 2, "one row per reported cell"
+    assert "UBI fallback" in text, "the fallback base is named as such"
+    assert "| `rust199` |" not in text, "an unbuilt cell is not a row of dashes"
+    assert "rust199 (arm64)" in text and "no image record" in text
 
 
 def test_no_workflow_or_script_references_the_removed_layer_tools() -> None:

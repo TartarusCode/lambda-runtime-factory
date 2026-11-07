@@ -405,6 +405,7 @@ jobs:
       - name: Collect the published image tags
         env:
           MATRIX: ${{ needs.prepare-matrix.outputs.matrix }}
+          PUBLISH_SOCI: ${{ inputs.publish_soci }}
         run: |
           python3 - <<'PY' > "${RUNNER_TEMP}/cells.txt"
           import json
@@ -426,15 +427,18 @@ jobs:
             tag=$(grep '^CONTAINER_TAG=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
             {
               echo "- \`${image}:${tag}-${arch}\`"
-              echo "- \`${image}:${tag}-${arch}-soci\` (when SOCI is enabled)"
+              # Only name a SOCI index this run actually published; a bullet for
+              # one that was never built sends a consumer to a missing tag.
+              if [ "${PUBLISH_SOCI}" = "true" ]; then
+                echo "- \`${image}:${tag}-${arch}-soci\`"
+              fi
             } >> "${RUNNER_TEMP}/release-notes.md"
           done < "${RUNNER_TEMP}/cells.txt"
           cat "${RUNNER_TEMP}/release-notes.md" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Collect the published container images
-        # The images are the delivery path for the runtimes that cannot be a
-        # layer, so a release record that named only the layers would omit half
-        # the release. Skipped when the merge job did not run (dry run) or failed:
+        # The image is the delivery artifact, so the release record names it per
+        # runtime. Skipped when the merge job did not run (dry run) or failed:
         # naming an image that was never pushed is worse than omitting it.
         if: ${{ needs.merge-containers.result == 'success' }}
         env:
@@ -447,9 +451,9 @@ jobs:
           for cell in json.loads(os.environ["MATRIX"])["include"]:
               print(cell["runtime"])
           PY
-          # The section goes into the record *and* the run summary. Appending the
-          # whole notes file to the summary here would replay the layer section
-          # that was already written above, so only the new section is emitted.
+          # The section goes into the record *and* the run summary. The summary
+          # already holds the per-arch tag section written above, so only this
+          # section is appended to it, while the record takes the whole file.
           {
             echo "## Published container images"
             echo
