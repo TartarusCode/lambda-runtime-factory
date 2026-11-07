@@ -1345,210 +1345,6 @@ def test_the_size_row_carries_the_container_image(tmp_path: Path) -> None:
     row = summary.read_text(encoding="utf-8")
     assert "| `bun13` | `x86_64` | 34.3 | 92754962 / 88.5 | 35.4% | 161.5 | yes | 111.0 |" in row
 
-# --- Dual-artifact contract: distroless OCI images ------------------------------
-#
-# Every runtime ships an OCI image built from the same payload as the zip layer.
-# The base is distroless: no /bin/sh, no /usr/bin/env, no package manager. That
-# makes the entrypoint part of the contract — a shell string or a shebang script
-# cannot run — and it moves the size ceiling from 250 MB to 10 GB, which is the
-# only way the Go and Rust toolchains publish as first-class artifacts.
-
-
-def test_every_runtime_has_a_container_target() -> None:
-    for runtime_id in runtime_manifest.list_active_runtime_ids():
-        for arch in runtime_manifest.SUPPORTED_ARCHS:
-            container = runtime_manifest.load_runtime(runtime_id, arch=arch)["container"]
-
-            assert container["enabled"] is True, runtime_id
-            assert container["profile"] in runtime_manifest.CONTAINER_PROFILES, runtime_id
-            assert container["workdir"] == "/var/task", runtime_id
-            # Exec form, never a shell string.
-            assert isinstance(container["entrypoint"], list) and container["entrypoint"]
-
-
-def test_a_distroless_image_is_a_runtime_base() -> None:
-    """The interpreter runtimes ship as runtime bases: no shell, no package manager."""
-    for runtime_id in runtime_manifest.list_active_runtime_ids():
-        for arch in runtime_manifest.SUPPORTED_ARCHS:
-            container = runtime_manifest.load_runtime(runtime_id, arch=arch)["container"]
-            if container["profile"] != "distroless":
-                continue
-
-            assert container["base_image"].startswith("gcr.io/distroless/"), runtime_id
-            # The entrypoint has to be a binary inside the payload: there is no
-            # shell to interpret a script and no /usr/bin/env to find one.
-            assert container["entrypoint"][0].startswith("/opt/"), runtime_id
-            assert container["env"]["HOME"] == "/tmp", (
-                f"{runtime_id}: a distroless user has no writable home"
-            )
-            assert container["packages"] == [], runtime_id
-
-
-def test_a_toolchain_image_is_a_build_environment() -> None:
-    """A toolchain image is only useful as a `RUN go build` stage, and a RUN step
-    needs a shell — which is exactly what a distroless base does not have."""
-    for runtime_id in runtime_manifest.list_active_runtime_ids():
-        for arch in runtime_manifest.SUPPORTED_ARCHS:
-            container = runtime_manifest.load_runtime(runtime_id, arch=arch)["container"]
-            if container["profile"] != "build":
-                continue
-
-            assert not container["base_image"].startswith("gcr.io/distroless/"), runtime_id
-            assert container["entrypoint"] == ["/bin/sh"], runtime_id
-            # Root: a build stage installs packages and writes to the workdir.
-            assert container["user"] == "0:0", runtime_id
-            # The toolchain has to be on PATH or `RUN go build` cannot find it.
-            assert "/opt/" in container["env"]["PATH"], runtime_id
-            # No handler to invoke, so the toolchain command is the only proof the
-            # image works.
-            assert container["smoke_test"], runtime_id
-
-
-def test_the_toolchain_families_are_the_build_profiles() -> None:
-    """Only the two toolchain families are build environments; everything else is
-    a runtime base, so a new runtime cannot silently inherit a shell."""
-    build = {
-        runtime_id
-        for runtime_id in runtime_manifest.list_active_runtime_ids()
-        if runtime_manifest.load_runtime(runtime_id)["container"]["profile"] == "build"
-    }
-
-    assert build == {"go126", "go127", "rust194", "rust198", "rust199"}
-
-
-def test_container_coordinates_travel_to_the_builder() -> None:
-    env = runtime_manifest.runtime_env("graalpy312", arch="arm64")
-
-    assert env["CONTAINER_PLATFORM"] == "linux/arm64"
-    assert env["CONTAINER_ARCH"] == "arm64"
-    assert env["CONTAINER_WORKDIR"] == "/var/task"
-    assert json.loads(env["CONTAINER_ENTRYPOINT"]) == [
-        "/opt/graalpy/bin/graalpy",
-        "/opt/bootstrap",
-    ]
-    assert env["CONTAINER_IMAGE"].endswith("/graalpy312")
-    assert env["CONTAINER_TAG"] == "25.2.4"
-    assert env["VERSION_LINE"] == "3.12"
-
-
-def test_the_generated_dockerfile_is_shell_free_in_its_final_stage() -> None:
-    dockerfile = container_image.render_dockerfile(
-        base_image="gcr.io/distroless/cc-debian13:nonroot",
-        platform="linux/amd64",
-        layer_root="/opt",
-        workdir="/var/task",
-        user="65532:65532",
-        entrypoint=["/opt/bootstrap"],
-        env={"HOME": "/tmp", "TMPDIR": "/tmp"},
-        packages=["zlib1g"],
-        sonames=["libz.so.1"],
-        libs_base_image="debian:13-slim",
-    )
-    final_stage = dockerfile.split("FROM ${BASE_IMAGE}", 1)[1]
-
-    assert "RUN " not in final_stage, (
-        "the distroless stage has no shell; any RUN there fails with "
-        "'exec /bin/sh: no such file or directory'"
-    )
-    assert "COPY layer/ /opt/" in final_stage
-    assert "COPY --from=libs /out/ /usr/lib/x86_64-linux-gnu/" in final_stage
-    assert "WORKDIR /var/task" in final_stage
-    assert "USER 65532:65532" in final_stage
-    assert 'ENTRYPOINT ["/opt/bootstrap"]' in final_stage
-    # The extra libraries come from the same Debian release as the base, not from
-    # the build host's newer glibc.
-    assert "FROM debian:13-slim AS libs" in dockerfile
-    assert "zlib1g" in dockerfile
-
-
-def test_the_libs_stage_matches_the_distroless_release() -> None:
-    """A library staged from the wrong Debian release grafts one release's
-    dependencies onto another's C library — and upstream distroless only rebuilds
-    the current release, so the base itself moves."""
-    base = runtime_manifest.REPO_DEFAULTS["container"]["base_image"]
-    libs = runtime_manifest.REPO_DEFAULTS["container"]["libs_base_image"]
-
-    assert runtime_manifest.debian_slim_for(base) == libs, (base, libs)
-    assert "debian13" in base, "distroless only supports the current Debian release"
-
-    for runtime_id in runtime_manifest.list_active_runtime_ids():
-        env = runtime_manifest.runtime_env(runtime_id, "x86_64")
-        if env["CONTAINER_PROFILE"] != "distroless":
-            continue
-        assert env["CONTAINER_LIBS_BASE_IMAGE"] == libs, runtime_id
-        assert "debian13" in env["CONTAINER_BASE_IMAGE"], runtime_id
-        assert "debian13" in env["CONTAINER_DEBUG_BASE_IMAGE"], runtime_id
-
-
-def test_a_build_image_installs_its_packages_and_links_its_payload() -> None:
-    """A toolchain image is a build stage, so it must have a shell, a package
-    manager, and the symlinks that make the payload runnable."""
-    dockerfile = container_image.render_dockerfile(
-        base_image="alpine:3.22",
-        platform="linux/amd64",
-        layer_root="/opt",
-        workdir="/var/task",
-        user="0:0",
-        entrypoint=["/bin/sh"],
-        env={"PATH": "/opt/rust/cargo/bin:/usr/bin:/bin"},
-        packages=["libgcc", "gcc", "musl-dev"],
-        sonames=[],
-        profile="build",
-        links={
-            "/usr/lib/libc.so": "/lib/ld-musl-x86_64.so.1",
-            "/opt/rust/rustc/lib/rustlib": "/opt/rust/rust-std-x86_64-unknown-linux-musl/lib/rustlib",
-        },
-    )
-
-    # One stage: there is no distroless final stage to keep shell-free.
-    assert dockerfile.count("FROM ") == 1
-    assert "AS libs" not in dockerfile
-    assert "RUN apk add --no-cache libgcc gcc musl-dev" in dockerfile
-    # The links come after the COPY: one of them points into the payload.
-    assert dockerfile.index("COPY layer/ /opt/") < dockerfile.index("ln -s")
-    assert "ln -s /lib/ld-musl-x86_64.so.1 /usr/lib/libc.so" in dockerfile
-    assert "rust-std-x86_64-unknown-linux-musl/lib/rustlib" in dockerfile
-    # `ln -sfn` into an existing directory nests the link instead of replacing
-    # the path, which silently leaves the real path untouched.
-    assert "rm -rf /usr/lib/libc.so && ln -s" in dockerfile
-    assert 'ENTRYPOINT ["/bin/sh"]' in dockerfile
-
-
-def test_a_debian_build_image_uses_apt() -> None:
-    dockerfile = container_image.render_dockerfile(
-        base_image="debian:12-slim",
-        platform="linux/amd64",
-        layer_root="/opt",
-        workdir="/var/task",
-        user="0:0",
-        entrypoint=["/bin/sh"],
-        env={"PATH": "/opt/go/bin:/usr/bin:/bin"},
-        packages=["ca-certificates"],
-        sonames=[],
-        profile="build",
-    )
-
-    assert "apt-get install -y --no-install-recommends ca-certificates" in dockerfile
-    assert "apk add" not in dockerfile
-
-
-def test_an_unknown_base_image_is_refused() -> None:
-    """Guessing a package manager fails minutes later inside the build."""
-    with pytest.raises(container_image.ContainerError, match="no package manager"):
-        container_image.package_manager_for("ubuntu:24.04")
-
-
-def test_only_libraries_the_base_lacks_are_staged() -> None:
-    # glibc, libm, libpthread, libstdc++ and the SSL runtime are in the base.
-    assert container_image.required_packages(["libc.so.6", "libm.so.6", "libstdc++.so.6"]) == []
-    assert container_image.required_packages(["libz.so.1", "libbz2.so.1.0"]) == [
-        "libbz2-1.0",
-        "zlib1g",
-    ]
-
-    with pytest.raises(container_image.ContainerError, match="libunknown.so.9"):
-        container_image.required_packages(["libunknown.so.9"])
-
 
 def test_the_unpacked_size_is_summed_from_the_rootfs_listing() -> None:
     """The recorded size must not depend on the daemon's image store.
@@ -1575,22 +1371,6 @@ def test_the_unpacked_size_is_summed_from_the_rootfs_listing() -> None:
     assert summary["entries"]["opt/go/bin/go"] == "-rw-r--r--"
     assert summary["entries"]["usr/lib/libz.so.1"] == "lrwxrwxrwx"
     assert summary["entries"]["usr/lib/libz.so.1.2.13"] == "-rw-r--r--"
-
-
-def test_a_shebang_script_can_never_be_a_container_entrypoint(tmp_path: Path) -> None:
-    payload = tmp_path / "layer"
-    payload.mkdir()
-    script = payload / "bootstrap"
-    script.write_text("#!/bin/sh\nexec /opt/go/bin/handler\n", encoding="utf-8")
-
-    with pytest.raises(container_image.ContainerError, match="not an ELF binary"):
-        container_image.assert_native_entrypoint(payload, ["/opt/bootstrap"])
-
-    script.write_bytes(b"\x7fELF" + b"\x00" * 12)
-    assert container_image.assert_native_entrypoint(payload, ["/opt/bootstrap"]) == script
-
-    with pytest.raises(container_image.ContainerError, match="does not exist"):
-        container_image.assert_native_entrypoint(payload, ["/opt/missing"])
 
 
 def test_go_and_rust_get_a_compiled_launcher_not_a_script() -> None:
@@ -1625,22 +1405,6 @@ def test_the_javascript_helpers_initialize_the_environment_themselves() -> None:
     assert 'process.env.HOME ??= "/tmp"' in deno
 
 
-def test_ci_builds_scans_and_smoke_tests_the_container_image() -> None:
-    call = _call_site("ci.yml", "runtime-checks", _BUILD_ACTION)
-
-    assert call["container"] == "true"
-    build = _named_step("build-and-audit-runtime", "Build distroless container image")
-    audit = _named_step("build-and-audit-runtime", "Audit the container image")
-    smoke = _named_step("build-and-audit-runtime", "Smoke-test the container image")
-
-    assert build["if"] == "inputs.container == 'true'"
-    assert "build-container" in build["run"]
-    assert audit["if"] == "inputs.container == 'true' && inputs.audit == 'true'"
-    assert "audit-container" in audit["run"]
-    assert "local-invoke-container" in smoke["run"]
-    assert "aws-lambda-rie" in smoke["run"] or "local-invoke-container" in smoke["run"]
-
-
 def test_the_container_publish_matrix_covers_every_runtime() -> None:
     """Containers are the delivery path for the runtimes a layer cannot carry, so
     the publish matrix must not inherit the layer filter."""
@@ -1657,60 +1421,6 @@ def test_the_container_publish_matrix_covers_every_runtime() -> None:
     assert set(runtime_manifest.list_active_runtime_ids()) <= containers_matrix
     for toolchain in ("go126", "go127", "rust194", "rust198", "rust199"):
         assert toolchain in containers_matrix, f"{toolchain} must publish an image"
-
-
-def test_the_release_pushes_ghcr_images_and_merges_the_architectures() -> None:
-    jobs = _workflow("release-runtime.yml")["jobs"]
-
-    assert "publish-containers" in jobs and "merge-containers" in jobs
-    publish = jobs["publish-containers"]
-    steps = {step.get("name"): step for step in publish["steps"]}
-
-    assert publish["permissions"]["packages"] == "write"
-    assert steps["Log in to GHCR"]["with"]["registry"] == "ghcr.io"
-    for name in ("Log in to GHCR", "Push the per-architecture images"):
-        assert "github.event.inputs.dry_run != 'true'" in steps[name]["if"], name
-
-    # Every variant the runtime has is built, scanned and smoke-tested, and only
-    # those bytes are pushed.
-    build = steps["Build, scan and smoke-test every variant"]["run"]
-    for command in ("container-variants", "build-container", "audit-container", "local-invoke-container"):
-        assert command in build, command
-    assert "--variant" in build
-    push = steps["Push the per-architecture images"]["run"]
-    assert "container-variants" in push and "--variant" in push
-
-    merge = jobs["merge-containers"]
-    merge_run = next(step for step in merge["steps"] if step.get("name") == "Create the multi-arch tags")["run"]
-    assert "merge-container-tags" in merge_run
-    assert merge["permissions"]["packages"] == "write"
-
-    # The tag arithmetic lives in the script, which is the part that has to be
-    # right: one multi-arch tag per variant, from the two per-arch images.
-    script = (_REPO_ROOT / "tools" / "bin" / "merge-container-tags").read_text(encoding="utf-8")
-    assert "docker buildx imagetools create" in script
-    assert "-amd64" in script and "-arm64" in script
-    assert "-debug" in script and "latest" in script
-
-
-def test_the_release_publishes_to_ecr_public_and_writes_a_soci_index() -> None:
-    """Lambda functions cannot pull from GHCR, and a SOCI index is what makes a
-    large image start lazily — both are part of the published artifact."""
-    jobs = _workflow("release-runtime.yml")["jobs"]
-    publish = {step.get("name"): step for step in jobs["publish-containers"]["steps"]}
-
-    ecr_login = publish["Log in to Amazon ECR Public"]["run"]
-    assert "aws ecr-public get-login-password" in ecr_login
-    assert "docker login --username AWS" in ecr_login
-    assert "ensure-container-repos" in publish["Ensure the image repositories exist"]["run"]
-    assert "check-container-variants" in publish["Check that the variants differ only by the shell"]["run"]
-
-    # SOCI runs beside the image it converts, not in a job that re-fetches it.
-    soci = publish["Publish the SOCI-enabled copy"]
-    assert "publish-soci-index" in soci["run"] and "--push" in soci["run"]
-    assert "SOCI_VERSION" in soci["env"], "the soci CLI must be pinned"
-    assert "ORAS_VERSION" in soci["env"], "oras moves the OCI layout, so it is pinned too"
-    assert "publish-soci" not in jobs, "the separate SOCI job was folded into the image jobs"
 
 
 def test_soci_publishing_is_opt_in_and_needs_no_containerd() -> None:
@@ -1801,80 +1511,6 @@ def test_the_ecr_repository_name_excludes_the_account_alias() -> None:
     assert "public.ecr.aws/tartaruscode/lambda-runtime-factory/pypy311" in output
 
 
-def test_a_runtime_without_a_shell_variant_says_so() -> None:
-    """A `build` profile already has a shell, so it has one image — and asking for
-    a debug variant is a clean error rather than a silently identical image."""
-    for runtime_id in ("pypy311", "bun13", "deno29", "graalpy312"):
-        variants = subprocess.run(
-            ["bash", str(_REPO_ROOT / "tools" / "bin" / "container-variants"), runtime_id, "x86_64"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.split()
-        assert variants == ["standard", "debug"], runtime_id
-
-    for runtime_id in ("go126", "rust198"):
-        variants = subprocess.run(
-            ["bash", str(_REPO_ROOT / "tools" / "bin" / "container-variants"), runtime_id, "x86_64"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.split()
-        assert variants == ["standard"], runtime_id
-
-        with pytest.raises(ValueError, match="no debug container variant"):
-            runtime_manifest.runtime_env(runtime_id, "x86_64", variant="debug")
-
-
-def test_the_debug_variant_differs_only_by_its_base_and_tags() -> None:
-    standard = runtime_manifest.runtime_env("pypy311", "x86_64")
-    debug = runtime_manifest.runtime_env("pypy311", "x86_64", variant="debug")
-
-    assert standard["CONTAINER_BASE_IMAGE"] == "gcr.io/distroless/cc-debian13:nonroot"
-    assert debug["CONTAINER_BASE_IMAGE"] == "gcr.io/distroless/cc-debian13:debug-nonroot"
-    assert debug["CONTAINER_TAG_SUFFIX"] == "-debug"
-    assert debug["CONTAINER_LOCAL_IMAGE"].endswith("-x86_64-debug")
-    assert debug["CONTAINER_CONTEXT_DIR"] != standard["CONTAINER_CONTEXT_DIR"]
-
-    # What the image does must not change: a debug image that also changed the
-    # invocation would be debugging a different container.
-    for key in (
-        "CONTAINER_ENTRYPOINT",
-        "CONTAINER_USER",
-        "CONTAINER_ENV",
-        "CONTAINER_PROFILE",
-        "CONTAINER_WORKDIR",
-        "CONTAINER_LAYER_ROOT",
-    ):
-        assert debug[key] == standard[key], key
-
-
-def test_the_debug_dockerfile_keeps_the_production_invocation() -> None:
-    def render(base_image: str, variant: str) -> str:
-        return container_image.render_dockerfile(
-            base_image=base_image,
-            platform="linux/amd64",
-            layer_root="/opt",
-            workdir="/var/task",
-            user="65532:65532",
-            entrypoint=["/opt/pypy/bin/pypy", "/opt/bootstrap"],
-            env={"HOME": "/tmp"},
-            packages=[],
-            sonames=[],
-            profile="distroless",
-            variant=variant,
-        )
-
-    standard = render("gcr.io/distroless/cc-debian12:nonroot", "standard")
-    debug = render("gcr.io/distroless/cc-debian12:debug-nonroot", "debug")
-
-    entrypoint = 'ENTRYPOINT ["/opt/pypy/bin/pypy", "/opt/bootstrap"]'
-    assert entrypoint in standard and entrypoint in debug
-    assert "# Variant: standard" in standard and "# Variant: debug" in debug
-    # The final stage never runs anything: the debug base is the only difference.
-    assert "RUN " not in debug.split("FROM ${BASE_IMAGE}")[1]
-
-
 def test_a_container_can_pass_the_handler_as_cmd() -> None:
     """Lambda runs a container image as ENTRYPOINT + CMD, so the handler reaches
     the runtime as an argument when `_HANDLER` is not set. Supporting both is what
@@ -1932,7 +1568,6 @@ def test_the_example_dockerfiles_never_run_a_command_in_the_runtime_stage() -> N
         # runtime image deliberately does not have.
         tail = text[text.rindex("\nFROM "):]
         assert "RUN " not in tail, f"{path}: the runtime stage cannot run a command"
-
 
 
 def test_the_layer_publish_cell_does_not_build_the_container() -> None:
@@ -2075,43 +1710,6 @@ def test_a_narrow_margin_warns_without_failing() -> None:
     assert verdict["headroom_mb"] < 10
 
 
-# --- Iron Bank hardened artifact -------------------------------------------------
-#
-# Every runtime also ships a second image: the same payload on the DoD-hardened
-# UBI9 base, non-root UID 1001, a DoD root CA trust store and a read-only rootfs
-# with /tmp as the only writable path. The stage layout lives in one canonical
-# template so the STIG invariants are reviewable, and the invocation comes from
-# the manifest so it cannot drift from the distroless image.
-
-
-def test_the_iron_bank_coordinates_travel_to_the_builder() -> None:
-    env = runtime_manifest.runtime_env("graalpy312", arch="arm64")
-
-    assert env["CONTAINER_IRONBANK_ENABLED"] == "true"
-    assert env["CONTAINER_IRONBANK_BASE_IMAGE"].startswith("registry1.dso.mil/ironbank/")
-    assert env["CONTAINER_FALLBACK_BASE_IMAGE"].startswith("registry.access.redhat.com/")
-    assert env["CONTAINER_NONROOT_UID"] == "1001"
-    assert env["CONTAINER_NONROOT_GID"] == "1001"
-    assert json.loads(env["CONTAINER_IRONBANK_PACKAGES"]) == ["ca-certificates"]
-    assert env["CONTAINER_IRONBANK_LOCAL_IMAGE"].endswith("-x86_64-ironbank") or env[
-        "CONTAINER_IRONBANK_LOCAL_IMAGE"
-    ].endswith("-arm64-ironbank")
-    assert env["CONTAINER_BASE_IMAGE_DIGEST"] == ""
-    # The registry cache ref is derived, so a workflow cannot invent its own.
-    assert env["CONTAINER_CACHE_REF"].endswith("/graalpy312:buildcache-arm64")
-
-
-def test_the_iron_bank_base_and_fallback_are_declared_repo_wide() -> None:
-    ironbank = runtime_manifest.REPO_DEFAULTS["container"]["ironbank"]
-
-    assert ironbank["base_image"].startswith("registry1.dso.mil/ironbank/redhat/ubi/")
-    assert ironbank["fallback_base_image"].startswith("registry.access.redhat.com/")
-    assert ironbank["nonroot_uid"] == ironbank["nonroot_gid"] == 1001
-    # A digest pin is supported so Iron Bank's daily automated rebuild cannot
-    # change the base under a reproducible build.
-    assert "base_image_digest" in ironbank
-
-
 def test_the_iron_bank_template_carries_the_stig_invariants() -> None:
     """The canonical template is the one file that has to be right: the final
     stage runs non-root, writable only under /tmp, and carries no package
@@ -2143,22 +1741,6 @@ def test_the_iron_bank_template_carries_the_stig_invariants() -> None:
     assert "rpm -q" in template
 
 
-def test_render_ironbank_dockerfile_substitutes_every_placeholder() -> None:
-    dockerfile = container_image.render_ironbank_dockerfile(
-        layer_root="/opt",
-        workdir="/var/task",
-        env={"HOME": "/tmp", "TMPDIR": "/tmp", "GOCACHE": "/tmp/.cache/go-build"},
-        labels={"com.tartaruscode.lambda.profile": "ironbank"},
-    )
-
-    assert not re.search(r"@@[A-Z_]+@@", dockerfile), "a placeholder was left unsubstituted"
-    assert 'ENV HOME="/tmp"' in dockerfile
-    assert 'LABEL com.tartaruscode.lambda.profile="ironbank"' in dockerfile
-    assert "WORKDIR /var/task" in dockerfile
-    assert "COPY --chown=${NONROOT_UID}:${NONROOT_GID} layer/ /opt/" in dockerfile
-    assert "chmod -R a+rX /opt" in dockerfile
-
-
 def test_the_iron_bank_package_map_names_packages_not_files() -> None:
     # What the base ships needs no install at all.
     assert container_image.required_ubi_packages(["libc.so.6", "libz.so.1"]) == []
@@ -2178,34 +1760,6 @@ def test_the_iron_bank_package_list_is_names_not_characters() -> None:
 
     assert packages == ["bzip2-libs", "ca-certificates"]
     assert all(len(name) > 1 for name in packages)
-
-
-def test_the_iron_bank_build_supports_fallback_digest_and_registry_cache() -> None:
-    script = (_REPO_ROOT / "tools" / "bin" / "build-container").read_text(encoding="utf-8")
-
-    assert "--ironbank" in script
-    assert "USE_FALLBACK_UBI" in script
-    assert "IRONBANK_TOKEN" in script, "a CI build without the token must fall back"
-    assert "BASE_IMAGE_DIGEST" in script
-    assert "--cache-from" in script and "--cache-to" in script
-    assert "type=registry,ref=" in script
-    assert "prepare-ironbank" in script
-    # No payload is re-derived in the image build: build-runtime owns it.
-    assert "curl " not in script
-    assert "sha256sum" not in script
-
-
-def test_the_iron_bank_smoke_test_proves_rootless_read_only_execution() -> None:
-    script = (_REPO_ROOT / "tools" / "bin" / "local-invoke-container").read_text(encoding="utf-8")
-
-    assert "--ironbank" in script
-    assert "--read-only" in script
-    assert "--tmpfs /tmp:rw,exec,size=512m,uid=1001,gid=1001" in script
-    assert "--user 1001:1001" in script
-    # RIE comes from the host cache, never from the production image.
-    assert ":/tmp/aws-lambda-rie:ro" in script
-    # The emulator is never baked into the image the build produces.
-    assert "build-container" in script
 
 
 def test_local_invoke_never_bakes_the_emulator_into_the_image() -> None:
@@ -2303,27 +1857,6 @@ def test_the_soci_conversion_filters_the_pull_to_one_architecture() -> None:
     script = (_REPO_ROOT / "tools" / "bin" / "publish-soci-index").read_text(encoding="utf-8")
 
     assert '--platform "linux/${CONTAINER_ARCH}"' in script
-
-
-# --- Buildx registry caching ------------------------------------------------------
-
-
-def test_buildx_registry_caching_is_wired_end_to_end() -> None:
-    action = _action("build-and-audit-runtime")
-    steps = {step.get("name"): step for step in action["runs"]["steps"]}
-
-    setup = steps["Set up Docker Buildx"]
-    assert setup["uses"] == "docker/setup-buildx-action@v3"
-    assert setup["with"]["driver"] == "docker-container"
-
-    distroless = steps["Build distroless container image"]["run"]
-    assert "--cache-from" in distroless
-    # Only the default branch writes the cache: a PR's cache lands on a ref
-    # nothing else can read.
-    assert "refs/heads/${{ github.event.repository.default_branch }}" in distroless
-    assert "--cache-to" in distroless and "mode=max" in distroless
-    assert "--cache-from" in steps["Build the debug image"]["run"]
-    assert "--cache-from" in steps["Build the Iron Bank image"]["run"]
 
 
 # --- Two-tier CI gating -----------------------------------------------------------
@@ -2435,3 +1968,268 @@ def test_the_runtime_api_headers_are_read_case_insensitively() -> None:
             _REPO_ROOT / "runtimes" / helper / "helpers" / f"lambda_runtime_{helper.rstrip('0123456789')}" / "runtime.ts"
         ).read_text(encoding="utf-8")
         assert 'headers.get("lambda-runtime-aws-request-id")' in text, helper
+
+
+# --- One container per runtime, on the Iron Bank base ---------------------------
+#
+# There is exactly one image per runtime, from the same ${LAYER_ROOT} the zip layer
+# ships, on the DoD-hardened Iron Bank UBI9-minimal base. A second base would mean
+# a second container matrix, a second set of tags, and a library-staging hack that
+# leaves the image's RPM database unaware of libraries it carries. These tests hold
+# that shape: one base, one entrypoint, one tag per version.
+
+
+def test_every_runtime_has_one_container_target() -> None:
+    for runtime_id in runtime_manifest.list_active_runtime_ids():
+        for arch in runtime_manifest.SUPPORTED_ARCHS:
+            container = runtime_manifest.load_runtime(runtime_id, arch=arch)["container"]
+
+            assert container["enabled"] is True, runtime_id
+            assert container["workdir"] == "/var/task", runtime_id
+            # One entrypoint for every family: the bootstrap the zip layer ships.
+            assert container["entrypoint"] == ["/opt/bootstrap"], runtime_id
+            assert container["user"] == "1001:1001", runtime_id
+            assert container["layer_root"] == "/opt", runtime_id
+
+
+def test_the_single_container_base_is_iron_bank() -> None:
+    container = runtime_manifest.REPO_DEFAULTS["container"]
+
+    assert container["base_image"].startswith("registry1.dso.mil/ironbank/redhat/ubi/")
+    assert container["fallback_base_image"] == (
+        "registry.access.redhat.com/ubi9/ubi-minimal:latest"
+    ), "the credential-free fallback must be the same UBI9 userland"
+    assert container["nonroot_uid"] == container["nonroot_gid"] == 1001
+    assert "base_image_digest" in container, "a digest pin must be possible"
+    assert container["packages"] == ["ca-certificates"]
+
+    for runtime_id in runtime_manifest.list_active_runtime_ids():
+        for arch in runtime_manifest.SUPPORTED_ARCHS:
+            env = runtime_manifest.runtime_env(runtime_id, arch=arch)
+            assert env["CONTAINER_BASE_IMAGE"].startswith("registry1.dso.mil/"), runtime_id
+            assert env["CONTAINER_NONROOT_UID"] == "1001", runtime_id
+            assert env["CONTAINER_USER"] == "1001:1001", runtime_id
+
+
+def test_no_second_container_base_survives_anywhere() -> None:
+    """The distroless base, the Debian `.so`-staging stage and the Alpine musl base
+    are gone; a family that reintroduces one would rebuild the matrix by accident."""
+    for runtime_id in runtime_manifest.list_active_runtime_ids():
+        raw = json.loads(
+            runtime_manifest.runtime_manifest_path(runtime_id).read_text(encoding="utf-8")
+        )
+        container = raw.get("container", {})
+        for key in ("base_image", "fallback_base_image", "profile", "debug_base_image",
+                    "libs_base_image", "links", "user", "entrypoint"):
+            assert key not in container, (
+                f"{runtime_id}: container.{key} belongs to the repo default, not a family"
+            )
+
+    family_defaults = json.dumps(runtime_manifest.RUNTIME_FAMILY_DEFAULTS)
+    for forbidden in ("distroless", "gcr.io", "debian:", "alpine:"):
+        assert forbidden not in family_defaults, forbidden
+
+    package = runtime_manifest.load_runtime("graalpy312")["container"]
+    assert "gcr.io" not in package["base_image"]
+
+
+def test_the_container_coordinates_travel_to_the_builder() -> None:
+    env = runtime_manifest.runtime_env("graalpy312", arch="arm64")
+
+    assert env["CONTAINER_PLATFORM"] == "linux/arm64"
+    assert env["CONTAINER_ARCH"] == "arm64"
+    assert env["CONTAINER_WORKDIR"] == "/var/task"
+    assert json.loads(env["CONTAINER_ENTRYPOINT"]) == ["/opt/bootstrap"]
+    assert env["CONTAINER_IMAGE"].endswith("/graalpy312")
+    assert env["CONTAINER_TAG"] == "25.2.4"
+    assert env["VERSION_LINE"] == "3.12"
+    assert env["CONTAINER_CACHE_REF"] == (
+        "ghcr.io/tartaruscode/lambda-runtime-factory/graalpy312:buildcache-arm64"
+    )
+    # No variant coordinates exist any more: one image per runtime.
+    for gone in ("CONTAINER_VARIANT", "CONTAINER_TAG_SUFFIX", "CONTAINER_PROFILE"):
+        assert gone not in env, gone
+
+
+def test_render_dockerfile_substitutes_every_placeholder() -> None:
+    dockerfile = container_image.render_dockerfile(
+        layer_root="/opt",
+        workdir="/var/task",
+        env={"HOME": "/tmp", "TMPDIR": "/tmp", "GOCACHE": "/tmp/.cache/go-build"},
+        labels={"com.tartaruscode.lambda.runtime": "pypy311"},
+    )
+
+    assert not re.search(r"@@[A-Z_]+@@", dockerfile), "a placeholder was left unsubstituted"
+    assert 'ENV HOME="/tmp"' in dockerfile
+    assert 'LABEL com.tartaruscode.lambda.runtime="pypy311"' in dockerfile
+    assert "WORKDIR /var/task" in dockerfile
+    assert "COPY --chown=${NONROOT_UID}:${NONROOT_GID} layer/ /opt/" in dockerfile
+    assert "chmod -R a+rX /opt" in dockerfile
+    assert 'ENTRYPOINT ["/opt/bootstrap"]' in dockerfile
+    assert "USER ${NONROOT_UID}:${NONROOT_GID}" in dockerfile
+
+
+def test_the_toolchain_families_prove_themselves_without_a_handler() -> None:
+    """An image with no handler cannot be exercised through RIE, so its smoke test
+    is declared in the manifest and runs under the same STIG contract."""
+    go = runtime_manifest.load_runtime("go127")["container"]["smoke_test"]
+    assert go == {"argv": ["go", "version"], "expect_version": True}
+
+    rust = runtime_manifest.load_runtime("rust199")["container"]["smoke_test"]
+    assert rust["argv"] == ["/opt/bootstrap"]
+    assert rust["expect_exit"] == 127
+    assert "_HANDLER" in rust["expect_output"]
+
+    for runtime_id in ("pypy311", "bun13", "deno29", "graalpy312"):
+        assert runtime_manifest.load_runtime(runtime_id)["container"]["smoke_test"] == {}
+
+
+def test_a_malformed_smoke_test_is_refused() -> None:
+    data = runtime_manifest.load_runtime("go127")
+    data["container"]["smoke_test"] = {"argv": []}
+    with pytest.raises(ValueError, match="smoke_test.argv"):
+        runtime_manifest.validate_runtime_data("go127", data)
+
+    data["container"]["smoke_test"] = ["go", "version"]
+    with pytest.raises(ValueError, match="must be a mapping"):
+        runtime_manifest.validate_runtime_data("go127", data)
+
+
+def test_local_invoke_proves_the_stig_contract() -> None:
+    script = (_REPO_ROOT / "tools" / "bin" / "local-invoke-container").read_text(encoding="utf-8")
+
+    assert "--read-only" in script
+    assert "uid=${CONTAINER_NONROOT_UID},gid=${CONTAINER_NONROOT_GID}" in script
+    assert '--user "${CONTAINER_NONROOT_UID}:${CONTAINER_NONROOT_GID}"' in script
+    # The smoke test for an image with no handler runs under the same flags, not
+    # under a plain `docker run`.
+    assert script.index("stig_args=(") < script.index("Running the declared smoke test")
+    assert 'docker run --rm "${stig_args[@]}"' in script
+    # RIE comes from the host cache, never from the production image.
+    assert ":/tmp/aws-lambda-rie:ro" in script
+    assert "aws-lambda-rie-" in script
+
+
+def test_check_container_verifies_the_built_image() -> None:
+    script = (_REPO_ROOT / "tools" / "bin" / "check-container").read_text(encoding="utf-8")
+
+    # Everything it asserts is read back from the image, not from the manifest.
+    assert "docker image inspect" in script
+    assert '{{.Config.User}}' in script
+    assert '{{json .Config.Entrypoint}}' in script
+    assert "no-microdnf" in script and "no-dnf" in script and "no-yum" in script
+    assert "rpmdb-present" in script
+    assert "--read-only" in script
+
+
+def test_build_container_has_one_base_path_and_a_noop_ironbank_flag() -> None:
+    script = (_REPO_ROOT / "tools" / "bin" / "build-container").read_text(encoding="utf-8")
+
+    assert "--variant" not in script and "--debug" not in script
+    assert "--ironbank) shift ;;" in script, "the old flag must stay harmless"
+    assert "USE_FALLBACK_UBI" in script
+    assert "IRONBANK_TOKEN" in script, "a CI build without the token must fall back"
+    assert "BASE_IMAGE_DIGEST" in script
+    assert "--cache-from" in script and "--cache-to" in script
+    assert "type=registry,ref=" in script
+    # No payload is re-derived in the image build: build-runtime owns it.
+    assert "curl " not in script
+    assert "sha256sum" not in script
+    for gone in ("prepare-ironbank", "distroless", "LIB_PACKAGES", "STAGED_SONAMES"):
+        assert gone not in script, gone
+
+
+def test_ci_builds_scans_and_smoke_tests_the_container_image() -> None:
+    call = _call_site("ci.yml", "runtime-checks", _BUILD_ACTION)
+
+    assert call["container"] == "true"
+    assert "ironbank" not in call, "one image per runtime; there is no second artifact"
+
+    build = _named_step("build-and-audit-runtime", "Build the container image")
+    audit = _named_step("build-and-audit-runtime", "Audit the container image")
+    smoke = _named_step("build-and-audit-runtime", "Smoke-test the container image")
+    contract = _named_step("build-and-audit-runtime", "Check the image contract")
+
+    assert build["if"] == "inputs.container == 'true'"
+    assert "build-container" in build["run"]
+    assert audit["if"] == "inputs.container == 'true' && inputs.audit == 'true'"
+    assert "audit-container" in audit["run"]
+    assert "local-invoke-container" in smoke["run"]
+    assert "check-container" in contract["run"]
+    assert "container-variants" not in _workflow_text("ci.yml")
+
+
+def test_buildx_registry_caching_is_wired_end_to_end() -> None:
+    action = _action("build-and-audit-runtime")
+    steps = {step.get("name"): step for step in action["runs"]["steps"]}
+
+    setup = steps["Set up Docker Buildx"]
+    assert setup["uses"] == "docker/setup-buildx-action@v3"
+    assert setup["with"]["driver"] == "docker-container"
+
+    build = steps["Build the container image"]["run"]
+    assert "--cache-from" in build
+    # Only the default branch writes the cache: a PR's cache lands on a ref nothing
+    # else can read.
+    assert "refs/heads/${{ github.event.repository.default_branch }}" in build
+    assert "--cache-to" in build and "mode=max" in build
+
+
+def test_the_release_builds_scans_and_pushes_one_image_per_runtime() -> None:
+    jobs = _workflow("release-runtime.yml")["jobs"]
+    assert "publish-containers" in jobs and "merge-containers" in jobs
+    publish = jobs["publish-containers"]
+    steps = {step.get("name"): step for step in publish["steps"]}
+
+    assert publish["permissions"]["packages"] == "write"
+    assert steps["Log in to GHCR"]["with"]["registry"] == "ghcr.io"
+    for name in ("Log in to GHCR", "Push the per-architecture image"):
+        assert "github.event.inputs.dry_run != 'true'" in steps[name]["if"], name
+
+    # Every image is built, scanned, smoke-tested and checked before it is pushed,
+    # and there is no variant loop left to run twice.
+    build = steps["Build, scan and smoke-test the image"]["run"]
+    for command in ("build-container", "audit-container", "local-invoke-container"):
+        assert command in build, command
+    assert "--variant" not in build
+    assert "container-variants" not in _workflow_text("release-runtime.yml")
+    assert "check-container" in steps["Check the image contract"]["run"]
+    assert "--ironbank" not in steps["Push the per-architecture image"]["run"]
+
+    merge = jobs["merge-containers"]
+    merge_run = next(step for step in merge["steps"] if step.get("name") == "Create the multi-arch tags")["run"]
+    assert "merge-container-tags" in merge_run
+    assert "--ironbank" not in merge_run
+    assert merge["permissions"]["packages"] == "write"
+
+    # The tag arithmetic lives in the script, which is the part that has to be
+    # right: one multi-arch tag per version, from the two per-arch images.
+    script = (_REPO_ROOT / "tools" / "bin" / "merge-container-tags").read_text(encoding="utf-8")
+    assert "docker buildx imagetools create" in script
+    assert "-amd64" in script and "-arm64" in script
+    assert "latest" in script
+    # No variant or second-artifact tag suffix survives; `--ironbank` is only a
+    # harmless no-op case.
+    assert "${tag}-debug" not in script
+    assert "${tag}-ironbank" not in script
+    assert "${suffix}" not in script
+
+
+def test_the_release_publishes_to_ecr_public_and_writes_a_soci_index() -> None:
+    """Lambda functions cannot pull from GHCR, and a SOCI index is what makes a
+    large image start lazily — both are part of the published artifact."""
+    jobs = _workflow("release-runtime.yml")["jobs"]
+    publish = {step.get("name"): step for step in jobs["publish-containers"]["steps"]}
+
+    ecr_login = publish["Log in to Amazon ECR Public"]["run"]
+    assert "aws ecr-public get-login-password" in ecr_login
+    assert "docker login --username AWS" in ecr_login
+    assert "ensure-container-repos" in publish["Ensure the image repositories exist"]["run"]
+    assert "check-container" in publish["Check the image contract"]["run"]
+
+    # SOCI runs beside the image it converts, not in a job that re-fetches it.
+    soci = publish["Publish the SOCI-enabled copy"]
+    assert "publish-soci-index" in soci["run"] and "--push" in soci["run"]
+    assert "SOCI_VERSION" in soci["env"], "the soci CLI must be pinned"
+    assert "ORAS_VERSION" in soci["env"], "oras moves the OCI layout, so it is pinned too"
+    assert "publish-soci" not in jobs, "the separate SOCI job was folded into the image jobs"
