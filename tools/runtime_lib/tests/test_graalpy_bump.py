@@ -138,6 +138,5 @@ def test_bump_runtime_writes_python_versioned_checksum_names(
 def test_real_graalpy_runtimes_validate() -> None:
     from runtime_manifest import validate_runtime
 
-    validate_runtime("graalpy312", "x86_64")
     validate_runtime("graalpy313", "x86_64")
     validate_runtime("graalpy313", "arm64")

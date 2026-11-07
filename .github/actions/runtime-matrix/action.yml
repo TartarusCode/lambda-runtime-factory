@@ -37,7 +37,7 @@ inputs:
       "true" narrows the matrix to the runtimes whose files changed against the
       base branch (or, when only tooling or docs changed, to a single canary
       cell). This is the fast PR tier: a work-in-progress commit must not occupy
-      all 24 runners before the PR is ready to merge. Requires the caller's
+      every runner before the PR is ready to merge. Requires the caller's
       checkout to have the base branch in its history (fetch-depth: 0).
     required: false
     default: "false"
@@ -78,7 +78,7 @@ runs:
             | grep '^runtimes/' | cut -d/ -f2 | sort -u | paste -sd, - || true)
           if [[ -z "${changed}" ]]; then
             # Nothing under runtimes/ changed (tools, workflows, docs): one canary
-            # cell still proves the shared plumbing builds, without 24 runners.
+            # cell still proves the shared plumbing builds, without occupying every runner.
             echo "No runtime files changed against ${base}; running the pypy311 canary cell."
             runtime="pypy311"
             arch="x86_64"

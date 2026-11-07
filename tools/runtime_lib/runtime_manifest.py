@@ -103,11 +103,9 @@ REPO_DEFAULTS: Dict[str, Any] = {
         "workdir": "/var/task",
         "layer_root": "/opt",
         # One entrypoint for every family: the payload's bootstrap, which applies
-        # the Lambda filesystem contract and execs the runtime. The zip layer ships
-        # the identical file, so the two artifacts cannot disagree about how a
-        # function starts. An interpreter bootstrap is a shebang script naming the
-        # payload's own interpreter; UBI9-minimal has a shell, so a `#!/bin/sh`
-        # wrapper works too.
+        # the Lambda filesystem contract and execs the runtime. An interpreter
+        # bootstrap is a shebang script naming the payload's own interpreter;
+        # UBI9-minimal has a shell, so a `#!/bin/sh` wrapper works too.
         "entrypoint": ["/opt/bootstrap"],
         # A toolchain image has no handler to invoke, so its smoke test runs the
         # toolchain (or the launcher's contract) instead: see `smoke_test` in the
@@ -578,8 +576,8 @@ def validate_runtime_data(runtime_id: str, data: Dict[str, Any]) -> None:
                 f"not {value!r}"
             )
 
-    # One entrypoint for every family: the payload's bootstrap, which the zip
-    # layer ships too. It is an argv Docker execs directly, never a shell string.
+    # One entrypoint for every family: the payload's bootstrap, as an argv Docker
+    # execs directly, never a shell string.
     if not isinstance(data["container"]["entrypoint"], list) or not data["container"]["entrypoint"]:
         raise ValueError(
             f"Runtime {runtime_id} container.entrypoint must be a non-empty argv list"

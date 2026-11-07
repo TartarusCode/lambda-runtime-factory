@@ -11,7 +11,7 @@ Every runtime ships **one container image**, plus the compliance bundle that mak
 
 |  | Container image | Compliance bundle |
 | --- | --- | --- |
-| **Runtimes** | all 12 | all 12 |
+| **Runtimes** | every runtime | every runtime |
 | **Location** | `ghcr.io/tartaruscode/lambda-runtime-factory/<runtime>` and `public.ecr.aws/tartaruscode/lambda-runtime-factory/<runtime>` | attached to the image digest, and uploaded as a workflow artifact |
 | **Architectures** | one multi-arch manifest | per architecture |
 | **Address by** | `<version>` (`1.26.10`), `<line>` (`1.26`), `latest` | `oras discover` |
@@ -104,7 +104,6 @@ so `rustc` itself cannot run inside a glibc image (UBI9 ships no musl loader). T
 | `deno29` | Deno 2.9 | 2.9 | Bootstrap runs `deno` with sandbox flags for the Runtime API |
 | `go126` | Go 1.26 | 1.26 | Go toolchain image |
 | `go127` | Go 1.27 | 1.27 | Go toolchain image |
-| `graalpy312` | GraalPy 3.12 | 3.12 | GraalPy on Python, with the image's site-packages on `sys.path` |
 | `graalpy313` | GraalPy 3.13 | 3.13 | GraalPy on Python, with the image's site-packages on `sys.path` |
 | `pypy311` | PyPy 3.11 | 3.11 | Portable PyPy build from python.org; ships the Runtime API bootstrap and the helper package |
 | `pypy312` | PyPy 3.12 | 3.12 | Portable PyPy build from python.org; ships the Runtime API bootstrap and the helper package |

@@ -118,10 +118,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/runtime-build-env
         with:
-          grype: always
           db-refresh: "true"
 
-  # One job validates everything that would otherwise fail in all 24 cells.
+  # One job validates everything that would otherwise fail in every cell.
   # aws-actions/configure-aws-credentials retries credential loading 12 times
   # (~51s) before giving up, so a role that cannot be assumed is discovered here
   # in ~1 minute instead of costing ~20 minutes of wall clock across the matrix.
@@ -227,7 +226,6 @@ jobs:
           runtime: ${{ matrix.runtime }}
           arch: ${{ matrix.arch }}
           # A published image must be gated on a fresh scan.
-          grype: always
           db-refresh: "false"
       - name: Log in to GHCR
         if: ${{ github.event.inputs.dry_run != 'true' }}
@@ -274,16 +272,14 @@ jobs:
         run: bash tools/bin/ensure-container-repos "${{ matrix.runtime }}"
       - name: Build, scan and smoke-test the image
         # One image per runtime on the Iron Bank UBI9 base. Only bytes that passed
-        # all three steps are pushed, and the smoke test runs rootless on a
-        # read-only rootfs.
+        # all three steps are pushed. The smoke test runs before the compliance
+        # bundle so provenance cites the STIG check it performs.
+        env:
+          CONTAINER_BUILD_CACHE: gha
         run: |
-          env_text=$(python3 tools/runtime_lib/runtime_manifest.py env \
-            --runtime "${{ matrix.runtime }}" --arch "${{ matrix.arch }}")
-          cache_ref=$(grep '^CONTAINER_CACHE_REF=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
-          timeout 900 bash tools/bin/build-container "${{ matrix.runtime }}" "${{ matrix.arch }}" \
-            --cache-from "${cache_ref}"
-          bash tools/bin/generate-compliance-artifacts "${{ matrix.runtime }}" "${{ matrix.arch }}"
+          timeout 900 bash tools/bin/build-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
           timeout 600 bash tools/bin/local-invoke-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
+          bash tools/bin/generate-compliance-artifacts "${{ matrix.runtime }}" "${{ matrix.arch }}"
       - name: Check the image contract
         run: bash tools/bin/check-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
       - name: Push the per-architecture image

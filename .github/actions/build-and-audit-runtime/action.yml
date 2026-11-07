@@ -1,13 +1,12 @@
 name: Build and audit runtime package
 description: >-
-  Install the archive tooling, build a runtime layer package and scan it with
-  Grype. Shared by the CI matrix, the release matrix and the scheduled audit so
-  the build inputs and the scan cannot drift between workflows.
+  Install the archive tooling, build a runtime image and its compliance bundle.
+  Shared by the CI matrix, the release matrix and the scheduled audit so the
+  build inputs and the scan cannot drift between workflows.
 
-  The build is skipped when the caller's content-keyed package cache hit, and
-  the scan when the caller's decision says the pinned payload did not change.
-  Both are inputs rather than defaults because the gate belongs next to the
-  build-env action that computed it.
+  Every call site runs the same sequence — stage the payload, build the image,
+  smoke-test it, generate the bundle — so there is nothing to gate: a cached
+  payload would only be rebuilt by the image step that consumes it.
 
 inputs:
   runtime:
@@ -16,24 +15,11 @@ inputs:
   arch:
     description: Architecture to build
     required: true
-  skip-build:
-    description: >-
-      "true" skips the build step. Pass the build-env action's
-      `package-cache-hit` output when a hit means the package on disk is
-      byte-for-byte what this build would produce.
-    required: false
-    default: "false"
-  audit:
-    description: >-
-      "true" runs the Grype scan. Pass the build-env action's `audit` output,
-      or a literal "true" for a call site that must always scan.
-    required: false
-    default: "false"
   container:
     description: >-
-      "true" also builds the OCI image from the same payload, scans it and
-      smoke-tests it rootless on a read-only rootfs. A release cell that publishes
-      the layer only passes "false"; the container publish job owns the image.
+      "true" builds the OCI image from the staged payload, smoke-tests it rootless
+      on a read-only rootfs, checks its STIG contract and generates its compliance
+      bundle. "false" stages the payload only.
     required: false
     default: "true"
 
@@ -49,16 +35,16 @@ runs:
         fi
 
     - name: Set up Docker Buildx
-      # The docker-container driver is what supports registry cache import/export
-      # (`type=registry`), which is how the base pull, the certificate extraction
-      # and the library installation are reused across runs.
+      # The docker-container driver exposes the job's cache service through
+      # `type=gha`, which is how the base pull, the certificate extraction and the
+      # library installation are reused across cells and runs. The default docker
+      # driver has no BuildKit cache export at all.
       if: inputs.container == 'true'
       uses: docker/setup-buildx-action@v3
       with:
         driver: docker-container
 
     - name: Build runtime package
-      if: inputs.skip-build != 'true'
       shell: bash
       # A pathological upstream download must fail fast, not hang the cell.
       # This cannot be a step-level `timeout-minutes`: a composite action's step
@@ -74,21 +60,15 @@ runs:
     - name: Build the container image
       if: inputs.container == 'true'
       shell: bash
-      # Same payload as the zip layer, different ceiling: the image is the delivery
-      # path for the runtimes a layer cannot carry, and on the Iron Bank UBI9 base
-      # it is the artifact a DoD ATO accepts.
+      # Same payload the staging step produced, different ceiling: the image is
+      # the only artifact, on the Iron Bank UBI9 base, and it is what a DoD ATO
+      # accepts. BuildKit cache comes from the `gha` backend, scoped so the shared
+      # UBI9 layer is reused across every runtime on an architecture.
       env:
         LAMBDA_RUNTIME_SUMMARY_DEFERRED: "1"
+        CONTAINER_BUILD_CACHE: gha
       run: |
-        env_text=$(python3 tools/runtime_lib/runtime_manifest.py env \
-          --runtime "${{ inputs.runtime }}" --arch "${{ inputs.arch }}")
-        cache_ref=$(grep '^CONTAINER_CACHE_REF=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
-        cache_args=(--cache-from "${cache_ref}")
-        if [[ "${GITHUB_REF}" == "refs/heads/${{ github.event.repository.default_branch }}" ]]; then
-          cache_args+=(--cache-to "${cache_ref},mode=max,image-manifest=true")
-        fi
-        timeout 900 bash tools/bin/build-container \
-          "${{ inputs.runtime }}" "${{ inputs.arch }}" "${cache_args[@]}"
+        timeout 900 bash tools/bin/build-container "${{ inputs.runtime }}" "${{ inputs.arch }}"
 
 
     - name: Smoke-test the container image
@@ -116,8 +96,8 @@ runs:
       run: bash tools/bin/generate-compliance-artifacts "${{ inputs.runtime }}" "${{ inputs.arch }}"
 
     - name: Record the package size
-      # Always: the summary states this cell's share of the 250 MB deployment
-      # budget even when the package cache skipped the build.
+      # Always: the summary states this cell's payload size and headroom against
+      # the deployment ceiling, including when the image build failed.
       if: always()
       shell: bash
       run: >-

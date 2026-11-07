@@ -49,7 +49,7 @@ jobs:
       - id: matrix
         uses: ./.github/actions/runtime-matrix
         with:
-          # The full 24-cell matrix is for a push to main, a workflow_dispatch, or
+          # The full matrix is for a push to main, a workflow_dispatch, or
           # a PR that left draft and carries `ready-to-merge`. A draft or
           # unlabelled PR runs only the runtimes whose files changed (one canary
           # cell when the change is tooling-only), so a WIP commit cannot occupy
@@ -108,8 +108,7 @@ jobs:
       # entry can never be re-saved and the update would be discarded.
       - uses: ./.github/actions/runtime-build-env
         with:
-          # This job exists to refresh the database, so it always prepares it.
-          grype: always
+          # This job exists to refresh the database.
           db-refresh: "true"
 
   runtime-checks:
@@ -120,12 +119,11 @@ jobs:
       - grype-db
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
-    # The buildx registry cache lives in GHCR, so a cell reads it on every run
-    # and writes it on main. Job-level permissions replace the workflow map, so
-    # `contents: read` has to be repeated here.
+    # The `gha` build cache needs no registry permission and the cell pushes
+    # nothing, so `contents: read` is the whole grant. Job-level permissions
+    # replace the workflow map, so it has to be repeated here.
     permissions:
       contents: read
-      packages: write
     strategy:
       fail-fast: false
       matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
@@ -148,18 +146,8 @@ jobs:
         with:
           runtime: ${{ matrix.runtime }}
           arch: ${{ matrix.arch }}
-          grype: when-changed
           # Cells only read the week's database; the grype-db job writes it.
           db-refresh: "false"
-      - name: Log in to GHCR
-        # The buildx cache ref is a private GHCR package. Without credentials
-        # buildx asks GHCR for an anonymous token and gets 403, which fails the
-        # cell on main — the only ref that writes the cache.
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Log in to Iron Bank Registry
         if: ${{ env.IRONBANK_TOKEN != '' }}
         uses: docker/login-action@v3
@@ -174,19 +162,6 @@ jobs:
         with:
           runtime: ${{ matrix.runtime }}
           arch: ${{ matrix.arch }}
-          # Skipped when the package cache hit: the pinned archive, our bootstrap and
-          # helpers and the build script are all unchanged, so rebuilding only repeats
-          # the same extraction and zip (up to ~80s for rust). The restored zip still
-          # feeds the SAM example and the artifact upload.
-          skip-build: ${{ steps.build-env.outputs.package-cache-hit == 'true' }}
-          # Skipped when this cell's archive was already cached: the findings come
-          # only from the pinned upstream payload, so an unchanged archive can only
-          # report CVE-database drift that no commit caused. That drift is caught by
-          # the weekly audit-runtimes workflow instead of blocking unrelated PRs.
-          audit: ${{ steps.build-env.outputs.audit }}
-          # CI exercises both artifacts: the zip layer and the Iron Bank UBI9 image,
-          # including a scan of the image and a rootless, read-only smoke test. A
-          # container regression cannot reach a release unseen.
           container: "true"
       - name: Upload the compliance bundle
         # Auditors download this without a registry client: SBOMs, CVE report and

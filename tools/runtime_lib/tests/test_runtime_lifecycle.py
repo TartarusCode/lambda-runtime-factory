@@ -384,23 +384,26 @@ def _build_env_call_sites() -> dict[tuple[str, str], dict]:
     return sites
 
 
-def test_build_env_defaults_to_the_cheap_path() -> None:
-    """The optimization must not be opt-in via a default that pays 2.8GB."""
+def test_build_env_installs_the_scan_tooling_in_every_cell() -> None:
+    """The image scan is part of the bundle, so there is no cached-payload path
+    that skips Grype: an artifact with no SBOM is not a publishable artifact."""
     action = yaml.safe_load(
         (_REPO_ROOT / ".github/actions/runtime-build-env/action.yml").read_text(encoding="utf-8")
     )
 
-    assert action["inputs"]["grype"]["default"] == "when-changed"
+    assert "grype" not in action["inputs"], "there is nothing to switch off"
+    install = next(
+        step for step in action["runs"]["steps"] if step.get("name") == "Install Grype"
+    )
+    assert "if" not in install, "Grype is installed unconditionally"
 
 
-def test_every_build_env_call_site_declares_grype_explicitly() -> None:
+def test_every_build_env_call_site_leaves_the_scan_enabled() -> None:
     sites = _build_env_call_sites()
 
     assert sites, "no workflow uses the build-env action"
     for site, inputs in sites.items():
-        assert inputs.get("grype") in {"always", "when-changed"}, (
-            f"{site[0]}:{site[1]} must pass `grype:` explicitly"
-        )
+        assert "grype" not in inputs, f"{site[0]}:{site[1]} must not gate the scan"
 
 
 
@@ -474,11 +477,13 @@ def test_the_matrix_action_excludes_deprecated_runtimes_by_default() -> None:
     assert action["outputs"]["matrix"]["value"] == "${{ steps.matrix.outputs.matrix }}"
 
 
-def test_ci_matrix_audit_step_is_gated_on_the_decision() -> None:
-    """The gate and the action output must stay wired to each other."""
+def test_ci_matrix_gates_the_compliance_step_on_the_container_flag() -> None:
+    """Nothing selects the scan separately any more: a cell that builds the image
+    always generates its bundle, which is what makes the artifact reviewable."""
     call = _call_site("ci.yml", "runtime-checks", _BUILD_ACTION)
 
-    assert call["audit"] == "${{ steps.build-env.outputs.audit }}"
+    assert call["container"] == "true"
+    assert "audit" not in call, "the scan has no separate switch"
     assert _named_step("build-and-audit-runtime", "Generate the compliance bundle")["if"] == (
         "inputs.container == 'true'"
     )
@@ -486,11 +491,11 @@ def test_ci_matrix_audit_step_is_gated_on_the_decision() -> None:
 
 
 
-def test_the_scheduled_audit_needs_no_separate_build_step() -> None:
+def test_the_scheduled_audit_runs_the_same_sequence_as_a_pr() -> None:
     call = _call_site("audit-runtimes.yml", "audit", _BUILD_ACTION)
 
-    assert call["audit"] == "true"
-    assert call["skip-build"] == "true", "audit-runtime builds the layer on demand"
+    assert call["container"] == "true", "the image and its bundle are the output"
+    assert "skip-build" not in call, "the payload is staged before the image builds"
 
 
 # --- Grype database cache contract --------------------------------------------
@@ -566,7 +571,7 @@ def test_the_database_refresh_runs_the_binary_not_a_quoted_command() -> None:
 def test_only_the_default_branch_writes_the_shared_database_entry() -> None:
     """A cache entry is only readable outside its own ref when it was created on
     the default branch. A PR run that saves one writes ~458MB that nothing else
-    can restore, and evicts the package cache under the 10GB budget."""
+    can restore, and evicts the download and tool caches under the 10GB budget."""
     default_branch = "github.ref == format('refs/heads/{0}', github.event.repository.default_branch)"
 
     for name in ("Update vulnerability database", "Save vulnerability database"):
@@ -608,41 +613,42 @@ def test_no_workflow_refreshes_the_database_outside_the_action() -> None:
         )
 
 
-# --- Built-package cache contract ---------------------------------------------
+# --- Cache contract ------------------------------------------------------------
 #
-# The package cache may only ever hold the package this build would produce, so its
-# key covers every build input and it must not fall back to a prefix match: a stale
-# package restored from another revision would ship without a rebuild.
+# Every cell runs the build, so nothing caches the built payload: a restored
+# artifacts/ directory would be overwritten at best and leave a stale file behind
+# at worst, now that no cache-hit signal reaches the build step. What stays cached
+# is the expensive, input-independent part — the upstream downloads and the scan
+# tooling — plus the Buildx layer cache in the build action.
 
-_PACKAGE_INPUTS = (
-    "runtime.json",
-    "checksums/**",
-    "bootstrap/**",
-    "helpers/**",
-    "tools/bin/build-runtime",
-    # Sourced by build-runtime; a change here that alters the layer layout would
-    # otherwise reuse a package built by the old helpers.
-    "tools/bin/_common.sh",
-    # Compiled into the Go/Rust bootstrap; a change here changes package bytes.
-    "tools/launcher/**",
-    "tools/runtime_lib/runtime_manifest.py",
+_DOWNLOAD_INPUTS = (
+    # A version bump rewrites both, so a key without them would serve the previous
+    # release's tarball to a build pinned to the new one.
+    "runtimes/{0}/runtime.json",
+    "runtimes/{0}/checksums/**",
 )
 
+_BUILT_ARTIFACT_CACHE = "Cache built runtime package"
 
-def test_the_package_cache_is_keyed_on_every_build_input() -> None:
-    step = _action_step("Cache built runtime package")
-    key = step["with"]["key"]
+
+def test_nothing_caches_the_built_payload() -> None:
+    step = _action_step("Cache runtime downloads")
 
     assert step["uses"] == "actions/cache@v6"
-    assert step["with"]["path"].endswith("/artifacts"), step["with"]["path"]
-    for build_input in _PACKAGE_INPUTS:
-        assert build_input in key, f"the package cache key must cover {build_input}"
+    assert step["with"]["path"] == "${{ env.DOWNLOAD_CACHE_DIR }}"
+    for source in _DOWNLOAD_INPUTS:
+        assert source in step["with"]["key"], f"the download key must cover {source}"
     assert step["with"].get("restore-keys") is None, (
-        "a package built from other inputs must never be restored"
+        "a tarball fetched for another pin must never be reused"
     )
 
-    assert _build_env_action()["outputs"]["package-cache-hit"]["value"] == (
-        "${{ steps.package.outputs.cache-hit }}"
+    action = _build_env_action()
+    assert "outputs" not in action, "no cache-hit signal is published"
+    assert all(s.get("name") != _BUILT_ARTIFACT_CACHE for s in action["runs"]["steps"]), (
+        "the built payload is produced fresh in every cell"
+    )
+    assert "artifacts" not in yaml.safe_dump(action["runs"]["steps"]), (
+        "no cache step may restore the built payload"
     )
 
 
@@ -650,12 +656,20 @@ def test_the_package_cache_is_keyed_on_every_build_input() -> None:
 
 
 
-def test_the_ci_build_is_skipped_when_the_package_is_cached() -> None:
+def test_the_build_sequence_is_uniform_across_every_call_site() -> None:
+    """`build-runtime` always runs first: `build-container` consumes the staged
+    payload and stages it itself when absent, so a "skip the build" switch would
+    only move that work one step later while pretending the cell was cheaper."""
+    action = yaml.safe_load(
+        (_REPO_ROOT / ".github/actions/build-and-audit-runtime/action.yml").read_text(encoding="utf-8")
+    )
+    assert "skip-build" not in action["inputs"]
+
     call = _call_site("ci.yml", "runtime-checks", _BUILD_ACTION)
+    assert "skip-build" not in call
 
-    assert call["skip-build"] == "${{ steps.build-env.outputs.package-cache-hit == 'true' }}"
     build = _named_step("build-and-audit-runtime", "Build runtime package")
-    assert build["if"] == "inputs.skip-build != 'true'"
+    assert "if" not in build, "no cell skips the build step"
     assert build["run"].startswith("timeout "), (
         "a throttled upstream download must fail fast, and a composite step cannot "
         "carry timeout-minutes, so the command bounds itself"
@@ -733,7 +747,7 @@ def test_the_release_validates_the_tag_before_publishing_anything() -> None:
 
 
 def test_the_release_requires_the_credential_preflight() -> None:
-    """A role that cannot be assumed must fail once, not in all 24 cells: the
+    """A role that cannot be assumed must fail once, not in every cell: the
     credentials action retries for ~51s per cell before it gives up."""
     doc = _workflow("release-runtime.yml")
     preflight = doc["jobs"]["preflight"]
@@ -960,7 +974,7 @@ def test_display_names_follow_the_family_and_line_convention() -> None:
 #
 # Regions and the S3 bucket base name live in REPO_DEFAULTS. A runtime manifest is merged
 # last, so a per-runtime copy of either one silently wins over the global value — which is
-# exactly what happened: all twelve manifests carried their own region list.
+# exactly what happened: every manifest carried its own region list.
 
 
 def test_deployment_regions_are_a_repo_level_setting() -> None:
@@ -1207,7 +1221,7 @@ def test_a_container_can_pass_the_handler_as_cmd() -> None:
     """Lambda runs a container image as ENTRYPOINT + CMD, so the handler reaches
     the runtime as an argument when `_HANDLER` is not set. Supporting both is what
     makes `CMD ["app.handler"]` work in a function image."""
-    for runtime_id in ("pypy311", "pypy312", "graalpy312", "graalpy313"):
+    for runtime_id in ("pypy311", "pypy312", "graalpy313"):
         bootstrap = (
             _REPO_ROOT / "runtimes" / runtime_id / "bootstrap" / "bootstrap.py3"
         ).read_text(encoding="utf-8")
@@ -1537,22 +1551,22 @@ def test_no_second_container_base_survives_anywhere() -> None:
     for forbidden in ("distroless", "gcr.io", "debian:", "alpine:"):
         assert forbidden not in family_defaults, forbidden
 
-    package = runtime_manifest.load_runtime("graalpy312")["container"]
+    package = runtime_manifest.load_runtime("graalpy313")["container"]
     assert "gcr.io" not in package["base_image"]
 
 
 def test_the_container_coordinates_travel_to_the_builder() -> None:
-    env = runtime_manifest.runtime_env("graalpy312", arch="arm64")
+    env = runtime_manifest.runtime_env("graalpy313", arch="arm64")
 
     assert env["CONTAINER_PLATFORM"] == "linux/arm64"
     assert env["CONTAINER_ARCH"] == "arm64"
     assert env["CONTAINER_WORKDIR"] == "/var/task"
     assert json.loads(env["CONTAINER_ENTRYPOINT"]) == ["/opt/bootstrap"]
-    assert env["CONTAINER_IMAGE"].endswith("/graalpy312")
-    assert env["CONTAINER_TAG"] == "25.2.4"
-    assert env["VERSION_LINE"] == "3.12"
+    assert env["CONTAINER_IMAGE"].endswith("/graalpy313")
+    assert env["CONTAINER_TAG"] == "25.5.5"
+    assert env["VERSION_LINE"] == "3.13"
     assert env["CONTAINER_CACHE_REF"] == (
-        "ghcr.io/tartaruscode/lambda-runtime-factory/graalpy312:buildcache-arm64"
+        "ghcr.io/tartaruscode/lambda-runtime-factory/graalpy313:buildcache-arm64"
     )
     # No variant coordinates exist any more: one image per runtime.
     for gone in ("CONTAINER_VARIANT", "CONTAINER_TAG_SUFFIX", "CONTAINER_PROFILE"):
@@ -1588,7 +1602,7 @@ def test_the_toolchain_families_prove_themselves_without_a_handler() -> None:
     assert rust["expect_exit"] == 127
     assert "_HANDLER" in rust["expect_output"]
 
-    for runtime_id in ("pypy311", "bun13", "deno29", "graalpy312"):
+    for runtime_id in ("pypy311", "bun13", "deno29"):
         assert runtime_manifest.load_runtime(runtime_id)["container"]["smoke_test"] == {}
 
 
@@ -1631,21 +1645,21 @@ def test_check_container_verifies_the_built_image() -> None:
 
 
 def test_build_container_has_one_base_path_and_no_variant_flags() -> None:
+    """There is one base and one artifact, so nothing selects a variant."""
     script = (_REPO_ROOT / "tools" / "bin" / "build-container").read_text(encoding="utf-8")
 
     assert "--variant" not in script and "--debug" not in script
-    # The flag is gone with the second base: there is nothing to select.
     assert "--ironbank" not in script
     assert "USE_FALLBACK_UBI" in script
     assert "IRONBANK_TOKEN" in script, "a CI build without the token must fall back"
     assert "BASE_IMAGE_DIGEST" in script
     assert "--cache-from" in script and "--cache-to" in script
-    assert "type=registry,ref=" in script
+    assert "type=gha" in script, "the cache backend needs no registry credentials"
     # No payload is re-derived in the image build: build-runtime owns it.
     assert "curl " not in script
     assert "sha256sum" not in script
-    for gone in ("prepare-ironbank", "distroless", "LIB_PACKAGES", "STAGED_SONAMES"):
-        assert gone not in script, gone
+    for unsupported in ("prepare-ironbank", "distroless", "LIB_PACKAGES", "STAGED_SONAMES"):
+        assert unsupported not in script, unsupported
 
 
 def test_ci_builds_scans_and_smoke_tests_the_container_image() -> None:
@@ -1668,41 +1682,31 @@ def test_ci_builds_scans_and_smoke_tests_the_container_image() -> None:
     assert "container-variants" not in _workflow_text("ci.yml")
 
 
-def test_buildx_registry_caching_is_wired_end_to_end() -> None:
+def test_buildx_caching_is_wired_end_to_end() -> None:
     action = _action("build-and-audit-runtime")
     steps = {step.get("name"): step for step in action["runs"]["steps"]}
 
     setup = steps["Set up Docker Buildx"]
     assert setup["uses"] == "docker/setup-buildx-action@v3"
+    # The `gha` cache backend only exists for the container driver.
     assert setup["with"]["driver"] == "docker-container"
 
-    build = steps["Build the container image"]["run"]
-    assert "--cache-from" in build
-    # Only the default branch writes the cache: a PR's cache lands on a ref nothing
-    # else can read.
-    assert "refs/heads/${{ github.event.repository.default_branch }}" in build
-    assert "--cache-to" in build and "mode=max" in build
+    # The script owns the cache arguments now, because it is the only place that
+    # knows the arch and the runtime id the scopes are built from.
+    build = steps["Build the container image"]
+    assert build["env"]["CONTAINER_BUILD_CACHE"] == "gha"
+    assert "cache-from" not in build["run"] and "cache-to" not in build["run"]
 
 
-def test_every_workflow_that_uses_the_registry_cache_logs_into_ghcr() -> None:
-    """The cache ref is a private GHCR package, so an unauthenticated buildx asks
-    GHCR for an anonymous token and gets 403. The import failure is tolerated but
-    the export is fatal, which is how a green PR turns into a red main."""
+def test_ci_does_not_need_registry_credentials() -> None:
+    """The build cache is the Actions cache service (`type=gha`), and a CI cell
+    pushes nothing, so a GHCR login there would be a credential grant with no
+    consumer. The release still logs in, because it is the thing that pushes."""
     for workflow, job in (("ci.yml", "runtime-checks"), ("audit-runtimes.yml", "audit")):
         document = _workflow(workflow)["jobs"][job]
-        steps = {step.get("name"): step for step in document["steps"]}
-
-        login = steps["Log in to GHCR"]
-        assert login["with"]["registry"] == "ghcr.io", workflow
-        assert login["with"]["password"] == "${{ secrets.GITHUB_TOKEN }}", workflow
-        # Job-level permissions replace the workflow map, so the scope has to be
-        # granted on the job that logs in.
-        assert document["permissions"]["packages"] == "write", workflow
-        assert document["permissions"]["contents"] == "read", workflow
-
-        # The credentials have to be in place before the build exports the cache.
         names = [step.get("name") for step in document["steps"]]
-        assert names.index("Log in to GHCR") < names.index("Build and audit runtime package"), workflow
+        assert "Log in to GHCR" not in names, workflow
+        assert document["permissions"].get("packages") != "write", workflow
 
 
 def test_the_release_builds_scans_and_pushes_one_image_per_runtime() -> None:

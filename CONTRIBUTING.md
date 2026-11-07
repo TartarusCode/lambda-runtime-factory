@@ -59,7 +59,7 @@ python3 tools/runtime_lib/runtime_manifest.py env --runtime pypy311 --arch x86_6
 ```
 
 The manifest list is the single source of truth for the CI and release matrices — both call
-`runtime_manifest.py matrix` through the same composite action, and both run all 12 runtimes. There
+`runtime_manifest.py matrix` through the same composite action, and both run every runtime. There
 is no per-runtime opt-out: one artifact per runtime means nothing to narrow.
 
 There is no byte budget any more. The 250 MB unzipped ceiling applied to Lambda layers, and the
@@ -268,7 +268,7 @@ per architecture (the original layers are referenced, not re-uploaded).
 
 ```dockerfile
 # A runtime image is a Lambda container image: entrypoint = runtime, CMD = handler.
-FROM ghcr.io/tartaruscode/lambda-runtime-factory/graalpy312:3.12
+FROM ghcr.io/tartaruscode/lambda-runtime-factory/graalpy313:3.13
 COPY app.py ${LAMBDA_TASK_ROOT}/
 CMD ["app.handler"]
 ```
@@ -313,7 +313,7 @@ does not occupy all 24 runners:
   `git diff --name-only origin/<base>...HEAD`), or a single `pypy311` canary cell when nothing
   under `runtimes/` changed at all.
 - **Full tier** — a push to `main`, a `workflow_dispatch`, or a PR that left draft and carries
-  `ready-to-merge` runs the full 24-cell matrix.
+  `ready-to-merge` runs the full matrix.
 
 Between the two:
 
