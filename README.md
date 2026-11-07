@@ -6,7 +6,8 @@ runtime is an independent package under `runtimes/`.
 
 ## What gets published
 
-Every runtime is built and scanned, then ships as **two artifacts from the same payload**:
+Every runtime is built and scanned, then ships as **two images and, where it fits, a layer — all
+from the same payload**:
 
 |  | Lambda layer | Container image |
 | --- | --- | --- |
@@ -22,6 +23,11 @@ Every runtime is built and scanned, then ships as **two artifacts from the same 
   they publish as images. See [DELIVERY.md](DELIVERY.md).
 - **`-debug` tags** — same payload and entrypoint on a base with a busybox shell, for looking at
   an image that failed to start. The production tags never contain a shell.
+- **`-ironbank` tags** — the same payload on the DoD-hardened
+  `registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal` base: non-root `USER 1001:1001`, a DoD root
+  CA trust store fed from `certs/*.crt`, no package manager, and a read-only rootfs with `/tmp` as
+  the only writable path. Every runtime has one; the distroless tags stay as they were, so a
+  consumer picks the base their ATO accepts. See [DELIVERY.md](DELIVERY.md).
 - **`-soci` tags** — the same image with a SOCI index bundled in, for functions on **Lambda
   Managed Instances**, which then lazy-load it instead of downloading the whole thing. There is no
   moving `-soci` tag: that image is immutable by design.
@@ -74,6 +80,25 @@ The image is distroless, so anything installed with `RUN` has to happen in a bui
 see [examples/docker](examples/docker) for recipes covering pure-Python dependencies, a Bun
 bundle and the Go toolchain.
 
+### The Iron Bank base
+
+The same runtime is also published on the DoD-hardened UBI9 base. Swap the tag; nothing else
+changes — the payload, the entrypoint and the handler contract are identical:
+
+```dockerfile
+FROM ghcr.io/tartaruscode/lambda-runtime-factory/pypy311:3.11-ironbank
+
+COPY app.py ${LAMBDA_TASK_ROOT}/
+CMD ["app.handler"]
+```
+
+That image runs as `USER 1001:1001`, carries no package manager, injects any `certs/*.crt` root CA
+into `/etc/pki/ca-trust/extracted` (and points `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `DENO_CERT`
+and `NODE_EXTRA_CA_CERTS` at the resulting bundle), and expects `/` to be read-only with `/tmp`
+the only writable path. Build it locally with `make container-ironbank RUNTIME=pypy311` (add
+`USE_FALLBACK_UBI=1` when you have no registry1.dso.mil credentials) and smoke-test it with
+`make container-ironbank-invoke`.
+
 When an image fails to start, use the debug tag: the same payload and entrypoint with a
 busybox shell, so you can look at the real container instead of guessing.
 
@@ -125,6 +150,8 @@ the ids the current matrix builds.
 runtimes/<runtime-id>/   runtime.json, bootstrap/, helpers/, checksums/, examples/
 tools/bin/               build, audit, upload, publish, local-test entrypoints
 tools/runtime_lib/       family defaults, manifest resolution, bump tooling, tests
+tools/docker/            Dockerfile.ironbank — the canonical Iron Bank stage layout
+certs/                   extra root CAs baked into the Iron Bank images (*.crt)
 .github/workflows/       CI, release, audit and weekly version-bump pipelines
 .github/actions/         shared composite actions: matrix, build environment, build + audit
 ```

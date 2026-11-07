@@ -443,6 +443,17 @@ if [[ "${BUILD_BEST_EFFORT_AUDIT:-1}" == "1" ]]; then
     RUNTIME_BUILD_IN_PROGRESS=1 bash "$(common::repo_root)/tools/bin/audit-runtime" --best-effort "${runtime_id}"
 fi
 
+# --- STIG rootless permissions --------------------------------------------------
+#
+# Lambda mounts a layer read-only and runs the function under an arbitrary
+# non-root UID. Upstream archives carry whatever mode their packager used, and a
+# file that is not world-readable (or a directory that is not world-traversable)
+# is a permission-denied at first import — under a UID the build never saw.
+# `a+rX` adds read for everyone and execute only where a directory (or a file
+# that already had any execute bit) needs it, so no binary loses its mode.
+chmod -R a+rX "${LAYER_ROOT}"
+chmod a+rx "${LAYER_ROOT}/${BOOTSTRAP_OUTPUT}"
+
 (
     cd "${LAYER_ROOT}"
     # Deterministic package. The SHA-256 of this zip is both the S3 object key and

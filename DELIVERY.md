@@ -30,7 +30,8 @@ The factory now produces both, from the same `${LAYER_ROOT}` payload:
 | Artifact | Ceiling | Covers |
 | --- | --- | --- |
 | Lambda zip layer | 250 MB unzipped, **shared with the function's code** | Runtimes that fit with usable headroom |
-| OCI image | 10 GB uncompressed | **Every** runtime, including the toolchains |
+| OCI image (distroless) | 10 GB uncompressed | **Every** runtime, including the toolchains |
+| OCI image (Iron Bank) | 10 GB uncompressed | **Every** runtime, for a DoD ATO that requires UBI9 |
 
 The image is the permanent answer for the toolchains: `go126`, `go127`, `rust194`, `rust198` and
 `rust199` publish as multi-arch images (`ghcr.io/tartaruscode/lambda-runtime-factory/<id>`) and
@@ -49,6 +50,58 @@ An image is one of two shapes, and the manifest's `container.profile` picks whic
   cannot run `rustc` at all. The image installs `libgcc`, `gcc` and `musl-dev`, links musl's
   `libc.so` and rustc's sysroot into place, and its smoke test runs the toolchain
   (`go version`, `rustc --version`) rather than invoking a handler it does not have.
+
+## The Iron Bank artifact
+
+Every runtime builds a **second** image from the same payload on
+`registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal`. It is not a replacement for the distroless
+image — distroless is the smallest CVE surface and Iron Bank is the base a DoD ATO accepts — so a
+consumer picks, and both are published under their own tags:
+
+```
+ghcr.io/tartaruscode/lambda-runtime-factory/<id>:<version>            # distroless
+ghcr.io/tartaruscode/lambda-runtime-factory/<id>:<version>-debug      # distroless + busybox
+ghcr.io/tartaruscode/lambda-runtime-factory/<id>:<version>-ironbank   # UBI9, hardened
+```
+
+The stage layout lives in **one** canonical template, `tools/docker/Dockerfile.ironbank`, which
+`tools/runtime_lib/container_image.py` renders per runtime. Keeping it in a file (rather than in
+Python string concatenation) is what makes the STIG invariants reviewable:
+
+- **Stage 1 (`builder`)** copies `certs/*.crt` into `/etc/pki/ca-trust/source/anchors/` and runs
+  `update-ca-trust extract`, so an injected DoD root CA is trusted by OpenSSL, Python, Node and
+  Deno through the single bundle the final stage points every TLS stack at
+  (`SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `DENO_CERT`, `NODE_EXTRA_CA_CERTS`).
+- **Stage 2 (`runtime`)** copies the extracted trust store, copies the payload to `/opt` (owned by
+  the runtime UID), normalizes permissions (`chmod -R a+rX /opt`), installs any missing runtime
+  library **with `microdnf`**, then removes the package manager again. It runs as `USER 1001:1001`
+  with `WORKDIR /var/task` and `ENTRYPOINT ["/opt/bootstrap"]`.
+
+Two details are deliberate:
+
+- **Libraries are installed, never cherry-picked.** The build derives a package list from the
+  payload's `DT_NEEDED` scan (`container_image.required_ubi_packages`) and installs it with
+  `microdnf install -y --nodocs --setopt=install_weak_deps=0`. Copying resolved `.so` files by
+  hand would leave `/var/lib/rpm` without the owning package — Grype then cannot match a RHEL
+  backport and reports false positives against a payload that is actually patched — and
+  `/etc/ld.so.cache` stale. `rpm` itself stays in the image for exactly that reason.
+- **The base falls back when credentials are absent.** `registry1.dso.mil` needs a login, so a
+  build without `IRONBANK_TOKEN` (an external PR, a fork, a local run) uses
+  `registry.access.redhat.com/ubi9/ubi-minimal`, which serves the same UBI9-minimal userland. The
+  release logs in and builds from the primary; `BASE_IMAGE_DIGEST` pins the base when Iron Bank's
+  daily rebuild would otherwise move it under a reproducible build.
+
+`tools/bin/local-invoke-container` proves the contract rather than asserting it: the smoke test
+runs the image with `--read-only`, a `--tmpfs /tmp:rw,exec,size=512m,uid=1001,gid=1001` — the only
+writable path — and `--user 1001:1001`, with `aws-lambda-rie` bind-mounted read-only from the host
+cache. The emulator is never baked into the published image.
+
+Measured locally (x86_64, unpacked bytes from the exported rootfs, `USE_FALLBACK_UBI=1`):
+`graalpy312` — distroless 284,530,181 B, Iron Bank 359,244,382 B; both answer an RIE invocation
+with HTTP 200 under UID 1001 on a read-only rootfs. The Iron Bank image carries no package manager
+(`microdnf`/`dnf` removed, `rpm` and `/var/lib/rpm` kept) and its `/opt/bootstrap` is owned by
+1001:1001.
+
 
 Measured on the built images (x86_64, unpacked bytes summed from the exported rootfs): `go126`
 251,136,536 B, `rust198` 1,521,518,187 B, `bun13` 116,422,312 B, `pypy311` 113,869,671 B.
@@ -111,8 +164,17 @@ Measured on the built artifacts (`build-stats.json`, sum of zip entry sizes):
 | --- | --- | --- | --- | --- |
 | `pypy311` | x86_64 | 90,278,281 | 34.4% | yes |
 | `go126` | x86_64 | 176,269,276 | 67.2% | no — toolchain image |
-| `graalpy312` | x86_64 | 256,802,903 | 98.0% | yes |
+| `graalpy313` | x86_64 | 250,195,312 | 95.4% | yes |
+| `graalpy312` | x86_64 | 256,817,392 | 98.0% | yes |
 | `graalpy312` | arm64 | 259,170,629 | 98.9% | yes |
+
+Every build writes `${ARTIFACT_DIR}/build-stats.json` with the exact byte budget
+(`zipped_bytes`, `unzipped_bytes`, `max_unzipped_bytes`, `warn_unzipped_bytes`, `headroom_bytes`,
+`percent_of_quota`, `layer_publishable`, `level`) and the job summary prints it as a row whose
+`Targets` column names the artifacts the cell delivers (`Layer + Iron Bank Container` or
+`Iron Bank Container Only`). Before zipping, the payload's permissions are normalized
+(`chmod -R a+rX "${LAYER_ROOT}"`), so a file upstream happened to ship mode 0600 cannot be a
+permission-denied under the arbitrary non-root UID Lambda runs the function with.
 
 Slimming prunes stdlib test suites, GUI toolkits (`tkinter`, `turtledemo`, and the compiled
 `_tkinter` module that pulled in X11/fontconfig/freetype), `ensurepip`, `idlelib`, `lib2to3`,
@@ -127,16 +189,18 @@ Go toolchain compiles the standard library from source, so a name-based prune at
 deletes code that `go build` needs. Those directories are pruned at the payload root only;
 `testdata`, which is never an importable package, is the one name pruned at any depth.
 
-### GraalPy 3.12: published, with a narrow margin
+### GraalPy 3.12 and 3.13: published, with a narrow margin
 
 GraalPy is dominated by one file: `graalpy/lib/libpythonvm.so`, a GraalVM native image that is
-~225 MB after stripping. Everything else in the distribution — the Python stdlib, the launcher
-binaries, the native modules — adds ~32 MB. That puts a floor around 225 MB, so the 180–205 MB
-range is not reachable for this distribution by pruning: there is nothing else of that size to
-remove. The real numbers are 256.8 MB (x86_64) and 259.2 MB (arm64), both under the ceiling but
-leaving only **3–5 MB** for the function's own code. The layer publishes; a function that
-attaches it must stay small, and the build emits the over-200 MB warning so the margin is
-visible in every release summary.
+~225 MB **after stripping** (`file` reports it as already stripped, and `strip --strip-unneeded`
+finds nothing to remove). Everything else in the distribution — the Python stdlib, the launcher
+binaries, the native modules — adds ~30 MB. That puts a hard floor around 225 MB, so a sub-210 MB
+layer is not reachable for this distribution by pruning: there is nothing else of that size to
+remove, and the only remaining lever would be deleting the VM itself. The real numbers are
+256.8 MB (`graalpy312` x86_64), 250.2 MB (`graalpy313` x86_64) and 259.2 MB
+(`graalpy312` arm64), all under the ceiling but leaving **3–11 MB** for the function's own code.
+Both layers publish; a function that attaches one must stay small, and the build emits the
+over-200 MB warning so the margin is visible in every release summary.
 
 ### Go and Rust: layers are the wrong shape, not just too big
 

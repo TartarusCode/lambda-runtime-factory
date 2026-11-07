@@ -99,6 +99,9 @@ def budget(
         "warn_unzipped_bytes": warn_unzipped_bytes,
         "layer_publishable": bool(publishable),
         "percent_of_quota": percent_of_quota,
+        # Exact bytes, not just the rounded MB: the gate is a byte comparison and
+        # a consumer of build-stats.json should not have to re-derive it.
+        "headroom_bytes": max_unzipped_bytes - unzipped,
         "headroom_mb": round(headroom_mb, 1),
         "level": level,
         "message": message,
@@ -109,6 +112,18 @@ def budget(
     }
 
 
+def targets(stats: Dict[str, Any]) -> str:
+    """The artifacts this cell delivers, in the words the plan uses.
+
+    A layer-publishable runtime ships both a zip layer and an Iron Bank image; a
+    toolchain ships the image only, because its payload can never fit the 250 MB
+    deployment-package ceiling.
+    """
+    if stats.get("layer_publishable"):
+        return "Layer + Iron Bank Container"
+    return "Iron Bank Container Only"
+
+
 def summary_row(stats: Dict[str, Any]) -> str:
     """Return the Markdown row used in the job summary."""
     container_bytes = stats.get("container_image_bytes")
@@ -117,13 +132,14 @@ def summary_row(stats: Dict[str, Any]) -> str:
     )
     return (
         "| Runtime | Arch | Zipped (MB) | Unzipped (Bytes / MB) | % of 250 MB Quota | "
-        "Function Headroom (MB) | Layer Publishable | Container Image (MB) |\n"
-        "| --- | --- | --- | --- | --- | --- | --- | --- |\n"
+        "Function Headroom (MB) | Layer Publishable | Container Image (MB) | Targets |\n"
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
         f"| `{stats['runtime_id']}` | `{stats['arch']}` | "
         f"{stats['zipped_bytes'] / BYTES_PER_MB:.1f} | "
         f"{stats['unzipped_bytes']} / {stats['unzipped_bytes'] / BYTES_PER_MB:.1f} | "
         f"{stats['percent_of_quota']:.1f}% | {stats['headroom_mb']:.1f} | "
-        f"{'yes' if stats['layer_publishable'] else 'no'} | {container_mb} |\n\n"
+        f"{'yes' if stats['layer_publishable'] else 'no'} | {container_mb} | "
+        f"{targets(stats)} |\n\n"
     )
 
 
@@ -194,7 +210,10 @@ def main() -> None:
                     "unzipped_bytes": verdict["unzipped_bytes"],
                     "max_unzipped_bytes": verdict["max_unzipped_bytes"],
                     "warn_unzipped_bytes": verdict["warn_unzipped_bytes"],
+                    "headroom_bytes": verdict["headroom_bytes"],
+                    "percent_of_quota": verdict["percent_of_quota"],
                     "layer_publishable": verdict["layer_publishable"],
+                    "level": verdict["level"],
                 },
                 indent=2,
                 sort_keys=True,

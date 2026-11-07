@@ -17,11 +17,13 @@ set -euo pipefail
 source "$(dirname "$0")/_common.sh"
 
 variant=standard
+ironbank=0
 positional=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --variant) variant=$2; shift 2 ;;
         --debug) variant=debug; shift ;;
+        --ironbank) ironbank=1; shift ;;
         -*) echo "Unknown option: $1" >&2; exit 2 ;;
         *) positional+=("$1"); shift ;;
     esac
@@ -36,8 +38,19 @@ if [[ "${CONTAINER_ENABLED}" != "true" ]]; then
     exit 1
 fi
 
-if ! docker image inspect "${CONTAINER_LOCAL_IMAGE}" >/dev/null 2>&1; then
-    bash "$(common::repo_root)/tools/bin/build-container" "${runtime_id}" "${arch}"
+# The Iron Bank image is a second artifact: same payload, different base. It is
+# smoke-tested the same way, under the STIG UID both images are run with.
+local_image="${CONTAINER_LOCAL_IMAGE}"
+if (( ironbank )); then
+    local_image="${CONTAINER_IRONBANK_LOCAL_IMAGE}"
+fi
+
+if ! docker image inspect "${local_image}" >/dev/null 2>&1; then
+    if (( ironbank )); then
+        bash "$(common::repo_root)/tools/bin/build-container" "${runtime_id}" "${arch}" --ironbank
+    else
+        bash "$(common::repo_root)/tools/bin/build-container" "${runtime_id}" "${arch}"
+    fi
     common::load_runtime_env "${runtime_id}" "${arch}"
 fi
 
@@ -55,9 +68,9 @@ PY
         echo "${runtime_id} (${arch}) is a build image with no container.smoke_test" >&2
         exit 1
     fi
-    echo "Running the toolchain smoke test in ${CONTAINER_LOCAL_IMAGE}: ${smoke[*]}"
+    echo "Running the toolchain smoke test in ${local_image}: ${smoke[*]}"
     output=$(docker run --rm --platform "${CONTAINER_PLATFORM}" \
-        --entrypoint "${smoke[0]}" "${CONTAINER_LOCAL_IMAGE}" "${smoke[@]:1}")
+        --entrypoint "${smoke[0]}" "${local_image}" "${smoke[@]:1}")
     echo "${output}"
     if ! grep -qF "${DISTRIBUTION_VERSION}" <<<"${output}"; then
         echo "${runtime_id} (${arch}): the toolchain did not report version ${DISTRIBUTION_VERSION}" >&2
@@ -127,13 +140,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "Starting ${CONTAINER_LOCAL_IMAGE} under aws-lambda-rie on 127.0.0.1:${port}"
+# The invocation proves the STIG contract, not just that the handler answers:
+# the rootfs is read-only, /tmp is the only writable path (owned by the runtime
+# UID so the process can write it), and the process runs as UID 1001. RIE is
+# bind-mounted read-only from the host cache, so the production image never
+# carries the emulator.
+echo "Starting ${local_image} under aws-lambda-rie on 127.0.0.1:${port} (user 1001:1001, read-only rootfs)"
 docker run -d --rm --name "${container}" \
     --platform "${CONTAINER_PLATFORM}" \
+    --read-only \
+    --tmpfs /tmp:rw,exec,size=512m,uid=1001,gid=1001 \
+    --user 1001:1001 \
     -p "127.0.0.1:${port}:8080" \
-    -v "${rie}:/aws-lambda-rie:ro" \
+    -v "${rie}:/tmp/aws-lambda-rie:ro" \
     -v "${LOCAL_CODE_URI}:/var/task:ro" \
-    --entrypoint /aws-lambda-rie \
+    --entrypoint /tmp/aws-lambda-rie \
     -e "AWS_LAMBDA_FUNCTION_NAME=${LOCAL_FUNCTION_NAME}" \
     -e "AWS_LAMBDA_FUNCTION_VERSION=\$LATEST" \
     -e "AWS_LAMBDA_FUNCTION_MEMORY_SIZE=256" \
@@ -142,7 +163,7 @@ docker run -d --rm --name "${container}" \
     -e "AWS_REGION=us-east-1" \
     -e "LAMBDA_TASK_ROOT=/var/task" \
     -e "_HANDLER=${LOCAL_HANDLER}" \
-    "${CONTAINER_LOCAL_IMAGE}" \
+    "${local_image}" \
     "${entrypoint[@]}" >/dev/null
 
 endpoint="http://127.0.0.1:${port}/2015-03-31/functions/function/invocations"

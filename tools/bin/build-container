@@ -6,16 +6,28 @@
 #
 #   distroless  a runtime base. Everything that needs a shell (staging the
 #               payload, resolving its non-glibc shared libraries, installing
-#               them from Debian 12) happens in a builder stage; the final stage
+#               them from Debian 13) happens in a builder stage; the final stage
 #               only gets COPY, ENV, WORKDIR, USER and an exec-form ENTRYPOINT.
 #   build       a build environment for a toolchain. Single stage, with a shell
 #               and a package manager, because a consumer's `RUN go build` needs
 #               both.
 #
+# `--ironbank` builds the second artifact instead: the same payload on the
+# DoD-hardened UBI9 base, rendered from tools/docker/Dockerfile.ironbank. It is
+# a separate image (its own tag suffix), not a replacement for the distroless
+# one, so a consumer picks the base their ATO accepts.
+#
 #   build-container <runtime_id> <arch> [--push] [--force] [--tag <tag>]
+#                    [--variant standard|debug] [--ironbank]
+#                    [--cache-from <ref>] [--cache-to <ref>]
 #
 # --push publishes <registry>/<runtime>:<version>-<arch>; the release pipeline
 # merges the two per-arch manifests into one multi-arch tag afterwards.
+#
+# Iron Bank base resolution:
+#   * default: container.ironbank.base_image (registry1.dso.mil)
+#   * USE_FALLBACK_UBI=1, or IRONBANK_TOKEN unset in CI: the Red Hat fallback
+#   * BASE_IMAGE_DIGEST: appended as @<digest> to pin the base
 set -euo pipefail
 
 source "$(dirname "$0")/_common.sh"
@@ -23,6 +35,9 @@ source "$(dirname "$0")/_common.sh"
 push=0
 force=0
 variant=standard
+ironbank=0
+cache_from=""
+cache_to=""
 positional=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -31,6 +46,9 @@ while [[ $# -gt 0 ]]; do
         --no-cache) LAMBDA_CONTAINER_NO_CACHE=1; shift ;;
         --variant) variant=$2; shift 2 ;;
         --debug) variant=debug; shift ;;
+        --ironbank) ironbank=1; shift ;;
+        --cache-from) cache_from=$2; shift 2 ;;
+        --cache-to) cache_to=$2; shift 2 ;;
         -*) echo "Unknown option: $1" >&2; exit 2 ;;
         *) positional+=("$1"); shift ;;
     esac
@@ -58,6 +76,100 @@ if [[ ! -d "${LAYER_ROOT}" || -z "$(ls -A "${LAYER_ROOT}" 2>/dev/null)" ]]; then
     fi
 fi
 
+# A bare ref is a registry cache; a value that already names a type is passed
+# through so a caller can use a local or gha cache instead.
+cache_flag() {  # cache_flag <from|to> <value>
+    local direction=$1 value=$2
+    if [[ -z "${value}" ]]; then
+        return 0
+    fi
+    if [[ "${value}" == type=* ]]; then
+        printf -- '--cache-%s\n%s\n' "${direction}" "${value}"
+    else
+        printf -- '--cache-%s\ntype=registry,ref=%s\n' "${direction}" "${value}"
+    fi
+}
+
+if (( ironbank )); then
+    if [[ "${CONTAINER_IRONBANK_ENABLED}" != "true" ]]; then
+        echo "${runtime_id} (${arch}) has no Iron Bank target (container.ironbank.enabled=false)" >&2
+        exit 1
+    fi
+
+    base_image="${CONTAINER_IRONBANK_BASE_IMAGE}"
+    # registry1.dso.mil needs credentials. A build without them (an external PR,
+    # a fork, a local run) uses the Red Hat registry, which serves the same
+    # UBI9-minimal userland. The release logs in and builds from the primary.
+    if [[ "${USE_FALLBACK_UBI:-0}" == "1" ]]; then
+        base_image="${CONTAINER_FALLBACK_BASE_IMAGE}"
+        echo "USE_FALLBACK_UBI=1: building from ${base_image}"
+    elif [[ "${GITHUB_ACTIONS:-}" == "true" && -z "${IRONBANK_TOKEN:-}" ]]; then
+        base_image="${CONTAINER_FALLBACK_BASE_IMAGE}"
+        echo "IRONBANK_TOKEN is unset: falling back to ${base_image}"
+    fi
+    if [[ -n "${BASE_IMAGE_DIGEST:-${CONTAINER_BASE_IMAGE_DIGEST}}" ]]; then
+        digest="${BASE_IMAGE_DIGEST:-${CONTAINER_BASE_IMAGE_DIGEST}}"
+        base_image="${base_image%%@*}@${digest}"
+    fi
+
+    spec=$(python3 "$(common::repo_root)/tools/runtime_lib/container_image.py" \
+        prepare-ironbank --runtime "${runtime_id}" --arch "${arch}" \
+        $( (( force )) && printf -- '--force' ))
+    context_dir=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["context_dir"])' <<<"${spec}")
+    packages=$(python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["packages"]))' <<<"${spec}")
+    image="${CONTAINER_IRONBANK_LOCAL_IMAGE}"
+
+    echo "Building ${image} for ${CONTAINER_PLATFORM} (Iron Bank base ${base_image})"
+    echo "Installing UBI9 runtime packages: ${packages:-none}"
+
+    build_args=(
+        buildx build
+        --platform "${CONTAINER_PLATFORM}"
+        --file "${context_dir}/Dockerfile"
+        --build-arg "BASE_IMAGE=${base_image}"
+        --build-arg "BUILDER_IMAGE=${base_image}"
+        --build-arg "NONROOT_UID=${CONTAINER_NONROOT_UID}"
+        --build-arg "NONROOT_GID=${CONTAINER_NONROOT_GID}"
+        --build-arg "STAGE_PACKAGES=${packages}"
+        --label "org.opencontainers.image.revision=${GITHUB_SHA:-$(git -C "$(common::repo_root)" rev-parse HEAD 2>/dev/null || echo unknown)}"
+        --tag "${image}"
+        --load
+    )
+    mapfile -t cache_from_args < <(cache_flag from "${cache_from}")
+    mapfile -t cache_to_args < <(cache_flag to "${cache_to}")
+    build_args+=("${cache_from_args[@]}" "${cache_to_args[@]}")
+    if [[ "${LAMBDA_CONTAINER_NO_CACHE:-0}" == "1" ]]; then
+        build_args+=(--no-cache)
+    fi
+
+    docker "${build_args[@]}" "${context_dir}"
+
+    verify_json=$(python3 "$(common::repo_root)/tools/runtime_lib/container_image.py" verify --image "${image}")
+    unpacked_bytes=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["unpacked_bytes"])' <<<"${verify_json}")
+    container_image_bytes=$(python3 "$(common::repo_root)/tools/runtime_lib/container_image.py" \
+        record-size --runtime "${runtime_id}" --arch "${arch}" --image "${image}" \
+        --unpacked-bytes "${unpacked_bytes}" --variant ironbank \
+        | awk '{ print $(NF-1) }')
+
+    echo "${runtime_id} (${arch}): Iron Bank image ${image} holds ${container_image_bytes} bytes unpacked"
+    if (( push )); then
+        bash "$(dirname "$0")/push-container" "${runtime_id}" "${arch}" --ironbank
+    fi
+
+    if [[ -n "${GITHUB_STEP_SUMMARY:-}" && "${LAMBDA_RUNTIME_SUMMARY_DEFERRED:-0}" != "1" ]]; then
+        {
+            echo "### Iron Bank container image: ${runtime_id} (${arch})"
+            echo
+            echo "- \`${image}\`"
+            echo "- base: \`${base_image}\`"
+            echo "- user: \`${CONTAINER_NONROOT_UID}:${CONTAINER_NONROOT_GID}\`"
+            echo "- unpacked size: $(( container_image_bytes / 1048576 )) MB"
+            echo
+        } >> "${GITHUB_STEP_SUMMARY}"
+    fi
+    exit 0
+fi
+
 image="${CONTAINER_LOCAL_IMAGE}"
 
 prepare_args=(prepare --runtime "${runtime_id}" --arch "${arch}" --variant "${variant}")
@@ -72,7 +184,7 @@ echo "Building ${image} for ${CONTAINER_PLATFORM} (base ${CONTAINER_BASE_IMAGE},
 if [[ "${CONTAINER_PROFILE}" == "build" ]]; then
     echo "Installing the build environment's packages: ${packages:-none}"
 elif [[ -n "${packages}" ]]; then
-    echo "Staging runtime libraries from Debian 12: ${packages}"
+    echo "Staging runtime libraries from Debian 13: ${packages}"
 else
     echo "The distroless base already provides every shared library the payload needs."
 fi
@@ -86,6 +198,9 @@ build_args=(
     --tag "${image}"
     --load
 )
+mapfile -t cache_from_args < <(cache_flag from "${cache_from}")
+mapfile -t cache_to_args < <(cache_flag to "${cache_to}")
+build_args+=("${cache_from_args[@]}" "${cache_to_args[@]}")
 if [[ "${LAMBDA_CONTAINER_NO_CACHE:-0}" == "1" ]]; then
     build_args+=(--no-cache)
 fi

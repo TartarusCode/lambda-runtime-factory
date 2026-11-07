@@ -111,6 +111,35 @@ REPO_DEFAULTS: Dict[str, Any] = {
             "PYTHONUNBUFFERED": "1",
         },
         "user": "65532:65532",
+        # Iron Bank is the DoD-hardened delivery path: a UBI9 base from
+        # registry1.dso.mil, a non-root UID, and a trust store that carries the
+        # DoD root CAs. It is a *second* image built from the same payload, not a
+        # replacement for the distroless one — distroless is the smallest CVE
+        # surface, Iron Bank is the one a DoD ATO accepts, and a consumer picks.
+        #
+        # registry1.dso.mil needs credentials, so a build without them (an
+        # external PR, a fork, a local run) falls back to the upstream Red Hat
+        # registry, which serves the same UBI9-minimal userland. The fallback is
+        # a build-time convenience, never a published artifact: the release logs
+        # in to Iron Bank and builds from the primary base.
+        "ironbank": {
+            "enabled": True,
+            "base_image": "registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal:latest",
+            "fallback_base_image": "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+            # Pinning the digest stops Iron Bank's daily automated rebuild from
+            # silently changing the base under a reproducible build. Empty means
+            # "follow the tag".
+            "base_image_digest": "",
+            # DISA STIG: the container runs as a non-root user with no writable
+            # home. 1001 is the conventional first application UID.
+            "nonroot_uid": 1001,
+            "nonroot_gid": 1001,
+            # UBI9 packages installed with the base's own package manager for the
+            # family's native dependencies. The payload's DT_NEEDED scan adds
+            # whatever else the base does not ship; nothing is ever copied as a
+            # bare .so, so RPM keeps owning /var/lib/rpm and ld.so.cache.
+            "packages": ["ca-certificates"],
+        },
     },
 }
 
@@ -640,6 +669,35 @@ def validate_runtime_data(runtime_id: str, data: Dict[str, Any]) -> None:
             f"'{data['container']['profile']}'"
         )
 
+    # The Iron Bank image is a second artifact from the same payload, so its
+    # coordinates are validated like the distroless ones: a missing base or a
+    # non-numeric UID would only surface inside a Docker build.
+    ironbank = data["container"].get("ironbank")
+    if not isinstance(ironbank, dict):
+        raise ValueError(
+            f"Runtime {runtime_id} container.ironbank must be a mapping "
+            "(see REPO_DEFAULTS in runtime_manifest.py)"
+        )
+    _require_keys(
+        ironbank,
+        [
+            "enabled",
+            "base_image",
+            "fallback_base_image",
+            "base_image_digest",
+            "nonroot_uid",
+            "nonroot_gid",
+            "packages",
+        ],
+        f"runtime {runtime_id} container.ironbank",
+    )
+    for key in ("nonroot_uid", "nonroot_gid"):
+        if not isinstance(ironbank[key], int) or ironbank[key] <= 0:
+            raise ValueError(
+                f"Runtime {runtime_id} container.ironbank.{key} must be a positive "
+                f"integer, not {ironbank[key]!r}"
+            )
+
     # A distroless image has no shell, so a shell string here can never run: the
     # entrypoint must already be the argv Docker will exec. A build profile has a
     # shell, so it may name one.
@@ -716,6 +774,7 @@ def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH, variant: str = "stand
     downloads_dir = download_cache_root / runtime_id
     work_dir = build_dir / "work"
     container = data["container"]
+    ironbank = container["ironbank"]
     container_arch = CONTAINER_ARCH_SLUGS.get(arch, arch)
     container_registries = with_ecr_alias([item.rstrip("/") for item in container["registries"]])
     container_registry = with_ecr_alias([container["registry"].rstrip("/")])[0]
@@ -827,6 +886,25 @@ def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH, variant: str = "stand
         "CONTAINER_LOCAL_IMAGE": (
             f"lambda-runtime-factory/{runtime_id}:{container_tag}-{arch}{variant_suffix}"
         ),
+        # The Iron Bank image is a second artifact from the same payload. Its
+        # base, UID and digest travel to the builder so the Dockerfile template
+        # and the manifest cannot disagree about them.
+        "CONTAINER_IRONBANK_ENABLED": "true" if ironbank["enabled"] else "false",
+        "CONTAINER_IRONBANK_BASE_IMAGE": ironbank["base_image"],
+        "CONTAINER_FALLBACK_BASE_IMAGE": ironbank["fallback_base_image"],
+        "CONTAINER_BASE_IMAGE_DIGEST": ironbank["base_image_digest"],
+        "CONTAINER_NONROOT_UID": str(ironbank["nonroot_uid"]),
+        "CONTAINER_NONROOT_GID": str(ironbank["nonroot_gid"]),
+        "CONTAINER_IRONBANK_PACKAGES": json.dumps(list(ironbank["packages"])),
+        "CONTAINER_IRONBANK_CONTEXT_DIR": str(build_dir / "container-ironbank"),
+        "CONTAINER_IRONBANK_LOCAL_IMAGE": (
+            f"lambda-runtime-factory/{runtime_id}:{container_tag}-{arch}-ironbank"
+        ),
+        # Docker Buildx registry-cache coordinate. Every runner rebuilding the same
+        # base image and the same staged libraries from scratch is what the cache
+        # exists to avoid; the ref is derived here so the workflow, the release and
+        # a local run all point at the same tag.
+        "CONTAINER_CACHE_REF": f"{container_image}:buildcache-{container_arch}",
         "EXPORT_ARTIFACT_DIR": os.environ.get("EXPORT_ARTIFACT_DIR", ""),
     }
     return env
@@ -1015,12 +1093,17 @@ def main() -> None:
     if args.command == "matrix":
         runtime_ids = None
         if args.runtime and args.runtime != "all":
+            # A caller may narrow to several runtimes at once — the fast PR tier
+            # passes the ids whose files changed — so the value is a comma-separated
+            # list as well as a single id.
+            requested = [item.strip() for item in args.runtime.split(",") if item.strip()]
             known = list_runtime_ids()
-            if args.runtime not in known:
-                raise SystemExit(
-                    f"Unknown runtime '{args.runtime}'. Available: {', '.join(known)}"
-                )
-            runtime_ids = [args.runtime]
+            for runtime_id in requested:
+                if runtime_id not in known:
+                    raise SystemExit(
+                        f"Unknown runtime '{runtime_id}'. Available: {', '.join(known)}"
+                    )
+            runtime_ids = requested
         archs = None
         if args.arch and args.arch != "all":
             if args.arch not in SUPPORTED_ARCHS:

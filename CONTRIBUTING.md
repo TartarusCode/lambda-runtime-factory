@@ -32,6 +32,17 @@ make check RUNTIME=pypy311            # validate the manifest and compile its Py
 make test                             # repo test suite (pytest)
 ```
 
+Container work:
+
+```bash
+make container             RUNTIME=pypy311 ARCH=x86_64   # distroless image
+make container-invoke      RUNTIME=pypy311 ARCH=x86_64   # RIE smoke test, rootless + read-only
+make container-debug       RUNTIME=pypy311 ARCH=x86_64   # the debug variant
+make container-variants    RUNTIME=pypy311 ARCH=x86_64   # assert both variants' claims
+make container-ironbank    RUNTIME=pypy311 ARCH=x86_64   # Iron Bank (UBI9) image
+make container-ironbank-invoke RUNTIME=pypy311 ARCH=x86_64
+```
+
 `upload`/`publish`/`publicize`/`latest` need AWS credentials. Builds and scans do not.
 
 ## The runtime manifest
@@ -142,6 +153,69 @@ bash tools/bin/container-variants pypy311 x86_64    # standard debug | standard
 
 CI builds the debug variant for every cell that has one and runs the variant check, so a base
 swap that quietly dropped the entrypoint or the user fails there rather than in production.
+
+### The Iron Bank image
+
+Beside the distroless image, every runtime builds a **second** image from the same payload on the
+DoD-hardened UBI9 base. The two are independent artifacts with their own tags — distroless is the
+smallest CVE surface, Iron Bank is the base a DoD ATO accepts:
+
+| Tag | Base | User |
+| --- | --- | --- |
+| `<version>` | `gcr.io/distroless/cc-debian13:nonroot` | `65532:65532` |
+| `<version>-debug` | `…:debug-nonroot` | `65532:65532` |
+| `<version>-ironbank` | `registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal` | `1001:1001` |
+
+The stage layout is **one** file, `tools/docker/Dockerfile.ironbank`, which
+`container_image.render_ironbank_dockerfile` renders per runtime: the entrypoint is fixed at
+`/opt/bootstrap` (the STIG contract) and only the payload path, the environment and the labels
+come from the manifest. Keeping the invariants in a reviewable file rather than in Python string
+concatenation is deliberate — `test_the_iron_bank_template_carries_the_stig_invariants` reads the
+file, not the generator.
+
+```bash
+make container-ironbank         RUNTIME=pypy311 ARCH=x86_64   # build the image
+make container-ironbank-invoke  RUNTIME=pypy311 ARCH=x86_64   # rootless, read-only RIE smoke test
+make container-ironbank-audit   RUNTIME=pypy311 ARCH=x86_64   # Grype scan of that image
+```
+
+The manifest declares the base and the UID under `container.ironbank` in `REPO_DEFAULTS`:
+
+```json
+"ironbank": {
+  "enabled": true,
+  "base_image": "registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal:latest",
+  "fallback_base_image": "registry.access.redhat.com/ubi9/ubi-minimal:latest",
+  "base_image_digest": "",
+  "nonroot_uid": 1001,
+  "nonroot_gid": 1001,
+  "packages": ["ca-certificates"]
+}
+```
+
+Three rules matter when you touch this path:
+
+- **Libraries are installed, never copied.** `container_image.required_ubi_packages` maps the
+  payload's `DT_NEEDED` sonames to UBI9 packages and the image installs them with
+  `microdnf install -y --nodocs --setopt=install_weak_deps=0`. Cherry-picking resolved `.so`
+  files would leave `/var/lib/rpm` without the owning package — Grype then cannot match a RHEL
+  backport and reports false positives against a payload that is actually patched — and
+  `/etc/ld.so.cache` stale. `rpm` and `/var/lib/rpm` therefore stay in the image, and only
+  `microdnf`/`dnf`/`yum` are removed. The distroless path is different on purpose: it stages
+  `.so` files from `debian:<N>-slim` because distroless has no package manager at all.
+- **`registry1.dso.mil` needs credentials.** Set `IRONBANK_USERNAME`/`IRONBANK_TOKEN` as
+  repository secrets and the workflows log in; without them (`USE_FALLBACK_UBI=1`, or
+  `IRONBANK_TOKEN` unset in CI) the build uses `registry.access.redhat.com/ubi9/ubi-minimal`,
+  which serves the same userland. `BASE_IMAGE_DIGEST` pins the base so Iron Bank's daily rebuild
+  cannot move it under a reproducible build.
+- **Root CAs come from `certs/*.crt`.** The builder stage copies them into
+  `/etc/pki/ca-trust/source/anchors/` and runs `update-ca-trust extract`; the final stage points
+  every TLS stack at the resulting bundle. An empty directory is valid.
+
+The smoke test is the STIG proof, not a repetition of the distroless one: `local-invoke-container
+--ironbank` runs the image with `--read-only`, `--tmpfs /tmp:rw,exec,size=512m,uid=1001,gid=1001`
+and `--user 1001:1001`, with `aws-lambda-rie` bind-mounted read-only from the host cache. The
+emulator is never baked into either published image.
 
 ### The entrypoint must not need a shell
 
@@ -292,24 +366,44 @@ Requirements:
 
 ## CI
 
-`.github/workflows/ci.yml` runs on every push to `main` and every PR (docs-only changes are
-skipped):
+`.github/workflows/ci.yml` runs on every push to `main`, every PR (docs-only changes are
+skipped) and on demand via `workflow_dispatch`. It has **two tiers**, so a work-in-progress commit
+does not occupy all 24 runners:
 
-- `repo-checks` (once): manifest validation, `bash -n` over `tools/bin/`, a compile check per
-  runtime and the online archive-URL check, plus the test suite
+- **Fast tier** — a draft PR, or a PR whose labels do not include `ready-to-merge`, runs only the
+  cells whose files changed under `runtimes/` (computed by the `runtime-matrix` action from
+  `git diff --name-only origin/<base>...HEAD`), or a single `pypy311` canary cell when nothing
+  under `runtimes/` changed at all.
+- **Full tier** — a push to `main`, a `workflow_dispatch`, or a PR that left draft and carries
+  `ready-to-merge` runs the full 24-cell matrix.
+
+Between the two:
+
+- `repo-checks` (once, < 1 min): manifest validation, `bash -n` over `tools/bin/`, a compile check
+  per runtime and the online archive-URL check, plus the test suite
 - `grype-db` (once): refreshes and caches the ~2.8GB vulnerability database for the matrix
 - `runtime-checks` (matrix): builds every runtime × architecture, scans the ones whose pinned
-  payload changed, and on x86 runs the local SAM smoke test
+  payload changed, builds and smoke-tests the distroless image and the Iron Bank image, and on
+  x86 runs the local SAM smoke test
 - caches: upstream runtime downloads, the built package, the Grype binary and database
 - artifacts: built zips upload on **push to `main` only**, `retention-days: 7`
 - superseded PR runs cancel via workflow concurrency
 
+Docker Buildx is set up with the `docker-container` driver, and every image build passes
+`--cache-from type=registry,ref=$CONTAINER_CACHE_REF`
+(`ghcr.io/tartaruscode/lambda-runtime-factory/<runtime>:buildcache-<arch>`, derived in the
+manifest so no caller invents its own). Only the default branch adds `--cache-to …,mode=max`, so a
+PR's cache never lands on a ref nothing else can read. That is what makes the base pull, the
+certificate extraction and the library installation cheap on a re-run.
+
 Three composite actions in `.github/actions/` hold the whole per-cell procedure so the workflows
 cannot drift apart:
 
-- `runtime-matrix` — the build/publish matrix, generated from the manifest list
+- `runtime-matrix` — the build/publish matrix, generated from the manifest list (and narrowed to
+  the changed runtimes for the fast tier)
 - `runtime-build-env` — the download, package, Grype-binary and Grype-database caches
-- `build-and-audit-runtime` — archive tooling, `make build`, `tools/bin/audit-runtime`
+- `build-and-audit-runtime` — archive tooling, Buildx setup, `make build`,
+  `tools/bin/audit-runtime`, and the distroless + Iron Bank image builds, scans and smoke tests
 
 `.github/workflows/audit-runtimes.yml` runs the same matrix weekly to catch CVE-database drift,
 and `.github/workflows/check-updates.yml` opens the weekly version-bump PR.

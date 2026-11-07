@@ -9,7 +9,7 @@ DEV_BUILD_ENV := BUILD_BEST_EFFORT_AUDIT=0
 
 all: validate-runtimes build
 
-.PHONY: all list-runtimes validate-runtimes check build build-all build-all-arches audit audit-all upload upload-all publish publish-all publicize publicize-all latest latest-all unpublish create-buckets local-build local-invoke clean shell check-updates bump bump-latest roll-off test container container-debug container-variants container-invoke container-audit container-push container-merge container-soci container-repos
+.PHONY: all list-runtimes validate-runtimes check build build-all build-all-arches audit audit-all upload upload-all publish publish-all publicize publicize-all latest latest-all unpublish create-buckets local-build local-invoke clean shell check-updates bump bump-latest roll-off test container container-debug container-variants container-invoke container-audit container-push container-merge container-soci container-repos container-ironbank container-ironbank-invoke container-ironbank-audit
 
 list-runtimes:
 	python3 tools/runtime_lib/runtime_manifest.py list
@@ -115,6 +115,19 @@ container-audit:
 
 container-invoke:
 	bash tools/bin/local-invoke-container "$(RUNTIME)" "$(ARCH)"
+
+# The Iron Bank (UBI9) image is a second artifact from the same payload: non-root
+# UID 1001, DoD root CAs from certs/*.crt, and a read-only rootfs. Set
+# USE_FALLBACK_UBI=1 to build from the Red Hat registry when registry1.dso.mil
+# credentials are not available locally.
+container-ironbank: validate-runtimes
+	$(DEV_BUILD_ENV) bash tools/bin/build-container "$(RUNTIME)" "$(ARCH)" --ironbank
+
+container-ironbank-invoke:
+	bash tools/bin/local-invoke-container "$(RUNTIME)" "$(ARCH)" --ironbank
+
+container-ironbank-audit:
+	bash tools/bin/audit-container "$(RUNTIME)" "$(ARCH)" --ironbank
 
 container-push:
 	bash tools/bin/push-container "$(RUNTIME)" "$(ARCH)"

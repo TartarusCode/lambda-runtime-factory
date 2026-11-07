@@ -107,6 +107,71 @@ TRIPLET_FOR_PLATFORM: Dict[str, str] = {
     "arm64": "aarch64-linux-gnu",
 }
 
+# The canonical Iron Bank stage layout. It is a template, not a Dockerfile: the
+# @@...@@ placeholders carry the per-runtime entrypoint, environment and payload
+# paths from the manifest, so the STIG invariants live in one reviewable file
+# while the invocation stays in the manifest.
+IRONBANK_TEMPLATE = Path(__file__).resolve().parents[1] / "docker" / "Dockerfile.ironbank"
+
+# Sonames `registry1.dso.mil/.../ubi9-minimal` (and the Red Hat fallback, which
+# serves the same userland) already provides. Verified against the image itself;
+# a name missing from this set is staged from the builder stage.
+UBI_PROVIDED = {
+    "ld-linux-aarch64.so.1",
+    "ld-linux-x86-64.so.2",
+    "libBrokenLocale.so.1",
+    "libanl.so.1",
+    "libbz2.so.1",
+    "libc.so.6",
+    "libc_malloc_debug.so.0",
+    "libcrypto.so.3",
+    "libcrypt.so.2",
+    "libdl.so.2",
+    "libffi.so.8",
+    "libform.so.6",
+    "libformw.so.6",
+    "libgcc_s.so.1",
+    "libgdbm.so.6",
+    "libgdbm_compat.so.4",
+    "liblzma.so.5",
+    "libm.so.6",
+    "libmenuw.so.6",
+    "libmvec.so.1",
+    "libncurses.so.6",
+    "libncursesw.so.6",
+    "libnss_compat.so.2",
+    "libnss_dns.so.2",
+    "libnss_files.so.2",
+    "libpanel.so.6",
+    "libpanelw.so.6",
+    "libpthread.so.0",
+    "libreadline.so.8",
+    "libresolv.so.2",
+    "librt.so.1",
+    "libsqlite3.so.0",
+    "libssl.so.3",
+    "libstdc++.so.6",
+    "libthread_db.so.1",
+    "libtinfo.so.6",
+    "libutil.so.1",
+    "libuuid.so.1",
+    "libyaml-0.so.2",
+    "libz.so.1",
+    "libzstd.so.1",
+}
+
+# UBI9 package that owns a soname the base does not ship. Unknown names fail the
+# build with the soname in the message rather than producing an image that starts
+# and then cannot dlopen.
+PACKAGE_FOR_SONAME_UBI: Dict[str, str] = {
+    "libbz2.so.1.0": "bzip2-libs",
+    "libcrypt.so.1": "libxcrypt-compat",
+    "libexpat.so.1": "expat",
+    "libmpdec.so.3": "python3-libs",
+    "libnsl.so.1": "libnsl",
+    "libtinfo.so.5": "ncurses-compat-libs",
+}
+
 
 class ContainerError(RuntimeError):
     """A container build input is missing or a library cannot be resolved."""
@@ -187,6 +252,44 @@ def required_packages(
             "to PACKAGE_FOR_SONAME in tools/runtime_lib/container_image.py."
         )
     return sorted({PACKAGE_FOR_SONAME[name] for name in missing})
+
+
+def required_ubi_packages(
+    sonames: Iterable[str], *, provided_by_payload: Iterable[str] = ()
+) -> List[str]:
+    """Map sonames to the UBI9 packages that provide what the base does not."""
+    payload = set(provided_by_payload)
+    missing = [
+        name
+        for name in sonames
+        if name not in UBI_PROVIDED and name not in payload
+    ]
+    unknown = [name for name in missing if name not in PACKAGE_FOR_SONAME_UBI]
+    if unknown:
+        raise ContainerError(
+            "The UBI9-minimal base does not provide these shared libraries and no "
+            f"UBI9 package is mapped for them: {', '.join(unknown)}. Add them to "
+            "PACKAGE_FOR_SONAME_UBI in tools/runtime_lib/container_image.py."
+        )
+    return sorted({PACKAGE_FOR_SONAME_UBI[name] for name in missing})
+
+
+def ironbank_packages(
+    declared: Iterable[str],
+    sonames: Iterable[str],
+    *,
+    provided_by_payload: Iterable[str] = (),
+) -> List[str]:
+    """The UBI9 packages an Iron Bank image installs.
+
+    The manifest's declared floor plus whatever the payload's ``DT_NEEDED`` scan
+    finds the base does not ship. Only package *names* leave this function: the
+    image installs them with ``microdnf``, so RPM keeps owning the files.
+    """
+    return sorted(
+        set(declared)
+        | set(required_ubi_packages(sonames, provided_by_payload=provided_by_payload))
+    )
 
 
 def _docker_env(env: Dict[str, str]) -> str:
@@ -344,6 +447,161 @@ def render_dockerfile(
         "",
     ]
     return "\n".join(lines)
+
+
+def render_ironbank_dockerfile(
+    *,
+    layer_root: str,
+    workdir: str,
+    env: Dict[str, str],
+    labels: Optional[Dict[str, str]] = None,
+) -> str:
+    """Render the canonical Iron Bank template for one runtime.
+
+    The stage layout, the CA injection, the STIG invariants and the entrypoint all
+    come from ``tools/docker/Dockerfile.ironbank``; only the payload path, the
+    environment and the labels are substituted, so the two cannot drift. The
+    entrypoint is deliberately not a placeholder: the STIG contract fixes it at
+    ``/opt/bootstrap``, the one path every runtime family ships.
+    """
+    template = IRONBANK_TEMPLATE.read_text(encoding="utf-8")
+
+    label_lines = "\n".join(
+        f'LABEL {key}="{value}"' for key, value in sorted((labels or {}).items())
+    )
+
+    replacements = {
+        "@@LAYER_ROOT@@": layer_root.rstrip("/"),
+        "@@WORKDIR@@": workdir,
+        "@@ENV@@": _docker_env(env),
+        "@@LABELS@@": label_lines,
+    }
+    rendered = template
+    for placeholder, value in replacements.items():
+        rendered = rendered.replace(placeholder, value)
+
+    leftover = re.findall(r"@@[A-Z_]+@@", rendered)
+    if leftover:
+        raise ContainerError(
+            f"{IRONBANK_TEMPLATE.name}: unsubstituted placeholders {sorted(set(leftover))}"
+        )
+    return rendered
+
+
+def prepare_ironbank(runtime_id: str, arch: str, *, force: bool = False) -> Dict[str, Any]:
+    """Stage the Iron Bank build context and return what the builder needs.
+
+    The payload is the same ``${LAYER_ROOT}`` the zip layer and the distroless
+    image ship, hardlinked into ``context/layer`` where the filesystem allows it.
+    Nothing about the payload is re-derived here: build-runtime owns the download,
+    the checksum, the extraction, the slimming and the STIG permissions.
+    """
+    env = runtime_manifest.runtime_env(runtime_id, arch=arch)
+    if env["CONTAINER_IRONBANK_ENABLED"] != "true":
+        raise ContainerError(
+            f"{runtime_id} ({arch}) has no Iron Bank target (container.ironbank.enabled=false)"
+        )
+
+    layer_root = Path(env["LAYER_ROOT"])
+    if not layer_root.is_dir():
+        raise ContainerError(
+            f"{runtime_id} ({arch}): no payload at {layer_root}. "
+            "Build the runtime package first (tools/bin/build-runtime)."
+        )
+
+    # The image entrypoints at the payload's bootstrap, so the payload must carry
+    # one. It is the same file the zip layer ships.
+    bootstrap = layer_root / env["BOOTSTRAP_OUTPUT"]
+    if not bootstrap.exists():
+        raise ContainerError(
+            f"{runtime_id} ({arch}): the payload has no {bootstrap}; the Iron Bank "
+            "image entrypoints at /opt/bootstrap, so build-runtime must ship it"
+        )
+    if not os.access(bootstrap, os.X_OK):
+        raise ContainerError(
+            f"{runtime_id} ({arch}): {bootstrap} is not executable, so the image "
+            "could not start"
+        )
+
+    context_dir = Path(env["CONTAINER_IRONBANK_CONTEXT_DIR"])
+    if force or context_dir.exists():
+        shutil.rmtree(context_dir, ignore_errors=True)
+    context_dir.mkdir(parents=True, exist_ok=True)
+
+    layer_link = context_dir / "layer"
+    try:
+        subprocess.run(
+            ["cp", "-al", str(layer_root), str(layer_link)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError:
+        shutil.copytree(layer_root, layer_link, symlinks=True)
+
+    # The template always COPYs certs/, so the directory must exist even when the
+    # repository ships no extra root CAs.
+    certs_dir = context_dir / "certs"
+    certs_dir.mkdir(parents=True, exist_ok=True)
+    repo_certs = runtime_manifest.repo_root() / "certs"
+    if repo_certs.is_dir():
+        for cert in sorted(repo_certs.glob("*.crt")):
+            shutil.copy2(cert, certs_dir / cert.name)
+
+    # Which UBI9 packages to install. The manifest declares an explicit floor
+    # (ca-certificates); the payload's DT_NEEDED scan adds any soname the base
+    # does not ship. The names go into a `microdnf install` build arg — no file is
+    # ever cherry-picked, so RPM keeps owning /var/lib/rpm and ld.so.cache.
+    sonames = scan_payload_sonames(layer_root)
+    provided = payload_library_names(layer_root)
+    declared = json.loads(env.get("CONTAINER_IRONBANK_PACKAGES") or "[]")
+    packages = ironbank_packages(declared, sonames, provided_by_payload=provided)
+
+    labels = {
+        "org.opencontainers.image.title": f"lambda-runtime-factory {runtime_id}",
+        "org.opencontainers.image.description": (
+            f"Iron Bank hardened AWS Lambda runtime image for {runtime_id} ({arch})"
+        ),
+        "org.opencontainers.image.source": "https://github.com/TartarusCode/lambda-runtime-factory",
+        "org.opencontainers.image.version": env["CONTAINER_TAG"],
+        "org.opencontainers.image.licenses": "Apache-2.0",
+        "com.tartaruscode.lambda.runtime": runtime_id,
+        "com.tartaruscode.lambda.arch": env["CONTAINER_ARCH"],
+        "com.tartaruscode.lambda.profile": "ironbank",
+    }
+
+    dockerfile = render_ironbank_dockerfile(
+        layer_root=env["CONTAINER_LAYER_ROOT"],
+        workdir=env["CONTAINER_WORKDIR"],
+        env=json.loads(env["CONTAINER_ENV"]),
+        labels=labels,
+    )
+    (context_dir / "Dockerfile").write_text(dockerfile, encoding="utf-8", newline="\n")
+
+    staged = {
+        "runtime_id": runtime_id,
+        "arch": arch,
+        "profile": "ironbank",
+        "platform": env["CONTAINER_PLATFORM"],
+        "base_image": env["CONTAINER_IRONBANK_BASE_IMAGE"],
+        "fallback_base_image": env["CONTAINER_FALLBACK_BASE_IMAGE"],
+        "base_image_digest": env["CONTAINER_BASE_IMAGE_DIGEST"],
+        "nonroot_uid": env["CONTAINER_NONROOT_UID"],
+        "nonroot_gid": env["CONTAINER_NONROOT_GID"],
+        "context_dir": str(context_dir),
+        "dockerfile": str(context_dir / "Dockerfile"),
+        "local_image": env["CONTAINER_IRONBANK_LOCAL_IMAGE"],
+        "tag": env["CONTAINER_TAG"],
+        "entrypoint": ["/opt/bootstrap"],
+        "env": json.loads(env["CONTAINER_ENV"]),
+        "sonames": sonames,
+        "packages": packages,
+        "provided_by_base": [name for name in sonames if name in UBI_PROVIDED],
+    }
+    (context_dir / "container-spec.json").write_text(
+        json.dumps(staged, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return staged
 
 
 def _spec_for(runtime_id: str, arch: str, variant: str = "standard") -> Dict[str, Any]:
@@ -672,10 +930,14 @@ def record_size(
     stats.setdefault("max_unzipped_bytes", int(env["MAX_UNZIPPED_BYTES"]))
     stats.setdefault("warn_unzipped_bytes", int(env["WARN_UNZIPPED_BYTES"]))
     stats.setdefault("layer_publishable", env["LAYER_PUBLISHABLE"] == "true")
-    # The debug image is a second artifact for the same payload, so its size goes
-    # under its own keys: the summary and the release record describe the image
-    # that production runs, not the one that carries a shell.
-    prefix = "container_debug_image" if variant == "debug" else "container_image"
+    # The debug and Iron Bank images are second artifacts for the same payload, so
+    # their sizes go under their own keys: the summary and the release record
+    # describe the image that production runs, not the one that carries a shell or
+    # a different base.
+    prefix = {
+        "debug": "container_debug_image",
+        "ironbank": "container_ironbank_image",
+    }.get(variant, "container_image")
     stats[f"{prefix}_bytes"] = size
     stats[f"{prefix}_bytes_measured"] = source
     stats[prefix] = image
@@ -701,6 +963,13 @@ def _main() -> None:
         help="standard image, or the debug variant that carries a busybox shell",
     )
 
+    ironbank_parser = sub.add_parser(
+        "prepare-ironbank", help="Stage the Iron Bank build context"
+    )
+    ironbank_parser.add_argument("--runtime", required=True)
+    ironbank_parser.add_argument("--arch", required=True)
+    ironbank_parser.add_argument("--force", action="store_true")
+
     verify_parser = sub.add_parser("verify", help="Assert the Lambda filesystem contract")
     verify_parser.add_argument("--image", required=True)
 
@@ -721,8 +990,10 @@ def _main() -> None:
     size_parser.add_argument(
         "--variant",
         default="standard",
-        choices=runtime_manifest.CONTAINER_VARIANTS,
-        help="which variant's stats keys to write (standard or debug)",
+        # `ironbank` is a second artifact, not a container variant: it has its own
+        # base and its own stats keys, but it is recorded through the same path.
+        choices=(*runtime_manifest.CONTAINER_VARIANTS, "ironbank"),
+        help="which artifact's stats keys to write (standard, debug or ironbank)",
     )
 
     args = parser.parse_args()
@@ -731,6 +1002,15 @@ def _main() -> None:
         print(
             json.dumps(
                 prepare(args.runtime, args.arch, force=args.force, variant=args.variant),
+                indent=2,
+            )
+        )
+        return
+
+    if args.command == "prepare-ironbank":
+        print(
+            json.dumps(
+                prepare_ironbank(args.runtime, args.arch, force=args.force),
                 indent=2,
             )
         )

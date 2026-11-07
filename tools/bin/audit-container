@@ -11,12 +11,14 @@ source "$(dirname "$0")/_common.sh"
 
 best_effort=0
 variant=standard
+ironbank=0
 positional=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --best-effort) best_effort=1; shift ;;
         --variant) variant=$2; shift 2 ;;
         --debug) variant=debug; shift ;;
+        --ironbank) ironbank=1; shift ;;
         -*) echo "Unknown option: $1" >&2; exit 2 ;;
         *) positional+=("$1"); shift ;;
     esac
@@ -26,8 +28,20 @@ runtime_id=$(common::require_runtime_id "${positional[0]:-}")
 arch=$(common::require_arch "${positional[1]:-}")
 common::load_runtime_env "${runtime_id}" "${arch}" "${variant}"
 
-if ! docker image inspect "${CONTAINER_LOCAL_IMAGE}" >/dev/null 2>&1; then
-    bash "$(common::repo_root)/tools/bin/build-container" "${runtime_id}" "${arch}" --variant "${variant}"
+# The Iron Bank image is a second artifact with its own base and its own CVE
+# surface, so it is scanned as bytes, not assumed clean because the distroless
+# image is.
+local_image="${CONTAINER_LOCAL_IMAGE}"
+build_args=()
+if (( ironbank )); then
+    local_image="${CONTAINER_IRONBANK_LOCAL_IMAGE}"
+    build_args=(--ironbank)
+else
+    build_args=(--variant "${variant}")
+fi
+
+if ! docker image inspect "${local_image}" >/dev/null 2>&1; then
+    bash "$(common::repo_root)/tools/bin/build-container" "${runtime_id}" "${arch}" "${build_args[@]}"
     common::load_runtime_env "${runtime_id}" "${arch}" "${variant}"
 fi
 
@@ -38,7 +52,7 @@ if [[ -f "${grype_config}" ]]; then
 fi
 
 if type -P grype >/dev/null; then
-    grype "${grype_config_args[@]}" -q --fail-on high --only-fixed "docker:${CONTAINER_LOCAL_IMAGE}"
+    grype "${grype_config_args[@]}" -q --fail-on high --only-fixed "docker:${local_image}"
     exit 0
 fi
 

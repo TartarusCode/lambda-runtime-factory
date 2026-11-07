@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -2071,3 +2073,365 @@ def test_a_narrow_margin_warns_without_failing() -> None:
 
     assert verdict["level"] == "warning"
     assert verdict["headroom_mb"] < 10
+
+
+# --- Iron Bank hardened artifact -------------------------------------------------
+#
+# Every runtime also ships a second image: the same payload on the DoD-hardened
+# UBI9 base, non-root UID 1001, a DoD root CA trust store and a read-only rootfs
+# with /tmp as the only writable path. The stage layout lives in one canonical
+# template so the STIG invariants are reviewable, and the invocation comes from
+# the manifest so it cannot drift from the distroless image.
+
+
+def test_the_iron_bank_coordinates_travel_to_the_builder() -> None:
+    env = runtime_manifest.runtime_env("graalpy312", arch="arm64")
+
+    assert env["CONTAINER_IRONBANK_ENABLED"] == "true"
+    assert env["CONTAINER_IRONBANK_BASE_IMAGE"].startswith("registry1.dso.mil/ironbank/")
+    assert env["CONTAINER_FALLBACK_BASE_IMAGE"].startswith("registry.access.redhat.com/")
+    assert env["CONTAINER_NONROOT_UID"] == "1001"
+    assert env["CONTAINER_NONROOT_GID"] == "1001"
+    assert json.loads(env["CONTAINER_IRONBANK_PACKAGES"]) == ["ca-certificates"]
+    assert env["CONTAINER_IRONBANK_LOCAL_IMAGE"].endswith("-x86_64-ironbank") or env[
+        "CONTAINER_IRONBANK_LOCAL_IMAGE"
+    ].endswith("-arm64-ironbank")
+    assert env["CONTAINER_BASE_IMAGE_DIGEST"] == ""
+    # The registry cache ref is derived, so a workflow cannot invent its own.
+    assert env["CONTAINER_CACHE_REF"].endswith("/graalpy312:buildcache-arm64")
+
+
+def test_the_iron_bank_base_and_fallback_are_declared_repo_wide() -> None:
+    ironbank = runtime_manifest.REPO_DEFAULTS["container"]["ironbank"]
+
+    assert ironbank["base_image"].startswith("registry1.dso.mil/ironbank/redhat/ubi/")
+    assert ironbank["fallback_base_image"].startswith("registry.access.redhat.com/")
+    assert ironbank["nonroot_uid"] == ironbank["nonroot_gid"] == 1001
+    # A digest pin is supported so Iron Bank's daily automated rebuild cannot
+    # change the base under a reproducible build.
+    assert "base_image_digest" in ironbank
+
+
+def test_the_iron_bank_template_carries_the_stig_invariants() -> None:
+    """The canonical template is the one file that has to be right: the final
+    stage runs non-root, writable only under /tmp, and carries no package
+    manager."""
+    template = (
+        _REPO_ROOT / "tools" / "docker" / "Dockerfile.ironbank"
+    ).read_text(encoding="utf-8")
+
+    assert 'ENTRYPOINT ["/opt/bootstrap"]' in template, "the STIG entrypoint is fixed"
+    assert "USER ${NONROOT_UID}:${NONROOT_GID}" in template
+    assert "WORKDIR @@WORKDIR@@" in template
+    # The DoD root CAs are injected and the trust store is extracted.
+    assert "/etc/pki/ca-trust/source/anchors/" in template
+    assert "update-ca-trust extract" in template
+    assert "COPY --from=builder /etc/pki/ca-trust/extracted" in template
+    # TLS stacks all read the same bundle.
+    for key in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "DENO_CERT", "NODE_EXTRA_CA_CERTS"):
+        assert key in template, key
+    # Runtime dependencies are installed by the base's own package manager...
+    assert "microdnf install -y --nodocs --setopt=install_weak_deps=0" in template
+    # ...and never cherry-picked as bare shared objects, which would leave
+    # /var/lib/rpm without the owning package and /etc/ld.so.cache stale.
+    assert "cp -a" not in template
+    assert "find /lib" not in template and "find /usr/lib" not in template
+    assert "ldd" not in template
+    assert "STAGED_SONAMES" not in template
+    # rpm stays: Grype reads its database.
+    assert "rm -rf /var/lib/rpm" not in template
+    assert "rpm -q" in template
+
+
+def test_render_ironbank_dockerfile_substitutes_every_placeholder() -> None:
+    dockerfile = container_image.render_ironbank_dockerfile(
+        layer_root="/opt",
+        workdir="/var/task",
+        env={"HOME": "/tmp", "TMPDIR": "/tmp", "GOCACHE": "/tmp/.cache/go-build"},
+        labels={"com.tartaruscode.lambda.profile": "ironbank"},
+    )
+
+    assert not re.search(r"@@[A-Z_]+@@", dockerfile), "a placeholder was left unsubstituted"
+    assert 'ENV HOME="/tmp"' in dockerfile
+    assert 'LABEL com.tartaruscode.lambda.profile="ironbank"' in dockerfile
+    assert "WORKDIR /var/task" in dockerfile
+    assert "COPY --chown=${NONROOT_UID}:${NONROOT_GID} layer/ /opt/" in dockerfile
+    assert "chmod -R a+rX /opt" in dockerfile
+
+
+def test_the_iron_bank_package_map_names_packages_not_files() -> None:
+    # What the base ships needs no install at all.
+    assert container_image.required_ubi_packages(["libc.so.6", "libz.so.1"]) == []
+    # A soname the base lacks maps to its owning RPM.
+    assert container_image.required_ubi_packages(["libbz2.so.1.0"]) == ["bzip2-libs"]
+
+    with pytest.raises(container_image.ContainerError, match="libunknown\\.so\\.9"):
+        container_image.required_ubi_packages(["libunknown.so.9"])
+
+
+def test_the_iron_bank_package_list_is_names_not_characters() -> None:
+    """The manifest value is a JSON list; iterating the string would install
+    packages named `"`, `[` and `a`."""
+    packages = container_image.ironbank_packages(
+        ["ca-certificates"], ["libc.so.6", "libbz2.so.1.0"]
+    )
+
+    assert packages == ["bzip2-libs", "ca-certificates"]
+    assert all(len(name) > 1 for name in packages)
+
+
+def test_the_iron_bank_build_supports_fallback_digest_and_registry_cache() -> None:
+    script = (_REPO_ROOT / "tools" / "bin" / "build-container").read_text(encoding="utf-8")
+
+    assert "--ironbank" in script
+    assert "USE_FALLBACK_UBI" in script
+    assert "IRONBANK_TOKEN" in script, "a CI build without the token must fall back"
+    assert "BASE_IMAGE_DIGEST" in script
+    assert "--cache-from" in script and "--cache-to" in script
+    assert "type=registry,ref=" in script
+    assert "prepare-ironbank" in script
+    # No payload is re-derived in the image build: build-runtime owns it.
+    assert "curl " not in script
+    assert "sha256sum" not in script
+
+
+def test_the_iron_bank_smoke_test_proves_rootless_read_only_execution() -> None:
+    script = (_REPO_ROOT / "tools" / "bin" / "local-invoke-container").read_text(encoding="utf-8")
+
+    assert "--ironbank" in script
+    assert "--read-only" in script
+    assert "--tmpfs /tmp:rw,exec,size=512m,uid=1001,gid=1001" in script
+    assert "--user 1001:1001" in script
+    # RIE comes from the host cache, never from the production image.
+    assert ":/tmp/aws-lambda-rie:ro" in script
+    # The emulator is never baked into the image the build produces.
+    assert "build-container" in script
+
+
+def test_local_invoke_never_bakes_the_emulator_into_the_image() -> None:
+    for name in ("tools/docker/Dockerfile.ironbank", "tools/runtime_lib/container_image.py"):
+        text = (_REPO_ROOT / name).read_text(encoding="utf-8")
+        assert "aws-lambda-rie" not in text, name
+
+
+def test_build_runtime_normalizes_stig_permissions_before_zipping() -> None:
+    script = (_REPO_ROOT / "tools" / "bin" / "build-runtime").read_text(encoding="utf-8")
+
+    chmod_index = script.index("chmod -R a+rX")
+    zip_index = script.index('zip -qrX "${PACKAGE_PATH}"')
+    assert chmod_index < zip_index, "permissions must be normalized before the payload is zipped"
+    assert 'chmod a+rx "${LAYER_ROOT}/${BOOTSTRAP_OUTPUT}"' in script
+
+
+def test_the_build_stats_sidecar_carries_the_exact_byte_budget(tmp_path: Path) -> None:
+    """The gate is a byte comparison, so the sidecar has to state the bytes —
+    not just a rounded percentage."""
+    package = tmp_path / "pkg.zip"
+    with zipfile.ZipFile(package, "w") as archive:
+        archive.writestr("bootstrap", b"x" * 1024)
+
+    stats_out = tmp_path / "build-stats.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "tools" / "runtime_lib" / "package_size.py"),
+            "check",
+            "--runtime", "pypy311",
+            "--arch", "x86_64",
+            "--package", str(package),
+            "--stats-out", str(stats_out),
+            "--publishable", "true",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+    stats = json.loads(stats_out.read_text(encoding="utf-8"))
+    assert stats["unzipped_bytes"] == 1024
+    assert stats["headroom_bytes"] == 262144000 - 1024
+    assert stats["percent_of_quota"] == 0.0
+    assert stats["level"] == "ok"
+    assert stats["layer_publishable"] is True
+
+
+def test_the_size_row_states_the_target_artifacts(tmp_path: Path) -> None:
+    env = runtime_manifest.runtime_env("bun13", arch="x86_64")
+    artifact_dir = Path(env["ARTIFACT_DIR"])
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    stats = artifact_dir / "build-stats.json"
+    summary = tmp_path / "summary.md"
+    reporter = _REPO_ROOT / ".github" / "actions" / "build-and-audit-runtime" / "report-package-size.sh"
+
+    def run(payload: dict) -> str:
+        stats.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        if summary.exists():
+            summary.unlink()
+        subprocess.run(
+            ["bash", str(reporter), "bun13", "x86_64"],
+            check=True,
+            cwd=_REPO_ROOT,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "GITHUB_STEP_SUMMARY": str(summary)},
+        )
+        return summary.read_text(encoding="utf-8")
+
+    try:
+        row = run({
+            "runtime_id": "bun13", "arch": "x86_64", "zipped_bytes": 35979139,
+            "unzipped_bytes": 92754962, "max_unzipped_bytes": 262144000,
+            "warn_unzipped_bytes": 209715200, "layer_publishable": True,
+        })
+        assert "| Targets |" in row
+        assert "Layer + Iron Bank Container" in row
+
+        row = run({
+            "runtime_id": "bun13", "arch": "x86_64", "zipped_bytes": 35979139,
+            "unzipped_bytes": 92754962, "max_unzipped_bytes": 262144000,
+            "warn_unzipped_bytes": 209715200, "layer_publishable": False,
+        })
+        assert "Iron Bank Container Only" in row
+    finally:
+        stats.unlink()
+
+
+def test_the_soci_conversion_filters_the_pull_to_one_architecture() -> None:
+    """buildx exports provenance attestations by default, so the pushed per-arch
+    tag is an index holding an `unknown/unknown` manifest; `soci convert` refuses
+    it. Filtering the oras pull drops that entry."""
+    script = (_REPO_ROOT / "tools" / "bin" / "publish-soci-index").read_text(encoding="utf-8")
+
+    assert '--platform "linux/${CONTAINER_ARCH}"' in script
+
+
+# --- Buildx registry caching ------------------------------------------------------
+
+
+def test_buildx_registry_caching_is_wired_end_to_end() -> None:
+    action = _action("build-and-audit-runtime")
+    steps = {step.get("name"): step for step in action["runs"]["steps"]}
+
+    setup = steps["Set up Docker Buildx"]
+    assert setup["uses"] == "docker/setup-buildx-action@v3"
+    assert setup["with"]["driver"] == "docker-container"
+
+    distroless = steps["Build distroless container image"]["run"]
+    assert "--cache-from" in distroless
+    # Only the default branch writes the cache: a PR's cache lands on a ref
+    # nothing else can read.
+    assert "refs/heads/${{ github.event.repository.default_branch }}" in distroless
+    assert "--cache-to" in distroless and "mode=max" in distroless
+    assert "--cache-from" in steps["Build the debug image"]["run"]
+    assert "--cache-from" in steps["Build the Iron Bank image"]["run"]
+
+
+# --- Two-tier CI gating -----------------------------------------------------------
+
+
+def test_ci_has_a_fast_tier_and_a_ready_to_merge_tier() -> None:
+    triggers = _triggers("ci.yml")
+
+    assert "workflow_dispatch" in triggers, "an explicit full run must stay possible"
+    pull_request = triggers["pull_request"]
+    injected = set(pull_request["types"])
+    assert {"opened", "synchronize", "reopened"} <= injected
+    assert {"labeled", "unlabeled", "ready_for_review"} <= injected
+
+    call = _call_site("ci.yml", "prepare-matrix", _MATRIX_ACTION)
+    expression = call["changed-only"]
+    assert "github.event_name == 'pull_request'" in expression
+    assert "github.event.pull_request.draft == true" in expression
+    assert "ready-to-merge" in expression
+
+
+def test_the_matrix_action_can_narrow_to_changed_runtimes() -> None:
+    action = _action("runtime-matrix")
+
+    assert action["inputs"]["changed-only"]["default"] == "false"
+    generate = next(
+        step for step in action["runs"]["steps"] if step.get("id") == "matrix"
+    )["run"]
+
+    assert "git diff --name-only" in generate
+    assert "'^runtimes/'" in generate
+    # A tooling-only change still proves the shared plumbing builds.
+    assert "pypy311" in generate and "canary" in generate.lower()
+
+
+def test_the_matrix_generator_accepts_several_runtimes_at_once() -> None:
+    """The fast tier passes the ids whose files changed, which is a list."""
+    output = subprocess.run(
+        [
+            sys.executable,
+            str(_REPO_ROOT / "tools" / "runtime_lib" / "runtime_manifest.py"),
+            "matrix", "--runtime", "pypy311,bun13", "--arch", "x86_64",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        cwd=_REPO_ROOT,
+    ).stdout
+    entries = json.loads(output)["include"]
+
+    assert {entry["runtime"] for entry in entries} == {"pypy311", "bun13"}
+    assert all(entry["arch"] == "x86_64" for entry in entries)
+
+
+def test_a_forgotten_placeholder_or_unknown_runtime_fails_loudly() -> None:
+    with pytest.raises(subprocess.CalledProcessError) as excinfo:
+        subprocess.run(
+            [
+                sys.executable,
+                str(_REPO_ROOT / "tools" / "runtime_lib" / "runtime_manifest.py"),
+                "matrix", "--runtime", "nope", "--arch", "x86_64",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=_REPO_ROOT,
+        )
+    assert "Unknown runtime" in excinfo.value.stderr
+
+
+# --- Rootless bootstrap contract --------------------------------------------------
+#
+# PID 1 has to forward SIGTERM, so every shell bootstrap replaces itself with the
+# runtime (`exec`), leaving no intermediate shell. The compiled launcher does the
+# same without a shell, and both resolve the handler from _HANDLER or argv[1].
+
+
+def test_every_shell_bootstrap_execs_instead_of_forking() -> None:
+    bootstraps = sorted((_REPO_ROOT / "runtimes").glob("*/bootstrap/bootstrap"))
+    assert bootstraps, "the shell bootstrap families are part of the deliverable"
+
+    for path in bootstraps:
+        text = path.read_text(encoding="utf-8")
+        assert text.splitlines()[0].startswith("#!"), path
+        # Join backslash continuations first: the Deno bootstrap spans several
+        # lines with `exec` at the start and its arguments below.
+        joined = text.replace("\\\n", " ")
+        statements = [
+            line.strip()
+            for line in joined.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        # The last statement must be the exec: a bootstrap that runs the runtime
+        # as a child leaves a shell holding PID 1, which never forwards the Lambda
+        # shutdown signal.
+        assert statements[-1].startswith("exec "), f"{path}: last statement is {statements[-1]!r}"
+
+
+def test_the_runtime_api_headers_are_read_case_insensitively() -> None:
+    """Lambda's Runtime API sends `Lambda-Runtime-Aws-Request-Id`; the payloads
+    name it in lower case. Both must resolve to the same header."""
+    for path in sorted((_REPO_ROOT / "runtimes").glob("*/bootstrap/bootstrap.py3")):
+        text = path.read_text(encoding="utf-8")
+        assert "getheader(" in text, path
+        assert "Lambda-Runtime-Aws-Request-Id" in text, path
+
+    for helper in ("bun13", "bun14", "deno29"):
+        text = (
+            _REPO_ROOT / "runtimes" / helper / "helpers" / f"lambda_runtime_{helper.rstrip('0123456789')}" / "runtime.ts"
+        ).read_text(encoding="utf-8")
+        assert 'headers.get("lambda-runtime-aws-request-id")' in text, helper

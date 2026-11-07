@@ -14,11 +14,13 @@ set -euo pipefail
 source "$(dirname "$0")/_common.sh"
 
 variant=standard
+ironbank=0
 positional=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --variant) variant=$2; shift 2 ;;
         --debug) variant=debug; shift ;;
+        --ironbank) ironbank=1; shift ;;
         -*) echo "Unknown option: $1" >&2; exit 2 ;;
         *) positional+=("$1"); shift ;;
     esac
@@ -28,8 +30,17 @@ runtime_id=$(common::require_runtime_id "${positional[0]:-}")
 arch=$(common::require_arch "${positional[1]:-}")
 common::load_runtime_env "${runtime_id}" "${arch}" "${variant}"
 
-if ! docker image inspect "${CONTAINER_LOCAL_IMAGE}" >/dev/null 2>&1; then
-    echo "${CONTAINER_LOCAL_IMAGE} is not built; run build-container first" >&2
+# The Iron Bank image is a second artifact with its own tag suffix, so it is
+# pushed beside the distroless one rather than over it.
+local_image="${CONTAINER_LOCAL_IMAGE}"
+tag_suffix="${CONTAINER_TAG_SUFFIX}"
+if (( ironbank )); then
+    local_image="${CONTAINER_IRONBANK_LOCAL_IMAGE}"
+    tag_suffix="-ironbank"
+fi
+
+if ! docker image inspect "${local_image}" >/dev/null 2>&1; then
+    echo "${local_image} is not built; run build-container first" >&2
     exit 1
 fi
 
@@ -37,14 +48,14 @@ mapfile -t registries < <(python3 -c 'import json,sys
 for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIES_OVERRIDE:-${CONTAINER_REGISTRIES}}")
 
 for registry in "${registries[@]}"; do
-    reference="${registry}/${RUNTIME_ID}:${CONTAINER_TAG}-${CONTAINER_ARCH}${CONTAINER_TAG_SUFFIX}"
-    docker tag "${CONTAINER_LOCAL_IMAGE}" "${reference}"
+    reference="${registry}/${RUNTIME_ID}:${CONTAINER_TAG}-${CONTAINER_ARCH}${tag_suffix}"
+    docker tag "${local_image}" "${reference}"
     docker push "${reference}"
     digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "${reference}" 2>/dev/null || true)
     echo "Pushed ${reference}${digest:+ (${digest})}"
     if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         {
-            echo "#### Container pushed: ${runtime_id} (${arch}, ${CONTAINER_VARIANT})"
+            echo "#### Container pushed: ${runtime_id} (${arch}, ${CONTAINER_VARIANT}${ironbank:+, ironbank})"
             echo
             echo "- \`${reference}\`"
             echo
