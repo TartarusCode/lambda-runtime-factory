@@ -66,42 +66,55 @@ syft "docker:${CONTAINER_LOCAL_IMAGE}" --scope all-layers -q \
 # --- the SBOM must describe the image we ship ----------------------------------
 # An SBOM with only the payload, or only the base, describes a machine that is not
 # this image: the first hides the OS CVEs, the second hides the runtime.
-python3 - "${stem}.spdx.json" "${runtime_id}" <<'PYEOF'
+python3 - "${stem}.spdx.json" "${runtime_id}" "${stem}.sbom-stats.json" <<'PYEOF'
 import json
 import sys
 
-path, runtime_id = sys.argv[1:3]
-doc = json.load(open(path, encoding="utf-8"))
+sbom_path, runtime_id, stats_path = sys.argv[1:4]
+doc = json.load(open(sbom_path, encoding="utf-8"))
 packages = doc.get("packages") or []
 
-def named(package):
-    return (package.get("name") or "").lower()
-
-rpmish = [
-    package for package in packages
-    if any("rpm" in str(value).lower() for value in (package.get("externalRefs") or [{}])[0].values())
-]
-base_hits = {name: False for name in ("glibc", "zlib", "openssl-libs", "ca-certificates")}
-for package in packages:
-    name = named(package)
-    for wanted in base_hits:
-        if name == wanted or name.startswith(wanted + "-"):
-            base_hits[wanted] = True
-payload_hits = [
-    package for package in packages
-    if any("opt/" in str(location) for location in (package.get("sourceInfo") or "").split())
-    or any("opt/" in str(location) for location in (package.get("downloadLocation") or "").split())
-]
-
 if not packages:
-    sys.exit(f"{path}: the SBOM has no packages at all")
-missing = [name for name, found in base_hits.items() if not found]
+    sys.exit(f"{sbom_path}: the SBOM has no packages at all")
+
+def purls(package):
+    return [
+        ref.get("referenceLocator", "")
+        for ref in (package.get("externalRefs") or [])
+        if str(ref.get("referenceType", "")).lower() == "purl"
+    ]
+
+rpm_packages = [p for p in packages if any(loc.startswith("pkg:rpm/") for loc in purls(p))]
+runtime_packages = [p for p in packages if p not in rpm_packages]
+
+# The base must be visible by name: without it the SBOM describes only the
+# payload, so every OS CVE would be missing from the report.
+base_names = ("glibc", "zlib", "openssl-libs", "ca-certificates")
+seen = {name: False for name in base_names}
+for package in packages:
+    label = (package.get("name") or "").lower()
+    for wanted in base_names:
+        if label == wanted or label.startswith(wanted + "-"):
+            seen[wanted] = True
+missing = [name for name, found in seen.items() if not found]
 if missing:
     sys.exit(
-        f"{path}: no UBI9 base packages ({', '.join(missing)}) — the RPM database did "
-        "not reach Syft, so this SBOM cannot carry RHEL backport lineage"
+        f"{sbom_path}: no UBI9 base packages ({', '.join(missing)}) — the RPM database "
+        "did not reach Syft, so this SBOM cannot carry RHEL backport lineage"
     )
-print(f"SBOM: {len(packages)} packages, {len(rpmish)} RPM-sourced, base present")
+
+if not runtime_packages:
+    sys.exit(f"{sbom_path}: no runtime packages — the SBOM describes the base but not /opt")
+
+with open(stats_path, "w", encoding="utf-8") as handle:
+    json.dump(
+        {"total": len(packages), "rpm": len(rpm_packages), "runtime": len(runtime_packages)},
+        handle,
+        indent=2,
+        sort_keys=True,
+    )
+    handle.write("\n")
+print(f"SBOM: {len(packages)} packages ({len(rpm_packages)} rpm, {len(runtime_packages)} runtime), base present")
 PYEOF
 
 # --- vulnerability report, produced from the SPDX we publish --------------------
@@ -120,6 +133,10 @@ grype_status=$?
 set -e
 
 if (( grype_status != 0 )); then
+    if [[ ! -s "${stem}.grype.json" ]]; then
+        echo "${runtime_id} (${arch}): Grype failed without writing a report; see its output above" >&2
+        exit "${grype_status}"
+    fi
     echo "${runtime_id} (${arch}): Grype found a fixable High or Critical CVE" >&2
     python3 - "${stem}.grype.json" <<'PYEOF'
 import json
@@ -198,12 +215,15 @@ provenance = {
     "base_image_ref": container_record.get("base_image_ref", ""),
     "base_image_digest": container_record.get("base_image_digest", ""),
     "image_digest": docker_format("{{.Id}}", image),
-    "unpacked_size_bytes": container_record.get("unpacked_bytes", 0),
+    "unpacked_size_bytes": container_record.get("unpacked_size_bytes", container_record.get("unpacked_bytes", 0)),
     "stig_verification": {
         "user": container_record.get("user", ""),
         "package_managers_removed": container_record.get("package_managers_removed", False),
         "rpm_db_present": container_record.get("rpm_db_present", False),
         "read_only_rootfs_verified": container_record.get("read_only_rootfs_verified", False),
+    },
+    "sbom": {
+        "packages": load(stem + ".sbom-stats.json") if os.path.exists(stem + ".sbom-stats.json") else {},
     },
     "sbom_sha256": {
         "spdx": sha256(stem + ".spdx.json") if os.path.exists(stem + ".spdx.json") else "",

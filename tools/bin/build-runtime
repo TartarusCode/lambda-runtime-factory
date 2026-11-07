@@ -419,9 +419,9 @@ install_native_bootstrap
 # Before the audit and the zip, so both see exactly what ships.
 slim_layer
 
-if [[ "${BUILD_BEST_EFFORT_AUDIT:-1}" == "1" ]]; then
-    RUNTIME_BUILD_IN_PROGRESS=1 bash "$(common::repo_root)/tools/bin/audit-runtime" --best-effort "${runtime_id}"
-fi
+# No vulnerability scan here any more: the authoritative scan runs against the
+# image (generate-compliance-artifacts), because the RPM database is half of what
+# makes a finding mean anything.
 
 # --- STIG rootless permissions --------------------------------------------------
 #

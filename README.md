@@ -19,7 +19,7 @@ layer — both from the same payload**:
 - Uploads are content-addressed, so a layer version always points at the exact bytes it was built
   from, and layers are public (`lambda:GetLayerVersion` to `*`).
 - **Five runtimes ship no layer**: `go126`, `go127`, `rust194`, `rust198` and `rust199` carry a
-  whole upstream toolchain (`layer_publishable: false`). They are still built and scanned, and they
+  whole upstream toolchain. They are still built and scanned like every other runtime, and they
   publish as images. See [DELIVERY.md](DELIVERY.md).
 - **The base is Iron Bank UBI9** — `registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal`, the
   DoD-hardened minimal userland, for every runtime. Each image runs as non-root `USER 1001:1001` on a
@@ -127,7 +127,7 @@ the ids the current matrix builds.
 runtimes/<runtime-id>/   runtime.json, bootstrap/, helpers/, checksums/, examples/
 tools/bin/               build, audit, upload, publish, local-test entrypoints
 tools/runtime_lib/       family defaults, manifest resolution, bump tooling, tests
-tools/docker/            Dockerfile.ironbank — the canonical Iron Bank stage layout
+tools/docker/            Dockerfile — the canonical Iron Bank stage layout
 certs/                   extra root CAs baked into the Iron Bank images (*.crt)
 .github/workflows/       CI, release, audit and weekly version-bump pipelines
 .github/actions/         shared composite actions: matrix, build environment, build + audit

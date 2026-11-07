@@ -24,6 +24,10 @@ permissions:
 
 env:
   GRYPE_VERSION: v0.98.0
+  # Supply-chain tooling, pinned so a release can be reproduced.
+  SYFT_VERSION: v1.57.0
+  COSIGN_VERSION: v3.1.4
+  ORAS_VERSION: v1.3.6
   # The container smoke test runs the same pinned emulator everywhere.
   AWS_LAMBDA_RIE_VERSION: v1.38
 
@@ -184,33 +188,15 @@ jobs:
           # including a scan of the image and a rootless, read-only smoke test. A
           # container regression cannot reach a release unseen.
           container: "true"
-      - name: Install SAM CLI
-        if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-          cache: pip
-          cache-dependency-path: requirements-ci.txt
-      - name: Install SAM CLI dependencies
-        if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke
-        run: pip install -r requirements-ci.txt
-      - name: Warm SAM build image
-        if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke
-        # SAM resolves an arch-suffixed tag (public.ecr.aws/sam/build-provided.al2023:
-        # latest-<arch>), and that is a different image from the multi-arch `latest`
-        # list: on x86 they share 1 of 15 layers, so pulling bare `:latest` warms
-        # 734MB SAM never uses and leaves it to fetch ~695MB of its own.
-        run: docker pull "public.ecr.aws/sam/build-provided.al2023:latest-${{ matrix.arch }}"
-      - name: Build local SAM example
-        if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke
-        run: make local-build RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
-      - name: Invoke local SAM example
-        if: matrix.arch == 'x86_64' && !matrix.skip_local_invoke
-        run: make local-invoke RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
-      - name: Upload runtime artifact
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+      - name: Upload the compliance bundle
+        # Auditors download this without a registry client: SBOMs, CVE report and
+        # provenance for the exact bytes this cell built.
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.runtime }}-${{ matrix.arch }}-artifact
-          path: ${{ runner.temp }}/lambda-runtime-monorepo/${{ matrix.runtime }}/${{ matrix.arch }}/artifacts/*.zip
-          retention-days: 7
+          name: ${{ matrix.runtime }}-${{ matrix.arch }}-compliance
+          path: |
+            ${{ runner.temp }}/lambda-runtime-monorepo/${{ matrix.runtime }}/${{ matrix.arch }}/artifacts/compliance/*
+            ${{ runner.temp }}/lambda-runtime-monorepo/${{ matrix.runtime }}/${{ matrix.arch }}/artifacts/container.json
+          if-no-files-found: warn
+          retention-days: 30

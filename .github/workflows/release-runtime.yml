@@ -59,6 +59,10 @@ permissions:
 
 env:
   GRYPE_VERSION: v0.98.0
+  # Supply-chain tooling, pinned so a release can be reproduced.
+  SYFT_VERSION: v1.57.0
+  COSIGN_VERSION: v3.1.4
+  ORAS_VERSION: v1.3.6
   # The container smoke test runs the same pinned emulator everywhere.
   AWS_LAMBDA_RIE_VERSION: v1.38
   # The manifest names the ECR Public alias the project publishes under; a custom
@@ -86,12 +90,6 @@ jobs:
         with:
           runtime: ${{ github.event.inputs.runtime || 'all' }}
           arch: ${{ github.event.inputs.arch || 'all' }}
-          # A deployment package is capped at 250 MB unzipped — the function plus
-          # all of its layers together — so the runtimes flagged
-          # layer_publishable: false are built and audited by CI but cannot be
-          # delivered as a layer. Publishing one fails every release on an AWS
-          # quota; CI keeps covering them so nothing rots.
-          layer-publishable-only: "true"
       - id: containers
         uses: ./.github/actions/runtime-matrix
         with:
@@ -156,7 +154,7 @@ jobs:
         run: |
           count=$(python3 -c 'import json,os; print(len(json.loads(os.environ["MATRIX"])["include"]))')
           if [[ "${count}" -eq 0 ]]; then
-            echo "::error::the publish matrix is empty — every requested runtime is flagged layer_publishable: false or deprecated, so there is nothing to publish."
+            echo "::error::the publish matrix is empty — every requested runtime is deprecated, so there is nothing to publish."
             exit 1
           fi
 
@@ -193,89 +191,6 @@ jobs:
       - name: Confirm the identity
         run: aws sts get-caller-identity
 
-  publish:
-    needs:
-      - prepare-matrix
-      - grype-db
-      - preflight
-    # Gating on a repository environment lets required reviewers approve a
-    # production publish; add them under Settings -> Environments -> release.
-    environment: release
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
-    env:
-      SAM_CLI_TELEMETRY: "0"
-      BUILD_BEST_EFFORT_AUDIT: "0"
-      # A tag push carries no inputs, so an absent `publicize` must mean "public":
-      # the layers are advertised as public in the README, and comparing the input
-      # against 'true' silently downgraded a tagged release to a private layer.
-      # Only an explicit dispatch may opt out.
-      PUBLICIZE: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.publicize == 'true' }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-      - uses: ./.github/actions/runtime-build-env
-        id: build-env
-        with:
-          runtime: ${{ matrix.runtime }}
-          arch: ${{ matrix.arch }}
-          # Publishing must always be gated on a fresh scan.
-          grype: always
-          # Cells only read the week's database; the grype-db job writes it.
-          db-refresh: "false"
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ secrets.AWS_RELEASE_ROLE_ARN }}
-          aws-region: us-east-1
-      - name: Build and audit runtime package
-        uses: ./.github/actions/build-and-audit-runtime
-        with:
-          runtime: ${{ matrix.runtime }}
-          arch: ${{ matrix.arch }}
-          # A hit proves the archive, checksums, bootstrap, helpers and build
-          # script are all unchanged, so the cached package is byte-for-byte the
-          # one CI built and validated for this commit. The scan below still runs
-          # unconditionally, because a publish must never skip it.
-          skip-build: ${{ steps.build-env.outputs.package-cache-hit == 'true' }}
-          audit: "true"
-          # This cell publishes the layer; the image is built, scanned, smoke
-          # tested and pushed by publish-containers, so building it here would
-          # duplicate work without changing what is published.
-          container: "false"
-      # Everything below writes to S3 or creates a layer version; a dry run stops
-      # here, having already exercised the credential preflight, the package cache
-      # and the scan.
-      - name: Upload runtime artifact to S3
-        if: ${{ github.event.inputs.dry_run != 'true' }}
-        run: make upload RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
-      - name: Publish Lambda layer
-        if: ${{ github.event.inputs.dry_run != 'true' && env.PUBLICIZE != 'true' }}
-        run: make publish RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
-      - name: Publish and publicize Lambda layer
-        if: ${{ github.event.inputs.dry_run != 'true' && env.PUBLICIZE == 'true' }}
-        run: make publicize RUNTIME=${{ matrix.runtime }} ARCH=${{ matrix.arch }}
-      - name: Summarize latest layer arns
-        if: ${{ github.event.inputs.dry_run != 'true' }}
-        run: |
-          {
-            echo "### ${{ matrix.runtime }} (${{ matrix.arch }})"
-            bash tools/bin/latest-runtime "${{ matrix.runtime }}" "${{ matrix.arch }}"
-            echo
-          } >> "${GITHUB_STEP_SUMMARY}"
-      - name: Report the dry run
-        if: ${{ github.event.inputs.dry_run == 'true' }}
-        run: |
-          echo "::notice::dry run: ${{ matrix.runtime }} (${{ matrix.arch }}) was built and scanned; no S3 object was written and no layer version was created."
-
-  # Containers are a separate job from the layer publish on purpose: they cover
-  # every runtime (the layer matrix excludes the toolchains), they push to GHCR
-  # rather than S3/AWS, and a dry run still exercises the whole path.
   publish-containers:
     needs:
       - prepare-matrix
@@ -367,7 +282,7 @@ jobs:
           cache_ref=$(grep '^CONTAINER_CACHE_REF=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
           timeout 900 bash tools/bin/build-container "${{ matrix.runtime }}" "${{ matrix.arch }}" \
             --cache-from "${cache_ref}"
-          bash tools/bin/audit-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
+          bash tools/bin/generate-compliance-artifacts "${{ matrix.runtime }}" "${{ matrix.arch }}"
           timeout 600 bash tools/bin/local-invoke-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
       - name: Check the image contract
         run: bash tools/bin/check-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
@@ -384,6 +299,25 @@ jobs:
           SOCI_VERSION: v0.16.1
           ORAS_VERSION: v1.3.6
         run: bash tools/bin/publish-soci-index "${{ matrix.runtime }}" "${{ matrix.arch }}" --push
+      - name: Sign and attest the image
+        # Keyless: the OIDC token this job already has becomes a Fulcio
+        # certificate, and the SBOMs, CVE report and provenance are attached to
+        # the digest that was just pushed.
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: bash tools/bin/attest-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
+      - name: Upload the compliance bundle
+        # The same files, without a registry client: this is what an auditor
+        # downloads from the release run.
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.runtime }}-${{ matrix.arch }}-compliance
+          path: |
+            ${{ runner.temp }}/lambda-runtime-monorepo/${{ matrix.runtime }}/${{ matrix.arch }}/artifacts/compliance/*
+            ${{ runner.temp }}/lambda-runtime-monorepo/${{ matrix.runtime }}/${{ matrix.arch }}/artifacts/container.json
+          if-no-files-found: warn
+          retention-days: 90
+
       - name: Report the dry run
         if: ${{ github.event.inputs.dry_run == 'true' }}
         run: |
@@ -450,11 +384,10 @@ jobs:
   record-release:
     needs:
       - prepare-matrix
-      - publish
-      # The images are release artifacts too, so the record waits for the
+      # The images are the release artifacts, so the record waits for the
       # multi-arch tags to exist before it names them.
       - merge-containers
-    if: ${{ always() && needs.publish.result == 'success' && github.event.inputs.dry_run != 'true' }}
+    if: ${{ always() && needs.merge-containers.result == 'success' && github.event.inputs.dry_run != 'true' }}
     environment: release
     runs-on: ubuntu-26.04
     timeout-minutes: 15
@@ -473,7 +406,7 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_RELEASE_ROLE_ARN }}
           aws-region: us-east-1
-      - name: Collect the published layer arns
+      - name: Collect the published image tags
         env:
           MATRIX: ${{ needs.prepare-matrix.outputs.matrix }}
         run: |
@@ -485,16 +418,19 @@ jobs:
               print(cell["runtime"], cell["arch"])
           PY
           {
-            echo "## Published runtime layers"
+            echo "## Published runtime images"
             echo
             echo "Commit: \`${GITHUB_SHA}\`"
             echo
           } > "${RUNNER_TEMP}/release-notes.md"
           while read -r runtime arch; do
+            env_text=$(python3 tools/runtime_lib/runtime_manifest.py env \
+              --runtime "${runtime}" --arch "${arch}")
+            image=$(grep '^CONTAINER_IMAGE=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
+            tag=$(grep '^CONTAINER_TAG=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
             {
-              echo "### ${runtime} (${arch})"
-              bash tools/bin/latest-runtime "${runtime}" "${arch}"
-              echo
+              echo "- \`${image}:${tag}-${arch}\`"
+              echo "- \`${image}:${tag}-${arch}-soci\` (when SOCI is enabled)"
             } >> "${RUNNER_TEMP}/release-notes.md"
           done < "${RUNNER_TEMP}/cells.txt"
           cat "${RUNNER_TEMP}/release-notes.md" >> "${GITHUB_STEP_SUMMARY}"

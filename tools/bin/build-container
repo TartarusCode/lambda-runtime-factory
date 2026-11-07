@@ -4,7 +4,7 @@
 # The image is generated from the same ${LAYER_ROOT} the zip layer ships, so the
 # two artifacts cannot drift. There is one base for every runtime: the
 # DoD-hardened Iron Bank UBI9-minimal, rendered from
-# tools/docker/Dockerfile.ironbank. It runs as UID 1001, is read-only at run time
+# tools/docker/Dockerfile. It runs as UID 1001, is read-only at run time
 # with /tmp as the only writable path, and carries no package manager.
 #
 #   build-container <runtime_id> <arch> [--push] [--force]
@@ -140,6 +140,48 @@ container_image_bytes=$(python3 "$(common::repo_root)/tools/runtime_lib/containe
     | awk '{ print $(NF-1) }')
 
 echo "${runtime_id} (${arch}): image ${image} holds ${container_image_bytes} bytes unpacked (summed from the exported rootfs)"
+# --- container.json --------------------------------------------------------------
+# One machine-readable record of what was built: the compliance generator turns it
+# into provenance, and the job summary reads it instead of re-inspecting the image.
+base_digest=$(docker buildx imagetools inspect "${base_image}" --format '{{json .Manifest}}' 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin).get("digest",""))' 2>/dev/null || true)
+image_digest=$(docker image inspect --format '{{.Id}}' "${image}")
+python3 - "${ARTIFACT_DIR}/container.json" \
+    "${runtime_id}" "${arch}" "${image}" "${image_digest}" \
+    "${base_image}" "${base_digest}" "${unpacked_bytes}" \
+    "${CONTAINER_USER}" "${CONTAINER_WORKDIR}" "${CONTAINER_ENTRYPOINT}" <<'PYEOF'
+import json
+import sys
+
+(path, runtime_id, arch, image_tag, image_digest,
+ base_image_ref, base_image_digest, unpacked_bytes,
+ user, workdir, entrypoint) = sys.argv[1:12]
+
+record = {
+    "runtime_id": runtime_id,
+    "arch": arch,
+    "image_tag": image_tag,
+    "image_digest": image_digest,
+    "base_image_ref": base_image_ref,
+    "base_image_digest": base_image_digest,
+    # Both spellings: the generator reads the directive's name, older callers read
+    # the shorter one.
+    "unpacked_size_bytes": int(unpacked_bytes),
+    "unpacked_bytes": int(unpacked_bytes),
+    "user": user,
+    "workdir": workdir,
+    "entrypoint": json.loads(entrypoint or "[]"),
+    # verify_image_layout already refused the build if either were untrue.
+    "package_managers_removed": True,
+    "rpm_db_present": True,
+    "read_only_rootfs_verified": False,  # set by local-invoke-container once it runs
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(record, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+print(f"Recorded {path}")
+PYEOF
+
 if (( push )); then
     bash "$(dirname "$0")/push-container" "${runtime_id}" "${arch}"
 fi

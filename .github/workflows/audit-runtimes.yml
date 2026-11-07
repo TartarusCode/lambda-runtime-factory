@@ -22,6 +22,10 @@ permissions:
 
 env:
   GRYPE_VERSION: v0.98.0
+  # Supply-chain tooling, pinned so a release can be reproduced.
+  SYFT_VERSION: v1.57.0
+  COSIGN_VERSION: v3.1.4
+  ORAS_VERSION: v1.3.6
 
 jobs:
   prepare-matrix:

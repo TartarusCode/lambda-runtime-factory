@@ -64,7 +64,19 @@ REPO_DEFAULTS: Dict[str, Any] = {
         # UBI9 packages installed with the base's own package manager for a
         # family's native dependencies. The payload's DT_NEEDED scan adds whatever
         # else the base does not ship; nothing is ever copied as a bare .so.
-        "packages": ["ca-certificates"],
+        # The floor every runtime image installs, before the payload's DT_NEEDED
+        # scan adds anything else. These are the libraries the interpreter and
+        # toolchain families actually need on a UBI9-minimal base, and installing
+        # them as RPMs is what keeps /var/lib/rpm able to attribute them.
+        "packages": [
+            "ca-certificates",
+            "zlib",
+            "libffi",
+            "expat",
+            "libxcrypt-compat",
+            "bzip2-libs",
+            "xz-libs",
+        ],
         # Sonames the payload needs that this base genuinely cannot provide. Empty
         # by default, because an unsatisfied soname is a defect and the build must
         # say so with the soname in the message. A family may declare one here —

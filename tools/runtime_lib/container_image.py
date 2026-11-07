@@ -13,7 +13,7 @@ makes a scanner report a patched library as vulnerable, and what leaves
 payload needs are installed as *packages* and RPM keeps owning the files.
 
 What the base does not give for free is handled in
-``tools/docker/Dockerfile.ironbank`` (a template this module renders per runtime):
+``tools/docker/Dockerfile`` (a template this module renders per runtime):
 the DoD/enterprise root CAs are injected and the trust store extracted, the payload
 is copied to ``/opt`` owned by the runtime UID, permissions are normalized with
 ``chmod -R a+rX``, and the package manager is removed again before the image ships.
@@ -43,7 +43,7 @@ ELF_MAGIC = b"\x7fELF"
 # @@...@@ placeholders carry the per-runtime environment, payload path and labels
 # from the manifest, so the STIG invariants live in one reviewable file while the
 # payload coordinates stay in the manifest.
-IRONBANK_TEMPLATE = Path(__file__).resolve().parents[1] / "docker" / "Dockerfile.ironbank"
+CONTAINER_TEMPLATE = Path(__file__).resolve().parents[1] / "docker" / "Dockerfile"
 
 # Sonames `registry1.dso.mil/.../ubi9-minimal` (and the Red Hat fallback, which
 # serves the same userland) already provides. Verified against the image itself; a
@@ -241,12 +241,12 @@ def render_dockerfile(
     """Render the canonical UBI9 template for one runtime.
 
     The stage layout, the CA injection, the STIG invariants and the entrypoint all
-    come from ``tools/docker/Dockerfile.ironbank``; only the payload path, the
+    come from ``tools/docker/Dockerfile``; only the payload path, the
     environment and the labels are substituted, so the two cannot drift. The
     entrypoint is deliberately not a placeholder: the STIG contract fixes it at
     ``/opt/bootstrap``, the one path every runtime family ships.
     """
-    template = IRONBANK_TEMPLATE.read_text(encoding="utf-8")
+    template = CONTAINER_TEMPLATE.read_text(encoding="utf-8")
 
     label_lines = "\n".join(
         f'LABEL {key}="{value}"' for key, value in sorted((labels or {}).items())
@@ -265,7 +265,7 @@ def render_dockerfile(
     leftover = re.findall(r"@@[A-Z_]+@@", rendered)
     if leftover:
         raise ContainerError(
-            f"{IRONBANK_TEMPLATE.name}: unsubstituted placeholders {sorted(set(leftover))}"
+            f"{CONTAINER_TEMPLATE.name}: unsubstituted placeholders {sorted(set(leftover))}"
         )
     return rendered
 
@@ -354,6 +354,10 @@ def prepare(runtime_id: str, arch: str, *, force: bool = False) -> Dict[str, Any
         "org.opencontainers.image.source": "https://github.com/TartarusCode/lambda-runtime-factory",
         "org.opencontainers.image.version": env["CONTAINER_TAG"],
         "org.opencontainers.image.licenses": "Apache-2.0",
+        "org.opencontainers.image.vendor": "TartarusCode",
+        # The base this image was built on, named in the label set so a manifest
+        # inspection answers the compliance question without pulling layers.
+        "mil.dso.ironbank.os-type": "ubi9-minimal",
         "com.tartaruscode.lambda.runtime": runtime_id,
         "com.tartaruscode.lambda.arch": env["CONTAINER_ARCH"],
     }

@@ -62,9 +62,11 @@ for reference in "${references[@]}"; do
     echo "Signing ${reference}"
     cosign "${sign_args[@]}" "${reference}"
 
-    # The SBOM is attached in both formats because consumers disagree about which
-    # one they ingest; `cosign download sbom` returns the SPDX document.
-    cosign attach sbom --sbom "${stem}.spdx.json" --type spdxjson "${reference}"
+    # `oras attach` for every artifact rather than cosign's per-type subcommands:
+    # the media type travels with the blob, so `oras discover` lists the whole set
+    # and a consumer picks the format it ingests.
+    oras attach --artifact-type application/spdx+json \
+        "${reference}" "${stem}.spdx.json:application/spdx+json" >/dev/null
     oras attach --artifact-type application/vnd.cyclonedx+json \
         "${reference}" "${stem}.cdx.json:application/vnd.cyclonedx+json" >/dev/null
     oras attach --artifact-type application/vnd.grype.report.v1+json \

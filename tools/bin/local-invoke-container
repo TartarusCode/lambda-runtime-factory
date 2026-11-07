@@ -30,6 +30,26 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+mark_read_only_verified() {
+    # The smoke test is the only proof that the STIG runtime contract actually
+    # holds, so the fact is written where the provenance manifest can cite it
+    # instead of being asserted by the Dockerfile.
+    local record="${ARTIFACT_DIR}/container.json"
+    [[ -f "${record}" ]] || return 0
+    python3 - "${record}" <<'PYEOF'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    record = json.load(handle)
+record["read_only_rootfs_verified"] = True
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(record, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PYEOF
+}
+
 runtime_id=$(common::require_runtime_id "${positional[0]:-}")
 arch=$(common::require_arch "${positional[1]:-}")
 common::load_runtime_env "${runtime_id}" "${arch}"
@@ -95,7 +115,9 @@ PY
         echo "${runtime_id} (${arch}): the toolchain did not report version ${DISTRIBUTION_VERSION}" >&2
         exit 1
     fi
-    echo "Container smoke test passed for ${runtime_id} (${arch})"
+    mark_read_only_verified
+    mark_read_only_verified
+echo "Container smoke test passed for ${runtime_id} (${arch})"
     exit 0
 fi
 

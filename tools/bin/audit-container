@@ -1,8 +1,8 @@
 #!/bin/bash
 # Scan a runtime's image with Grype.
 #
-# The payload scan (audit-runtime) covers the runtime bytes; this covers the image
-# as it ships — base OS packages included — so a CVE in the base's glibc, OpenSSL
+# generate-compliance-artifacts is the authoritative scan: it reads the SBOM of
+# the image as it ships — base OS packages included — so a CVE in the base's glibc, OpenSSL
 # or zlib cannot slip through just because the payload is clean. Same policy as the
 # payload scan: high and above, fixed only.
 #

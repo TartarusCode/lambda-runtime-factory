@@ -139,6 +139,35 @@ runs:
 
     # Skipped when the week's entry already exists: the entry is immutable, so the
     # refresh would be discarded at the end of the job.
+    - name: Cache Syft, Cosign and Oras
+      uses: actions/cache@v6
+      with:
+        path: ${{ runner.temp }}/compliance-tools
+        key: compliance-tools-${{ runner.os }}-${{ runner.arch }}-${{ env.SYFT_VERSION }}-${{ env.COSIGN_VERSION }}-${{ env.ORAS_VERSION }}
+
+    - name: Install Syft, Cosign and Oras
+      # The compliance bundle needs a cataloguer (Syft), a signer (Cosign) and an
+      # artifact mover (Oras). Cached by pinned version so a matrix cell does not
+      # pay for three downloads, and pinned at all so a release is reproducible.
+      shell: bash
+      env:
+        COMPLIANCE_TOOL_DIR: ${{ runner.temp }}/compliance-tools
+      run: |
+        set -euo pipefail
+        mkdir -p "${COMPLIANCE_TOOL_DIR}"
+        if [[ -x "${COMPLIANCE_TOOL_DIR}/syft" && -x "${COMPLIANCE_TOOL_DIR}/cosign" && -x "${COMPLIANCE_TOOL_DIR}/oras" ]]; then
+          echo "Compliance tooling restored from cache"
+        else
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b "${COMPLIANCE_TOOL_DIR}" "${SYFT_VERSION}"
+          curl -sSfL -o "${COMPLIANCE_TOOL_DIR}/cosign" \
+            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64"
+          curl -sSfL "https://github.com/oras-project/oras/releases/download/${ORAS_VERSION}/oras_${ORAS_VERSION#v}_linux_amd64.tar.gz" \
+            | tar -xz -C "${COMPLIANCE_TOOL_DIR}" oras
+          chmod +x "${COMPLIANCE_TOOL_DIR}/cosign" "${COMPLIANCE_TOOL_DIR}/oras"
+        fi
+        echo "${COMPLIANCE_TOOL_DIR}" >> "${GITHUB_PATH}"
+
     - name: Update vulnerability database
       id: dbupdate
       # Only the default branch may write the shared entry: a cache created on

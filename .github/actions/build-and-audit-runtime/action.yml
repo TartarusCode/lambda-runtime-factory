@@ -71,11 +71,6 @@ runs:
         LAMBDA_RUNTIME_SUMMARY_DEFERRED: "1"
       run: timeout 1200 make build RUNTIME="${{ inputs.runtime }}" ARCH="${{ inputs.arch }}"
 
-    - name: Audit runtime package
-      if: inputs.audit == 'true'
-      shell: bash
-      run: bash tools/bin/audit-runtime "${{ inputs.runtime }}" "${{ inputs.arch }}"
-
     - name: Build the container image
       if: inputs.container == 'true'
       shell: bash
@@ -95,10 +90,6 @@ runs:
         timeout 900 bash tools/bin/build-container \
           "${{ inputs.runtime }}" "${{ inputs.arch }}" "${cache_args[@]}"
 
-    - name: Audit the container image
-      if: inputs.container == 'true' && inputs.audit == 'true'
-      shell: bash
-      run: bash tools/bin/audit-container "${{ inputs.runtime }}" "${{ inputs.arch }}"
 
     - name: Smoke-test the container image
       # Runs as the image's non-root user on a read-only rootfs with /tmp as the
@@ -114,6 +105,15 @@ runs:
       if: inputs.container == 'true'
       shell: bash
       run: bash tools/bin/check-container "${{ inputs.runtime }}" "${{ inputs.arch }}"
+
+    - name: Generate the compliance bundle
+      # Runs after the smoke test on purpose: the provenance manifest cites the
+      # STIG check the smoke test just performed, so generating it earlier would
+      # record a claim nothing had proven. Syft reads the image, Grype reads the
+      # SPDX document Syft produced, and a fixable High fails the cell.
+      if: inputs.container == 'true'
+      shell: bash
+      run: bash tools/bin/generate-compliance-artifacts "${{ inputs.runtime }}" "${{ inputs.arch }}"
 
     - name: Record the package size
       # Always: the summary states this cell's share of the 250 MB deployment

@@ -88,7 +88,31 @@ RUN for pkg in microdnf dnf yum; do \
         if rpm -q "${pkg}" >/dev/null 2>&1; then microdnf remove -y "${pkg}" || true; fi; \
     done; \
     command -v microdnf >/dev/null 2>&1 && microdnf clean all || true; \
+    rm -f /usr/bin/microdnf /usr/bin/dnf /usr/bin/yum; \
     rm -rf /var/cache/dnf /var/cache/yum /var/lib/dnf
+
+# Syft and Grype locate RHEL backports through the RPM database, and identify the
+# distribution at all through /etc/os-release. An image that has lost either still
+# builds and still runs — it just produces an SBOM with no lineage, which is the
+# compliance artifact this image exists for. Assert both here, where the cause is
+# still visible, instead of discovering it in a scan report.
+RUN set -eu; \
+    rpmdb=""; \
+    for candidate in /var/lib/rpm /usr/lib/sysimage/rpm; do \
+        if [ -d "${candidate}" ] && [ -n "$(ls -A "${candidate}" 2>/dev/null)" ]; then \
+            rpmdb="${candidate}"; \
+        fi; \
+    done; \
+    if [ -z "${rpmdb}" ]; then \
+        echo "no RPM database under /var/lib/rpm or /usr/lib/sysimage/rpm:" \
+             "Syft and Grype would lose RHEL backport lineage" >&2; \
+        exit 1; \
+    fi; \
+    if [ ! -s /etc/os-release ]; then \
+        echo "/etc/os-release is missing, so a scanner cannot identify the distribution" >&2; \
+        exit 1; \
+    fi; \
+    echo "RPM lineage: ${rpmdb} ($(ls "${rpmdb}" | wc -l) entries), os-release present"
 
 @@ENV@@
 

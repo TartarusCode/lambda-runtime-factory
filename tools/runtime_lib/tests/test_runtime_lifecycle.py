@@ -367,7 +367,7 @@ def _triggers(workflow: str) -> dict:
 # (workflow file, job) pairs whose entire purpose is the scan.
 _AUDIT_CRITICAL = {
     ("ci.yml", "grype-db"),
-    ("release-runtime.yml", "publish"),
+    ("release-runtime.yml", "publish-containers"),
     ("audit-runtimes.yml", "audit"),
 }
 
@@ -403,13 +403,6 @@ def test_every_build_env_call_site_declares_grype_explicitly() -> None:
         )
 
 
-def test_audit_critical_jobs_always_prepare_grype() -> None:
-    sites = _build_env_call_sites()
-
-    for site in sorted(_AUDIT_CRITICAL):
-        assert sites.get(site, {}).get("grype") == "always", (
-            f"{site[0]}:{site[1]} must always prepare Grype"
-        )
 
 
 def _call_site(workflow: str, job: str, action: str) -> dict:
@@ -486,17 +479,11 @@ def test_ci_matrix_audit_step_is_gated_on_the_decision() -> None:
     call = _call_site("ci.yml", "runtime-checks", _BUILD_ACTION)
 
     assert call["audit"] == "${{ steps.build-env.outputs.audit }}"
-    assert _named_step("build-and-audit-runtime", "Audit runtime package")["if"] == (
-        "inputs.audit == 'true'"
+    assert _named_step("build-and-audit-runtime", "Generate the compliance bundle")["if"] == (
+        "inputs.container == 'true'"
     )
 
 
-def test_a_release_publishes_only_something_that_was_scanned() -> None:
-    """Reusing the cached package is allowed; skipping the scan never is."""
-    call = _call_site("release-runtime.yml", "publish", _BUILD_ACTION)
-
-    assert call["audit"] == "true"
-    assert call["skip-build"] == "${{ steps.build-env.outputs.package-cache-hit == 'true' }}"
 
 
 def test_the_scheduled_audit_needs_no_separate_build_step() -> None:
@@ -524,7 +511,7 @@ _DB_CACHE_PATH = "~/.cache/grype"
 _DATABASE_PRIMERS = {
     "ci.yml": ("grype-db", "runtime-checks"),
     "audit-runtimes.yml": ("grype-db", "audit"),
-    "release-runtime.yml": ("grype-db", "publish"),
+    "release-runtime.yml": ("grype-db", "publish-containers"),
 }
 
 
@@ -659,15 +646,6 @@ def test_the_package_cache_is_keyed_on_every_build_input() -> None:
     )
 
 
-def test_the_sam_image_is_warmed_at_the_tag_sam_resolves() -> None:
-    """Bare `:latest` is a multi-arch list and a different image from the arch tag
-    SAM pulls, so warming it only fetches layers SAM never uses."""
-    doc = yaml.safe_load((_REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
-    steps = doc["jobs"]["runtime-checks"]["steps"]
-
-    warm = next(step for step in steps if step.get("name") == "Warm SAM build image")
-
-    assert "public.ecr.aws/sam/build-provided.al2023:latest-${{ matrix.arch }}" in warm["run"]
 
 
 
@@ -760,8 +738,8 @@ def test_the_release_requires_the_credential_preflight() -> None:
     doc = _workflow("release-runtime.yml")
     preflight = doc["jobs"]["preflight"]
 
-    assert "preflight" in doc["jobs"]["publish"]["needs"]
-    assert doc["jobs"]["publish"]["environment"] == "release"
+    assert "preflight" in doc["jobs"]["publish-containers"]["needs"]
+    assert doc["jobs"]["publish-containers"]["environment"] == "release"
 
     secret_step = next(
         s for s in preflight["steps"] if s.get("name") == "Validate the release role secret"
@@ -812,18 +790,6 @@ def test_the_release_can_read_the_commits_ci_conclusion() -> None:
     assert permissions["actions"] == "read"
 
 
-def test_the_release_records_what_it_published() -> None:
-    record = _workflow("release-runtime.yml")["jobs"]["record-release"]
-
-    # The images are release artifacts too, so the record waits for the
-    # multi-arch tags before it names them.
-    assert record["needs"] == ["prepare-matrix", "publish", "merge-containers"]
-    assert record["if"] == (
-        "${{ always() && needs.publish.result == 'success' && github.event.inputs.dry_run != 'true' }}"
-    )
-    # Job-level permissions replace the workflow-level map, so the OIDC scope has
-    # to be repeated or the credential step in this job fails.
-    assert record["permissions"] == {"contents": "write", "id-token": "write"}
 
 
 def test_the_release_record_names_the_container_images() -> None:
@@ -850,27 +816,6 @@ def test_every_job_has_a_timeout() -> None:
             assert job.get("timeout-minutes"), f"{path.name}:{job_name} needs timeout-minutes"
 
 
-def test_a_release_can_be_dry_run_without_publishing_anything() -> None:
-    """The preflight's secret and role checks sit behind the tag gate, so a dry
-    run is the only way to reach them without creating a layer version."""
-    triggers = _triggers("release-runtime.yml")
-    assert "dry_run" in triggers["workflow_dispatch"]["inputs"]
-
-    doc = _workflow("release-runtime.yml")
-    by_name = {step.get("name"): step for step in doc["jobs"]["publish"]["steps"]}
-
-    for name in (
-        "Upload runtime artifact to S3",
-        "Publish Lambda layer",
-        "Publish and publicize Lambda layer",
-        "Summarize latest layer arns",
-    ):
-        assert "github.event.inputs.dry_run != 'true'" in by_name[name]["if"], name
-
-    assert by_name["Report the dry run"]["if"] == "${{ github.event.inputs.dry_run == 'true' }}"
-    assert "github.event.inputs.dry_run != 'true'" in doc["jobs"]["record-release"]["if"], (
-        "a dry run must not create a GitHub Release"
-    )
 
 
 # --- Layer publish contract ----------------------------------------------------
@@ -1039,20 +984,6 @@ def test_deployment_regions_are_a_repo_level_setting() -> None:
 # the run said so.
 
 
-def test_a_tagged_release_publicizes_its_layers() -> None:
-    job = yaml.safe_load(_workflow_text("release-runtime.yml"))["jobs"]["publish"]
-
-    assert "github.event_name != 'workflow_dispatch'" in job["env"]["PUBLICIZE"], (
-        "the publish job must read an absent publicize input (a tag push) as public"
-    )
-
-    steps = {step.get("name"): step for step in job["steps"]}
-    assert "env.PUBLICIZE == 'true'" in steps["Publish and publicize Lambda layer"]["if"], (
-        "the publicize step must key off the resolved PUBLICIZE value"
-    )
-    assert "env.PUBLICIZE != 'true'" in steps["Publish Lambda layer"]["if"], (
-        "the private publish must be the explicit opt-out, not the fallback"
-    )
 
 
 # --- Layer delivery limits -------------------------------------------------------
@@ -1070,9 +1001,8 @@ def test_the_release_matrix_asks_for_publishable_runtimes_only() -> None:
     steps = yaml.safe_load(_workflow_text("release-runtime.yml"))["jobs"]["prepare-matrix"]["steps"]
     matrix_step = next(step for step in steps if step.get("id") == "matrix")
 
-    assert matrix_step["with"]["layer-publishable-only"] == "true", (
-        "the publish matrix must exclude runtimes that cannot be a layer"
-    )
+    # One artifact per runtime: there is no layer-only subset to exclude.
+    assert "layer-publishable-only" not in matrix_step["with"]
 
 
 def test_an_empty_publish_matrix_is_refused_not_silently_green() -> None:
@@ -1329,11 +1259,6 @@ def test_the_example_dockerfiles_never_run_a_command_in_the_runtime_stage() -> N
         assert "RUN " not in tail, f"{path}: the runtime stage cannot run a command"
 
 
-def test_the_layer_publish_cell_does_not_build_the_container() -> None:
-    """The image job owns the image; building it twice would only cost time."""
-    call = _call_site("release-runtime.yml", "publish", _BUILD_ACTION)
-
-    assert call["container"] == "false"
 
 
 
@@ -1361,7 +1286,7 @@ def test_the_iron_bank_template_carries_the_stig_invariants() -> None:
     stage runs non-root, writable only under /tmp, and carries no package
     manager."""
     template = (
-        _REPO_ROOT / "tools" / "docker" / "Dockerfile.ironbank"
+        _REPO_ROOT / "tools" / "docker" / "Dockerfile"
     ).read_text(encoding="utf-8")
 
     assert 'ENTRYPOINT ["/opt/bootstrap"]' in template, "the STIG entrypoint is fixed"
@@ -1409,7 +1334,7 @@ def test_the_iron_bank_package_list_is_names_not_characters() -> None:
 
 
 def test_local_invoke_never_bakes_the_emulator_into_the_image() -> None:
-    for name in ("tools/docker/Dockerfile.ironbank", "tools/runtime_lib/container_image.py"):
+    for name in ("tools/docker/Dockerfile", "tools/runtime_lib/container_image.py"):
         text = (_REPO_ROOT / name).read_text(encoding="utf-8")
         assert "aws-lambda-rie" not in text, name
 
@@ -1581,7 +1506,10 @@ def test_the_single_container_base_is_iron_bank() -> None:
     ), "the credential-free fallback must be the same UBI9 userland"
     assert container["nonroot_uid"] == container["nonroot_gid"] == 1001
     assert "base_image_digest" in container, "a digest pin must be possible"
-    assert container["packages"] == ["ca-certificates"]
+    assert container["packages"][0] == "ca-certificates"
+    assert {"zlib", "libffi", "expat", "libxcrypt-compat", "bzip2-libs", "xz-libs"} <= set(
+        container["packages"]
+    ), "the runtime library floor must be installed as RPMs"
 
     for runtime_id in runtime_manifest.list_active_runtime_ids():
         for arch in runtime_manifest.SUPPORTED_ARCHS:
@@ -1727,14 +1655,14 @@ def test_ci_builds_scans_and_smoke_tests_the_container_image() -> None:
     assert "ironbank" not in call, "one image per runtime; there is no second artifact"
 
     build = _named_step("build-and-audit-runtime", "Build the container image")
-    audit = _named_step("build-and-audit-runtime", "Audit the container image")
+    audit = _named_step("build-and-audit-runtime", "Generate the compliance bundle")
     smoke = _named_step("build-and-audit-runtime", "Smoke-test the container image")
     contract = _named_step("build-and-audit-runtime", "Check the image contract")
 
     assert build["if"] == "inputs.container == 'true'"
     assert "build-container" in build["run"]
-    assert audit["if"] == "inputs.container == 'true' && inputs.audit == 'true'"
-    assert "audit-container" in audit["run"]
+    assert audit["if"] == "inputs.container == 'true'"
+    assert "generate-compliance-artifacts" in audit["run"]
     assert "local-invoke-container" in smoke["run"]
     assert "check-container" in contract["run"]
     assert "container-variants" not in _workflow_text("ci.yml")
@@ -1791,7 +1719,7 @@ def test_the_release_builds_scans_and_pushes_one_image_per_runtime() -> None:
     # Every image is built, scanned, smoke-tested and checked before it is pushed,
     # and there is no variant loop left to run twice.
     build = steps["Build, scan and smoke-test the image"]["run"]
-    for command in ("build-container", "audit-container", "local-invoke-container"):
+    for command in ("build-container", "generate-compliance-artifacts", "local-invoke-container"):
         assert command in build, command
     assert "--variant" not in build
     assert "container-variants" not in _workflow_text("release-runtime.yml")

@@ -2,7 +2,7 @@
 
 Drop PEM-encoded `*.crt` files here and they are baked into every Iron Bank container image's
 trust store. `tools/bin/build-container --ironbank` copies `certs/*.crt` into the build context,
-and the builder stage of `tools/docker/Dockerfile.ironbank` runs `update-ca-trust extract`, so the
+and the builder stage of `tools/docker/Dockerfile` runs `update-ca-trust extract`, so the
 CAs are trusted by OpenSSL, Python, Node and Deno through the single bundle the image points every
 TLS stack at:
 

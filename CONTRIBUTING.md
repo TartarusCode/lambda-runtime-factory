@@ -66,7 +66,7 @@ Deployment regions and the S3 bucket base name are repo-level settings in `REPO_
 per-runtime fields. A runtime manifest that redeclares them silently wins over the global value,
 because the manifest is merged last.
 
-One field is neither derived nor a version: `layer_publishable` marks a runtime whose package
+One field is neither derived nor a version: `layer_publishable` (removed) used to mark a runtime whose package
 cannot be delivered as a Lambda layer, because a deployment package is capped at 250 MB
 unzipped — the function plus every layer attached to it. It is still built and scanned
 everywhere; only the publish matrix skips it. Because it is resolved from the *merged*
@@ -125,7 +125,7 @@ bash tools/bin/audit-container pypy311 x86_64 # Grype scan of the image
 
 ### The stage layout
 
-`tools/docker/Dockerfile.ironbank` is the one canonical file, rendered per runtime by
+`tools/docker/Dockerfile` is the one canonical file, rendered per runtime by
 `container_image.render_dockerfile`: the entrypoint is fixed at `/opt/bootstrap` (the STIG
 contract) and only the payload path, the environment and the labels come from the manifest. Keeping
 the invariants in a reviewable file rather than in Python string concatenation is deliberate —
@@ -354,8 +354,8 @@ cannot drift apart:
 - `runtime-matrix` — the build/publish matrix, generated from the manifest list (and narrowed to
   the changed runtimes for the fast tier)
 - `runtime-build-env` — the download, package, Grype-binary and Grype-database caches
-- `build-and-audit-runtime` — archive tooling, Buildx setup, `make build`, `tools/bin/audit-runtime`,
-  and the image build, scan, smoke test and STIG contract check
+- `build-and-audit-runtime` — archive tooling, Buildx setup, `make build`, the image build, the
+  smoke test, the STIG contract check and `tools/bin/generate-compliance-artifacts`
 
 `.github/workflows/audit-runtimes.yml` runs the same matrix weekly to catch CVE-database drift,
 and `.github/workflows/check-updates.yml` opens the weekly version-bump PR.
