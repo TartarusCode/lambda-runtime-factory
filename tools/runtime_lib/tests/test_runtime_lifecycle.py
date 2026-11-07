@@ -2175,6 +2175,27 @@ def test_buildx_registry_caching_is_wired_end_to_end() -> None:
     assert "--cache-to" in build and "mode=max" in build
 
 
+def test_every_workflow_that_uses_the_registry_cache_logs_into_ghcr() -> None:
+    """The cache ref is a private GHCR package, so an unauthenticated buildx asks
+    GHCR for an anonymous token and gets 403. The import failure is tolerated but
+    the export is fatal, which is how a green PR turns into a red main."""
+    for workflow, job in (("ci.yml", "runtime-checks"), ("audit-runtimes.yml", "audit")):
+        document = _workflow(workflow)["jobs"][job]
+        steps = {step.get("name"): step for step in document["steps"]}
+
+        login = steps["Log in to GHCR"]
+        assert login["with"]["registry"] == "ghcr.io", workflow
+        assert login["with"]["password"] == "${{ secrets.GITHUB_TOKEN }}", workflow
+        # Job-level permissions replace the workflow map, so the scope has to be
+        # granted on the job that logs in.
+        assert document["permissions"]["packages"] == "write", workflow
+        assert document["permissions"]["contents"] == "read", workflow
+
+        # The credentials have to be in place before the build exports the cache.
+        names = [step.get("name") for step in document["steps"]]
+        assert names.index("Log in to GHCR") < names.index("Build and audit runtime package"), workflow
+
+
 def test_the_release_builds_scans_and_pushes_one_image_per_runtime() -> None:
     jobs = _workflow("release-runtime.yml")["jobs"]
     assert "publish-containers" in jobs and "merge-containers" in jobs
