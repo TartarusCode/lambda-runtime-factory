@@ -2320,3 +2320,34 @@ def test_every_job_that_assumes_a_role_can_mint_an_oidc_token() -> None:
                 )
             checked.append((path.name, name))
     assert checked, "no job assumes an AWS role over OIDC"
+
+
+def test_the_iron_bank_login_reads_what_the_fallback_check_reads() -> None:
+    """A login step that reads a differently spelled secret than the fallback
+    check can be skipped while the token is set — and the build then publishes the
+    Red Hat fallback userland under the same tag, with nothing failing. Resolving
+    the secret into one job variable, and logging in with that variable, is what
+    makes the two impossible to disagree."""
+    sites = []
+    for path in sorted((_REPO_ROOT / ".github" / "workflows").glob("*.yml")):
+        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        for name, job in (doc.get("jobs") or {}).items():
+            env = job.get("env") or {}
+            for step in job.get("steps") or []:
+                if not (
+                    isinstance(step, dict)
+                    and step.get("name") == "Log in to Iron Bank Registry"
+                ):
+                    continue
+                sites.append((path.name, name))
+                assert env.get("IRONBANK_TOKEN") == "${{ secrets.IRONBANK_TOKEN }}", (
+                    f"{path.name}:{name} must resolve IRONBANK_TOKEN from the secret"
+                )
+                assert step.get("with", {}).get("password") == "${{ env.IRONBANK_TOKEN }}", (
+                    f"{path.name}:{name} must log in with the resolved IRONBANK_TOKEN, "
+                    "not a separately spelled secret name"
+                )
+                assert "IRONBANK_TOKEN" in str(step.get("if", "")), (
+                    f"{path.name}:{name} must gate the login on the same variable"
+                )
+    assert sites, "no workflow logs in to Iron Bank"

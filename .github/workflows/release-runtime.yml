@@ -297,6 +297,9 @@ jobs:
       # registry1.dso.mil needs credentials. Empty means "no Iron Bank login",
       # which makes build-container fall back to the Red Hat UBI9 registry — the
       # same userland — instead of failing every cell.
+      # Resolved once here so the login step and `build-container`'s fallback
+      # check read the same variable and cannot disagree about whether Iron Bank
+      # credentials exist.
       IRONBANK_TOKEN: ${{ secrets.IRONBANK_TOKEN }}
     steps:
       - uses: actions/checkout@v7
@@ -326,7 +329,9 @@ jobs:
         with:
           registry: registry1.dso.mil
           username: ${{ secrets.IRONBANK_USERNAME }}
-          password: ${{ secrets.IRONBANK_TOKEN }}
+          # The resolved value, so the login and the fallback check cannot
+          # disagree about whether credentials exist.
+          password: ${{ env.IRONBANK_TOKEN }}
       - name: Set up Docker Buildx
         # The docker-container driver is what supports registry cache
         # import/export, which is how the base pull and the certificate/library

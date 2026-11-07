@@ -131,6 +131,11 @@ jobs:
       # registry1.dso.mil needs credentials; empty makes build-container fall back
       # to the Red Hat UBI9 registry, so the Iron Bank artifact is still built and
       # smoke-tested on an external PR.
+      # Resolved once here so the login step and `build-container`'s fallback
+      # check read the same variable. These are *environment* secrets on
+      # `release`, so CI only sees them if they are also set at the repository
+      # level — without them the cells still build and smoke-test the image on
+      # the Red Hat fallback.
       IRONBANK_TOKEN: ${{ secrets.IRONBANK_TOKEN }}
     steps:
       - uses: actions/checkout@v7
@@ -157,7 +162,9 @@ jobs:
         with:
           registry: registry1.dso.mil
           username: ${{ secrets.IRONBANK_USERNAME }}
-          password: ${{ secrets.IRONBANK_TOKEN }}
+          # The resolved value, so the login and build-container's fallback check
+          # cannot disagree about whether credentials exist.
+          password: ${{ env.IRONBANK_TOKEN }}
       - name: Build and audit runtime package
         uses: ./.github/actions/build-and-audit-runtime
         with:
