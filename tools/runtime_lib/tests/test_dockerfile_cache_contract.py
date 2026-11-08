@@ -104,8 +104,11 @@ def test_build_container_publishes_the_shared_base_cache_scope() -> None:
     assert 'GITHUB_ACTIONS:-}' in script, "the gha backend must be the CI default"
 
 
-def test_the_actions_do_not_hand_build_container_a_registry_cache_ref() -> None:
-    """Two cache backends at once means the registry ref is pulled for nothing."""
+def test_the_build_step_uses_dockers_own_action_for_the_gha_cache() -> None:
+    """`type=gha` reads the Actions cache runtime variables from the process that
+    runs the build, and a shell `docker buildx build` does not inherit them — the
+    flags parse fine and every layer is still a miss. Docker's action wires them,
+    so the cache belongs in its inputs rather than in the script's argv."""
     action = yaml.safe_load(
         (_REPO_ROOT / ".github" / "actions" / "build-and-audit-runtime" / "action.yml").read_text(
             encoding="utf-8"
@@ -113,6 +116,13 @@ def test_the_actions_do_not_hand_build_container_a_registry_cache_ref() -> None:
     )
     build = next(s for s in action["runs"]["steps"] if s.get("name") == "Build the container image")
 
-    assert build["env"]["CONTAINER_BUILD_CACHE"] == "gha"
-    assert "cache-from" not in build["run"], "the script owns the cache args now"
-    assert "cache-to" not in build["run"]
+    assert build["uses"] == "docker/build-push-action@v7"
+    assert "run" not in build, "a shell build cannot reach the Actions cache"
+    assert "type=gha" in build["with"]["cache-from"]
+    assert "type=gha" in build["with"]["cache-to"]
+    assert "ubi9-base-" in build["with"]["cache-from"], "the base scope is shared per arch"
+
+    prepare = next(s for s in action["runs"]["steps"] if s.get("name") == "Prepare the image build")
+    assert "--prepare-only" in prepare["run"]
+    measure = next(s for s in action["runs"]["steps"] if s.get("name") == "Measure the container image")
+    assert "--finish" in measure["run"]

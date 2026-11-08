@@ -1696,7 +1696,9 @@ def test_ci_builds_scans_and_smoke_tests_the_container_image() -> None:
     contract = _named_step("build-and-audit-runtime", "Check the image contract")
 
     assert build["if"] == "inputs.container == 'true'"
-    assert "build-container" in build["run"]
+    assert build["uses"] == "docker/build-push-action@v7"
+    assert "--prepare-only" in _named_step("build-and-audit-runtime", "Prepare the image build")["run"]
+    assert "--finish" in _named_step("build-and-audit-runtime", "Measure the container image")["run"]
     assert audit["if"] == "inputs.container == 'true'"
     assert "generate-compliance-artifacts" in audit["run"]
     assert "local-invoke-container" in smoke["run"]
@@ -1709,15 +1711,16 @@ def test_buildx_caching_is_wired_end_to_end() -> None:
     steps = {step.get("name"): step for step in action["runs"]["steps"]}
 
     setup = steps["Set up Docker Buildx"]
-    assert setup["uses"] == "docker/setup-buildx-action@v3"
+    assert setup["uses"] == "docker/setup-buildx-action@v4"
     # The `gha` cache backend only exists for the container driver.
     assert setup["with"]["driver"] == "docker-container"
 
-    # The script owns the cache arguments now, because it is the only place that
-    # knows the arch and the runtime id the scopes are built from.
+    # The cache belongs to Docker's own action, which hands buildx the Actions
+    # cache runtime variables a shell step never sees.
     build = steps["Build the container image"]
-    assert build["env"]["CONTAINER_BUILD_CACHE"] == "gha"
-    assert "cache-from" not in build["run"] and "cache-to" not in build["run"]
+    assert build["uses"] == "docker/build-push-action@v7"
+    assert "type=gha" in build["with"]["cache-from"]
+    assert "type=gha,mode=max" in build["with"]["cache-to"]
 
 
 def test_ci_does_not_need_registry_credentials() -> None:
@@ -1744,7 +1747,7 @@ def test_the_release_builds_scans_and_pushes_one_image_per_runtime() -> None:
 
     # Every image is built, scanned, smoke-tested and checked before it is pushed,
     # and there is no variant loop left to run twice.
-    build = steps["Build, scan and smoke-test the image"]["run"]
+    build = steps["Measure, smoke-test and scan the image"]["run"]
     for command in ("build-container", "generate-compliance-artifacts", "local-invoke-container"):
         assert command in build, command
     assert "--variant" not in build

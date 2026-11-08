@@ -260,7 +260,7 @@ jobs:
         # `type=gha`, which is how the base pull and the certificate/library
         # staging are reused across runs and architectures; the default docker
         # driver has no BuildKit cache export.
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
         with:
           driver: docker-container
       - name: Configure AWS credentials
@@ -281,14 +281,41 @@ jobs:
         # exists; GHCR creates the package itself.
         if: ${{ github.event.inputs.dry_run != 'true' }}
         run: bash tools/bin/ensure-container-repos "${{ matrix.runtime }}"
-      - name: Build, scan and smoke-test the image
-        # One image per runtime on the Iron Bank UBI9 base. Only bytes that passed
-        # all three steps are pushed. The smoke test runs before the compliance
-        # bundle so provenance cites the STIG check it performs.
+      - name: Prepare the image build
         env:
           CONTAINER_BUILD_CACHE: gha
         run: |
-          timeout 900 bash tools/bin/build-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
+          timeout 300 bash tools/bin/build-container \
+            "${{ matrix.runtime }}" "${{ matrix.arch }}" --prepare-only
+      - name: Build the container image
+        # `docker/build-push-action` rather than a shell `docker buildx build`:
+        # `type=gha` needs the Actions cache runtime variables, which a shell step
+        # does not inherit, so the cache flags parse and every layer misses.
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ env.BUILD_CONTEXT }}
+          file: ${{ env.BUILD_DOCKERFILE }}
+          platforms: ${{ env.BUILD_PLATFORM }}
+          tags: ${{ env.BUILD_IMAGE_TAG }}
+          load: true
+          labels: |
+            org.opencontainers.image.revision=${{ env.BUILD_REVISION }}
+          build-args: |
+            BASE_IMAGE=${{ env.BUILD_BASE_IMAGE }}
+            BUILDER_IMAGE=${{ env.BUILD_BASE_IMAGE }}
+            NONROOT_UID=${{ env.BUILD_NONROOT_UID }}
+            NONROOT_GID=${{ env.BUILD_NONROOT_GID }}
+          cache-from: |
+            type=gha,scope=ubi9-base-${{ matrix.arch }}
+            type=gha,scope=runtime-${{ matrix.runtime }}-${{ matrix.arch }}
+          cache-to: |
+            type=gha,mode=max,scope=ubi9-base-${{ matrix.arch }}
+            type=gha,mode=max,scope=runtime-${{ matrix.runtime }}-${{ matrix.arch }}
+      - name: Measure, smoke-test and scan the image
+        # Only bytes that passed every step are pushed. The smoke test runs before
+        # the compliance bundle so provenance cites the STIG check it performs.
+        run: |
+          timeout 900 bash tools/bin/build-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --finish
           timeout 600 bash tools/bin/local-invoke-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
           bash tools/bin/generate-compliance-artifacts "${{ matrix.runtime }}" "${{ matrix.arch }}"
       - name: Check the image contract

@@ -40,7 +40,7 @@ runs:
       # library installation are reused across cells and runs. The default docker
       # driver has no BuildKit cache export at all.
       if: inputs.container == 'true'
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@v4
       with:
         driver: docker-container
 
@@ -57,18 +57,57 @@ runs:
         LAMBDA_RUNTIME_SUMMARY_DEFERRED: "1"
       run: timeout 1200 make build RUNTIME="${{ inputs.runtime }}" ARCH="${{ inputs.arch }}"
 
-    - name: Build the container image
+    - name: Prepare the image build
       if: inputs.container == 'true'
       shell: bash
-      # Same payload the staging step produced, different ceiling: the image is
-      # the only artifact, on the Iron Bank UBI9 base, and it is what a DoD ATO
-      # accepts. BuildKit cache comes from the `gha` backend, scoped so the shared
-      # UBI9 layer is reused across every runtime on an architecture.
+      # Renders the Dockerfile and records the tag, base and build args. The build
+      # itself is `docker/build-push-action` below: `type=gha` needs the Actions
+      # cache runtime variables, and a shell `docker buildx build` does not inherit
+      # them — the flags parse fine and every layer is still a miss.
       env:
         LAMBDA_RUNTIME_SUMMARY_DEFERRED: "1"
-        CONTAINER_BUILD_CACHE: gha
       run: |
-        timeout 900 bash tools/bin/build-container "${{ inputs.runtime }}" "${{ inputs.arch }}"
+        timeout 300 bash tools/bin/build-container \
+          "${{ inputs.runtime }}" "${{ inputs.arch }}" --prepare-only
+
+    - name: Build the container image
+      if: inputs.container == 'true'
+      uses: docker/build-push-action@v7
+      with:
+        context: ${{ env.BUILD_CONTEXT }}
+        file: ${{ env.BUILD_DOCKERFILE }}
+        platforms: ${{ env.BUILD_PLATFORM }}
+        tags: ${{ env.BUILD_IMAGE_TAG }}
+        # The image has to reach the local daemon: `docker image inspect`, the
+        # rootfs measurement, `syft docker:<tag>` and the smoke test all read it
+        # from there, and none of them can consume a cache-only export.
+        load: true
+        labels: |
+          org.opencontainers.image.revision=${{ env.BUILD_REVISION }}
+        build-args: |
+          BASE_IMAGE=${{ env.BUILD_BASE_IMAGE }}
+          BUILDER_IMAGE=${{ env.BUILD_BASE_IMAGE }}
+          NONROOT_UID=${{ env.BUILD_NONROOT_UID }}
+          NONROOT_GID=${{ env.BUILD_NONROOT_GID }}
+        # The base scope is runtime-independent, so every runtime on an
+        # architecture reuses one ubi9-minimal pull plus microdnf install layer.
+        cache-from: |
+          type=gha,scope=ubi9-base-${{ inputs.arch }}
+          type=gha,scope=runtime-${{ inputs.runtime }}-${{ inputs.arch }}
+        cache-to: |
+          type=gha,mode=max,scope=ubi9-base-${{ inputs.arch }}
+          type=gha,mode=max,scope=runtime-${{ inputs.runtime }}-${{ inputs.arch }}
+
+    - name: Measure the container image
+      if: inputs.container == 'true'
+      shell: bash
+      # Exports the rootfs, asserts the Lambda filesystem and STIG contract, and
+      # writes container.json from what the build produced.
+      env:
+        LAMBDA_RUNTIME_SUMMARY_DEFERRED: "1"
+      run: |
+        timeout 900 bash tools/bin/build-container \
+          "${{ inputs.runtime }}" "${{ inputs.arch }}" --finish
 
 
     - name: Smoke-test the container image

@@ -27,6 +27,8 @@ push=0
 force=0
 cache_from=""
 cache_to=""
+prepare_only=0
+finish=0
 positional=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -35,6 +37,12 @@ while [[ $# -gt 0 ]]; do
         --no-cache) LAMBDA_CONTAINER_NO_CACHE=1; shift ;;
         --cache-from) cache_from=$2; shift 2 ;;
         --cache-to) cache_to=$2; shift 2 ;;
+        # Two-phase build for CI: `--prepare-only` renders the Dockerfile and
+        # records the tag and contexts, the workflow builds with
+        # `docker/build-push-action` (which wires the Actions cache itself), and
+        # `--finish` measures the image and writes container.json.
+        --prepare-only) prepare_only=1; shift ;;
+        --finish) finish=1; shift ;;
         -*) echo "Unknown option: $1" >&2; exit 2 ;;
         *) positional+=("$1"); shift ;;
     esac
@@ -87,14 +95,47 @@ cache_flag() {  # cache_flag <from|to> <value>
 }
 
 prepare_args=(prepare --runtime "${runtime_id}" --arch "${arch}")
-if (( force )); then
-    prepare_args+=(--force)
-fi
-spec=$(python3 "$(common::repo_root)/tools/runtime_lib/container_image.py" "${prepare_args[@]}")
-context_dir=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["context_dir"])' <<<"${spec}")
-packages=$(python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["packages"]))' <<<"${spec}")
+state_file="${ARTIFACT_DIR}/build-state.env"
 
-image="${CONTAINER_LOCAL_IMAGE}"
+if (( finish )); then
+    # The workflow built the image; everything here is measurement. The state was
+    # written by `--prepare-only` and exported to the job environment.
+    if [[ ! -f "${state_file}" ]]; then
+        echo "Missing ${state_file}: run --prepare-only before --finish" >&2
+        exit 1
+    fi
+    # shellcheck disable=SC1090
+    source "${state_file}"
+    context_dir="${BUILD_CONTEXT}"
+    image="${BUILD_IMAGE_TAG}"
+    base_image="${BUILD_BASE_IMAGE}"
+else
+    if (( force )); then
+        prepare_args+=(--force)
+    fi
+    spec=$(python3 "$(common::repo_root)/tools/runtime_lib/container_image.py" "${prepare_args[@]}")
+    context_dir=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["context_dir"])' <<<"${spec}")
+    packages=$(python3 -c 'import json,sys; print(" ".join(json.load(sys.stdin)["packages"]))' <<<"${spec}")
+    image="${CONTAINER_LOCAL_IMAGE}"
+fi
+
+if (( prepare_only )); then
+    mkdir -p "${ARTIFACT_DIR}"
+    {
+        echo "BUILD_CONTEXT=${context_dir}"
+        echo "BUILD_DOCKERFILE=${context_dir}/Dockerfile"
+        echo "BUILD_PLATFORM=${CONTAINER_PLATFORM}"
+        echo "BUILD_IMAGE_TAG=${image}"
+        echo "BUILD_BASE_IMAGE=${base_image}"
+        echo "BUILD_NONROOT_UID=${CONTAINER_NONROOT_UID}"
+        echo "BUILD_NONROOT_GID=${CONTAINER_NONROOT_GID}"
+        echo "BUILD_REVISION=${GITHUB_SHA:-$(git -C "$(common::repo_root)" rev-parse HEAD 2>/dev/null || echo unknown)}"
+    } | tee "${state_file}" >> "${GITHUB_ENV:-/dev/null}"
+    echo "Prepared ${context_dir}; the image build is the caller's step"
+    exit 0
+fi
+
+if (( ! finish )); then
 echo "Building ${image} for ${CONTAINER_PLATFORM} (base ${base_image})"
 echo "Installing the shared UBI9 library floor: ${packages:-none}"
 
@@ -148,7 +189,12 @@ if [[ "${LAMBDA_CONTAINER_NO_CACHE:-0}" == "1" ]]; then
     build_args+=(--no-cache)
 fi
 
+# Print the invocation: whether the cache flags reached buildx is the first thing
+# to check when a build rebuilds every layer, and the step log is the only place
+# that shows it.
+echo "docker ${build_args[*]}"
 docker "${build_args[@]}" "${context_dir}"
+fi
 
 # The rootfs export is also the size measurement, and it asserts the Lambda
 # filesystem contract plus the STIG rules: world-writable /tmp, /var/task and /opt
