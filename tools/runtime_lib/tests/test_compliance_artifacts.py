@@ -454,3 +454,26 @@ def test_soci_attestation_follows_the_soci_publication_policy() -> None:
     assert "common::soci_registries" not in other_branch, (
         "a plain image is published everywhere and must be attested everywhere"
     )
+
+
+def test_a_transient_registry_answer_is_retried(tmp_path) -> None:
+    """A tag resolves before every layer is readable, so a pull moments after a
+    push can answer `not found` for a blob. Retrying separates that from a
+    genuinely missing image, and gives up rather than looping."""
+    script = """
+source tools/bin/_common.sh
+export RETRY_DELAY=0
+attempts=0
+flaky() { attempts=$((attempts + 1)); [ "$attempts" -ge 3 ]; }
+common::retry 5 flaky && echo "recovered after $attempts"
+common::retry 2 false || echo "gave up"
+"""
+    result = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, cwd=_REPO_ROOT
+    )
+    assert result.returncode == 0, result.stderr
+    assert "recovered after 3" in result.stdout
+    assert "gave up" in result.stdout
+
+    soci = (_REPO_ROOT / "tools/bin/publish-soci-index").read_text(encoding="utf-8")
+    assert soci.count("common::retry 5") == 2, "the pull and the read-back both retry"

@@ -101,7 +101,13 @@ plain_flags() {  # plain_flags <registry>; sets PLAIN_SOURCE, PLAIN_DESTINATION,
 # so the shape is checked rather than assumed.
 verify_soci_index() {
     local reference=$1 file=$2
-    "${oras}" manifest fetch "${PLAIN_FETCH[@]}" "${reference}" > "${file}"
+    fetch_index() {
+        "${oras}" manifest fetch "${PLAIN_FETCH[@]}" "${reference}" > "${file}"
+    }
+    if ! common::retry 5 fetch_index; then
+        echo "Could not read ${reference} back after 5 attempts" >&2
+        exit 1
+    fi
     python3 - "${CONTAINER_ARCH}" "${file}" <<'PY'
 import json
 import sys
@@ -154,8 +160,18 @@ for registry in "${registries[@]}"; do
     # platform". Filtering the pull to this architecture drops the attestation
     # entry and leaves exactly the one manifest SOCI can convert.
     echo "Pulling ${reference} to an OCI layout"
-    "${oras}" cp "${PLAIN_SOURCE[@]}" --platform "linux/${CONTAINER_ARCH}" \
-        --to-oci-layout "${reference}" "${layout}:${CONTAINER_TAG}"
+    # The tag was pushed seconds ago, and a registry can resolve it before every
+    # layer is readable, which surfaces as `not found` for a blob the manifest
+    # names. Retry before concluding the image is missing.
+    pull_image() {
+        rm -rf "${layout}"
+        "${oras}" cp "${PLAIN_SOURCE[@]}" --platform "linux/${CONTAINER_ARCH}" \
+            --to-oci-layout "${reference}" "${layout}:${CONTAINER_TAG}"
+    }
+    if ! common::retry 5 pull_image; then
+        echo "Could not pull ${reference} after 5 attempts" >&2
+        exit 1
+    fi
 
     echo "Converting ${reference} to a SOCI-enabled image"
     "${soci}" convert --standalone --format oci-dir "${layout}" "${converted}"

@@ -92,3 +92,27 @@ for registry in candidates:
         print(registry)
 PYEOF
 }
+
+# common::retry <attempts> <command...>
+#
+# Run a command until it succeeds, up to <attempts> times, with a growing delay
+# between tries (RETRY_DELAY seconds times the attempt number, default 5).
+# A registry can answer `not found` for a blob that a push moments earlier wrote:
+# the tag resolves before every layer is readable, and the window is seconds.
+common::retry() {
+    local tries=$1
+    shift
+    local delay=${RETRY_DELAY:-5}
+    local try=1
+    while :; do
+        if "$@"; then
+            return 0
+        fi
+        if (( try >= tries )); then
+            return 1
+        fi
+        echo "Attempt ${try}/${tries} failed; retrying in $(( delay * try ))s" >&2
+        sleep $(( delay * try ))
+        try=$(( try + 1 ))
+    done
+}
