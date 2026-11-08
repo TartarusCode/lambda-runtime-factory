@@ -699,6 +699,11 @@ def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> Dict[str, str]:
         "PACKAGE_NAME": data["artifact"]["package_name"],
         "ARTIFACT_DIR": str(build_dir / "artifacts"),
         "PACKAGE_PATH": str(build_dir / "artifacts" / data["artifact"]["package_name"]),
+        # Digest-verified Syft cache, keyed per runtime and architecture. The
+        # metadata file written beside the two documents records the image digest,
+        # the base image digest and the Syft version that produced them, so a
+        # restored entry is reused only when it describes these exact bytes.
+        "SBOM_CACHE_DIR": os.environ.get("SBOM_CACHE_DIR") or str(temp_root / "sbom-cache"),
         "BOOTSTRAP_SOURCE": str(_absolute(runtime_id, data["layout"]["bootstrap"])),
         "BOOTSTRAP_OUTPUT": data["layout"]["bootstrap_output"],
         "HELPER_SOURCE": str(_absolute(runtime_id, data["layout"]["helper_source"])),

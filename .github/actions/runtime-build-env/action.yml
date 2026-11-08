@@ -34,7 +34,9 @@ runs:
       run: |
         echo "DOWNLOAD_CACHE_DIR=${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads" >> "$GITHUB_ENV"
         echo "GRYPE_INSTALL_DIR=${RUNNER_TEMP}/grype/bin" >> "$GITHUB_ENV"
+        echo "SBOM_CACHE_DIR=${RUNNER_TEMP}/lambda-runtime-monorepo/cache/sbom" >> "$GITHUB_ENV"
         mkdir -p "${RUNNER_TEMP}/lambda-runtime-monorepo/cache/downloads"
+        mkdir -p "${RUNNER_TEMP}/lambda-runtime-monorepo/cache/sbom"
         mkdir -p "${RUNNER_TEMP}/grype/bin"
 
     - name: Cache runtime downloads
@@ -44,6 +46,23 @@ runs:
       with:
         path: ${{ env.DOWNLOAD_CACHE_DIR }}
         key: downloads-${{ runner.os }}-${{ inputs.runtime }}-${{ inputs.arch }}-${{ hashFiles(format('runtimes/{0}/runtime.json', inputs.runtime), format('runtimes/{0}/checksums/**', inputs.runtime)) }}
+
+    # The Syft package list for one runtime/arch. The key is a cheap first filter —
+    # it names the runtime, the arch and the Syft version, so an entry is only ever
+    # offered to a cell that could use it. Whether it *is* usable is decided by the
+    # generator: `sbom-cache-meta.json` is compared against the image digest and the
+    # base image digest this cell actually built, because a rebuilt image can carry
+    # exactly the same key and a different package set. The restore-keys prefix
+    # exists so a tooling change lands a miss that is still visible, not a stale hit.
+    - name: Cache SBOMs
+      id: sbom
+      if: inputs.runtime != '' && inputs.arch != ''
+      uses: actions/cache@v6
+      with:
+        path: ${{ env.SBOM_CACHE_DIR }}
+        key: sbom-${{ inputs.runtime }}-${{ inputs.arch }}-${{ env.SYFT_VERSION }}-${{ hashFiles('tools/docker/Dockerfile', 'tools/bin/build-runtime', 'tools/bin/build-container', 'tools/bin/generate-compliance-artifacts', format('runtimes/{0}/**', inputs.runtime)) }}
+        restore-keys: |
+          sbom-${{ inputs.runtime }}-${{ inputs.arch }}-${{ env.SYFT_VERSION }}-
 
     - name: Compute database cache key
       id: dbkey
