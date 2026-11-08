@@ -74,20 +74,7 @@ workdir="${TEMP_ROOT}/soci/${CONTAINER_ARCH}"
 layout="${workdir}/image"
 converted="${workdir}/image-soci"
 
-mapfile -t registries < <(python3 - "${SOCI_REGISTRIES:-}" "${CONTAINER_REGISTRIES_OVERRIDE:-${CONTAINER_REGISTRIES}}" <<'PY'
-import json
-import sys
-
-explicit, configured = sys.argv[1], sys.argv[2]
-candidates = json.loads(explicit) if explicit else json.loads(configured)
-for registry in candidates:
-    # Lambda reads SOCI indexes from Amazon ECR. A SOCI copy on another registry
-    # would be bytes nothing consumes, so it is only published there when asked for
-    # explicitly (a mirror, or a throwaway registry in a test).
-    if explicit or registry.startswith("public.ecr.aws/") or ".dkr.ecr." in registry:
-        print(registry)
-PY
-)
+mapfile -t registries < <(common::soci_registries)
 
 if [[ ${#registries[@]} -eq 0 ]]; then
     echo "no ECR registry in the manifest and SOCI_REGISTRIES is unset; Lambda reads SOCI indexes from ECR, so nothing is published"

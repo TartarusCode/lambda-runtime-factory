@@ -9,6 +9,7 @@ generator cannot drift away from the manifest an auditor reads.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -408,4 +409,48 @@ def test_the_compliance_tools_match_the_runner_architecture() -> None:
     )
     assert cache_step["with"]["key"].startswith("compliance-tools-v2-"), (
         "a v1 entry may hold a binary for another CPU"
+    )
+
+
+def test_only_ecr_registries_carry_a_soci_copy() -> None:
+    """Lambda reads SOCI indexes from ECR, so a copy elsewhere is bytes nothing
+    consumes. The rule lives in one helper rather than in each script."""
+    environment = dict(os.environ)
+    environment.pop("SOCI_REGISTRIES", None)
+    environment.pop("CONTAINER_REGISTRIES_OVERRIDE", None)
+    environment["CONTAINER_REGISTRIES"] = json.dumps(
+        [
+            "ghcr.io/example/project",
+            "public.ecr.aws/alias/project",
+            "123456789.dkr.ecr.us-east-1.amazonaws.com/project",
+        ]
+    )
+    result = subprocess.run(
+        ["bash", "-c", "source tools/bin/_common.sh; common::soci_registries"],
+        capture_output=True,
+        text=True,
+        env=environment,
+        cwd=_REPO_ROOT,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == [
+        "public.ecr.aws/alias/project",
+        "123456789.dkr.ecr.us-east-1.amazonaws.com/project",
+    ]
+
+
+def test_soci_attestation_follows_the_soci_publication_policy() -> None:
+    """Attesting a SOCI digest on a registry that never received the copy fails
+    with "Cannot resolve ... to a digest". Both scripts ask the same helper."""
+    publish = (_REPO_ROOT / "tools/bin/publish-soci-index").read_text(encoding="utf-8")
+    attest = (_REPO_ROOT / "tools/bin/attest-container").read_text(encoding="utf-8")
+    for script in (publish, attest):
+        assert "common::soci_registries" in script, "one rule, both callers"
+
+    body = attest.split('case "${target}" in', 1)[1]
+    soci_branch = body.split("soci | merged-soci)", 1)[1].split(";;", 1)[0]
+    other_branch = body.split("*)", 1)[1].split(";;", 1)[0]
+    assert "common::soci_registries" in soci_branch
+    assert "common::soci_registries" not in other_branch, (
+        "a plain image is published everywhere and must be attested everywhere"
     )

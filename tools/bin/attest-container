@@ -81,8 +81,22 @@ elif [[ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" && -z "${SIGSTORE_ID_TOKEN:-}" 
     exit 0
 fi
 
-mapfile -t registries < <(python3 -c 'import json,sys
+case "${target}" in
+    soci | merged-soci)
+        # A SOCI copy is published only to the registries Lambda can read it from,
+        # so asking every registry for the tag would fail on the ones that never
+        # received it.
+        mapfile -t registries < <(common::soci_registries)
+        if [[ ${#registries[@]} -eq 0 ]]; then
+            echo "::notice::${runtime_id} (${arch}) ${tag}: no SOCI registry configured, nothing to attest"
+            exit 0
+        fi
+        ;;
+    *)
+        mapfile -t registries < <(python3 -c 'import json,sys
 for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIES_OVERRIDE:-${CONTAINER_REGISTRIES}}")
+        ;;
+esac
 
 for registry in "${registries[@]}"; do
     repository="${registry}/${RUNTIME_ID}"

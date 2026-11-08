@@ -74,3 +74,21 @@ temp_root = Path(
 print(temp_root)
 PY
 }
+
+# common::soci_registries
+#
+# One registry per line: every configured registry that can carry a SOCI copy.
+# Lambda reads SOCI indexes from Amazon ECR, so a copy anywhere else is bytes
+# nothing consumes and is only published when SOCI_REGISTRIES names it.
+common::soci_registries() {
+    python3 - "${SOCI_REGISTRIES:-}" "${CONTAINER_REGISTRIES_OVERRIDE:-${CONTAINER_REGISTRIES:-}}" <<'PYEOF'
+import json
+import sys
+
+explicit, configured = sys.argv[1], sys.argv[2]
+candidates = json.loads(explicit) if explicit else json.loads(configured)
+for registry in candidates:
+    if explicit or registry.startswith("public.ecr.aws/") or ".dkr.ecr." in registry:
+        print(registry)
+PYEOF
+}
