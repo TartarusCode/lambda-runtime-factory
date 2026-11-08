@@ -98,6 +98,24 @@ for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIE
         ;;
 esac
 
+SIGNATURE_TYPE="application/vnd.dev.sigstore.bundle.v0.3+json"
+
+# Media types already attached to a digest. Re-running a release over an
+# unchanged image produces the same digest, and both `oras attach` and `cosign
+# sign` append rather than replace — so a second run would double every referrer.
+# Reading what is present also heals a run that attached some artifacts and then
+# failed: only the missing ones are written.
+attached_types() {
+    oras discover --format json "$1" 2>/dev/null \
+        | python3 -c 'import json, sys
+try:
+    document = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for referrer in document.get("referrers") or []:
+    print(referrer.get("artifactType", ""))' || true
+}
+
 for registry in "${registries[@]}"; do
     repository="${registry}/${RUNTIME_ID}"
     tag_reference="${repository}:${tag}"
@@ -117,8 +135,14 @@ except Exception:
     }
     reference="${repository}@${digest}"
 
-    echo "Signing ${reference}"
-    cosign "${sign_args[@]}" "${reference}"
+    present=$(attached_types "${reference}")
+
+    if grep -qxF "${SIGNATURE_TYPE}" <<< "${present}"; then
+        echo "Skipping cosign sign on ${reference} (signature already attached)"
+    else
+        echo "Signing ${reference}"
+        cosign "${sign_args[@]}" "${reference}"
+    fi
 
     # `oras attach` for every artifact rather than cosign's per-type subcommands:
     # the media type travels with the blob, so `oras discover` lists the whole set
@@ -128,14 +152,18 @@ except Exception:
     if (( ! sign_only )); then
         (
             cd "${compliance_dir}"
-            oras attach --artifact-type application/spdx+json \
-                "${reference}" "${runtime_id}-${arch}.spdx.json:application/spdx+json" >/dev/null
-            oras attach --artifact-type application/vnd.cyclonedx+json \
-                "${reference}" "${runtime_id}-${arch}.cdx.json:application/vnd.cyclonedx+json" >/dev/null
-            oras attach --artifact-type application/vnd.grype.report.v1+json \
-                "${reference}" "${runtime_id}-${arch}.grype.json:application/vnd.grype.report.v1+json" >/dev/null
-            oras attach --artifact-type application/vnd.lambda-runtime.provenance.v1+json \
-                "${reference}" "${runtime_id}-${arch}.provenance.json:application/vnd.lambda-runtime.provenance.v1+json" >/dev/null
+            attach_if_missing() {  # attach_if_missing <file> <media-type>
+                if grep -qxF "$2" <<< "${present}"; then
+                    echo "Skipping $2 on ${reference} (already attached)"
+                    return 0
+                fi
+                oras attach --artifact-type "$2" "${reference}" "$1:$2" >/dev/null
+            }
+            attach_if_missing "${runtime_id}-${arch}.spdx.json" application/spdx+json
+            attach_if_missing "${runtime_id}-${arch}.cdx.json" application/vnd.cyclonedx+json
+            attach_if_missing "${runtime_id}-${arch}.grype.json" application/vnd.grype.report.v1+json
+            attach_if_missing "${runtime_id}-${arch}.provenance.json" \
+                application/vnd.lambda-runtime.provenance.v1+json
         )
     fi
 

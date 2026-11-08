@@ -308,8 +308,9 @@ def test_attaching_the_bundle_uses_paths_oras_accepts() -> None:
     # itself may not.
     attach = script.split('cd "${compliance_dir}"', 1)[1]
     assert "${stem}" not in attach, "oras gets the absolute stem, which it rejects"
+    assert 'oras attach --artifact-type "$2" "${reference}" "$1:$2"' in attach
     for name in ("spdx", "cdx", "grype", "provenance"):
-        assert f"\"${{runtime_id}}-${{arch}}.{name}.json:" in attach
+        assert f'attach_if_missing "${{runtime_id}}-${{arch}}.{name}.json" ' in attach
 
 
 def test_signing_and_attaching_pin_the_digest_not_the_tag() -> None:
@@ -477,3 +478,101 @@ common::retry 2 false || echo "gave up"
 
     soci = (_REPO_ROOT / "tools/bin/publish-soci-index").read_text(encoding="utf-8")
     assert soci.count("common::retry 5") == 2, "the pull and the read-back both retry"
+
+
+def _attest_calls(tmp_path: Path, present: tuple[str, ...]) -> list[str]:
+    """Run attest-container against a stubbed registry; return the calls it made.
+
+    The stub answers `oras discover` with the referrers listed in `present`, so the
+    test drives the idempotency decision rather than reading the script for it.
+    """
+    artifacts = tmp_path / "lambda-runtime-monorepo" / "pypy311" / "x86_64" / "artifacts"
+    compliance = artifacts / "compliance"
+    compliance.mkdir(parents=True)
+    for name in ("spdx", "cdx", "grype", "provenance"):
+        (compliance / f"pypy311-x86_64.{name}.json").write_text("{}", encoding="utf-8")
+
+    referrers = tmp_path / "referrers.json"
+    referrers.write_text(
+        json.dumps({"referrers": [{"artifactType": kind} for kind in present]}), encoding="utf-8"
+    )
+    calls = tmp_path / "calls.log"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+
+    oras = bin_dir / "oras"
+    oras.write_text(
+        "#!/bin/sh\n"
+        'case "$1" in\n'
+        f'  discover) cat "{referrers}" ;;\n'
+        """  manifest) echo '{"digest":"sha256:deadbeef"}' ;;\n"""
+        f'  attach) echo "ATTACH $3" >> "{calls}" ;;\n'
+        "esac\n",
+        encoding="utf-8",
+    )
+    oras.chmod(0o755)
+    cosign = bin_dir / "cosign"
+    cosign.write_text(f'#!/bin/sh\necho "COSIGN" >> "{calls}"\n', encoding="utf-8")
+    cosign.chmod(0o755)
+
+    environment = dict(os.environ)
+    environment.update(
+        {
+            "PATH": f"{bin_dir}:/usr/bin:/bin",
+            # _common.sh derives ARTIFACT_DIR from the build root, so point the
+            # root at the fixture instead of trying to set the derived path.
+            "RUNNER_TEMP": str(tmp_path),
+            "SIGSTORE_ID_TOKEN": "stub",
+            "CONTAINER_REGISTRIES_OVERRIDE": '["public.ecr.aws/alias/project"]',
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(_REPO_ROOT / "tools/bin/attest-container"), "pypy311", "x86_64"],
+        capture_output=True,
+        text=True,
+        env=environment,
+        cwd=_REPO_ROOT,
+    )
+    assert result.returncode == 0, result.stderr
+    return calls.read_text(encoding="utf-8").split() if calls.exists() else []
+
+
+SIGNATURE = "application/vnd.dev.sigstore.bundle.v0.3+json"
+ARTIFACT_TYPES = (
+    "application/spdx+json",
+    "application/vnd.cyclonedx+json",
+    "application/vnd.grype.report.v1+json",
+    "application/vnd.lambda-runtime.provenance.v1+json",
+)
+
+
+def test_a_fresh_digest_gets_signed_and_fully_attested(tmp_path: Path) -> None:
+    calls = _attest_calls(tmp_path, present=())
+
+    assert calls.count("COSIGN") == 1
+    attached = [call for call, _kind in zip(calls, calls[1:]) if call == "ATTACH"]
+    assert sorted(calls[i + 1] for i, call in enumerate(calls) if call == "ATTACH") == sorted(
+        ARTIFACT_TYPES
+    )
+    assert len(attached) == 4
+
+
+def test_re_attesting_the_same_digest_writes_nothing(tmp_path: Path) -> None:
+    """A second release over an unchanged image resolves to the same digest, and
+    both oras and cosign append — so a re-run doubles every referrer."""
+    calls = _attest_calls(tmp_path, present=(*ARTIFACT_TYPES, SIGNATURE))
+
+    assert "COSIGN" not in calls
+    assert "ATTACH" not in calls
+
+
+def test_a_partial_previous_run_is_completed_not_repeated(tmp_path: Path) -> None:
+    """Self-healing: the two artifacts and the signature already on the digest are
+    left alone, the two missing ones are written."""
+    calls = _attest_calls(
+        tmp_path, present=(ARTIFACT_TYPES[0], ARTIFACT_TYPES[1], SIGNATURE)
+    )
+
+    assert "COSIGN" not in calls
+    attached = sorted(calls[i + 1] for i, call in enumerate(calls) if call == "ATTACH")
+    assert attached == [ARTIFACT_TYPES[2], ARTIFACT_TYPES[3]]
