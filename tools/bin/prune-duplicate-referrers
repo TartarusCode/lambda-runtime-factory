@@ -95,14 +95,25 @@ PY
     fi
 
     removed=0
+    failed=0
     while read -r action referrer_digest artifact_type _created; do
         [[ "${action}" == "delete" ]] || continue
-        if oras manifest delete "${repository}@${referrer_digest}" >/dev/null 2>&1; then
+        # `--force` is required: without it oras prompts for confirmation, reads
+        # EOF in a non-interactive shell and cancels — reporting nothing removed
+        # while the referrer stays.
+        if oras manifest delete --force "${repository}@${referrer_digest}" >/dev/null 2>&1; then
             echo "  removed ${referrer_digest} (${artifact_type})"
             removed=$((removed + 1))
         else
             echo "  could not remove ${referrer_digest} (${artifact_type})" >&2
+            failed=$((failed + 1))
         fi
     done <<< "${plan}"
     echo "  removed ${removed}"
+    if (( failed )); then
+        echo "${runtime_id} (${arch}) ${subject}: ${failed} duplicate(s) remain" >&2
+        status=1
+    fi
 done
+
+exit ${status:-0}

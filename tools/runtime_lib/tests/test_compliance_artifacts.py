@@ -615,7 +615,7 @@ def test_pruning_keeps_one_referrer_of_each_type_and_only_deletes_on_request(
     oras = bin_dir / "oras"
     oras.write_text(
         "#!/bin/sh\n"
-        f'if [ "$1" = "manifest" ] && [ "$2" = "delete" ]; then echo "$3" >> "{deleted}"; exit 0; fi\n'
+        f'if [ "$1" = "manifest" ] && [ "$2" = "delete" ]; then for a in "$@"; do last="$a"; done; echo "$last" >> "{deleted}"; exit 0; fi\n'
         """if [ "$1" = "manifest" ]; then echo '{"digest":"sha256:deadbeef"}'; exit 0; fi\n"""
         f'if [ "$1" = "discover" ]; then cat "{referrers}"; exit 0; fi\n'
         "exit 0\n",
