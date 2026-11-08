@@ -149,14 +149,24 @@ jobs:
           # Cells only read the week's database; the grype-db job writes it.
           db-refresh: "false"
       - name: Log in to Iron Bank Registry
+        # Retried: registry1.dso.mil answers `context deadline exceeded` often
+        # enough that one attempt fails a healthy cell. A cell that never reaches
+        # it fails here rather than quietly building on the Red Hat mirror.
         if: ${{ env.IRONBANK_TOKEN != '' }}
-        uses: docker/login-action@v3
-        with:
-          registry: registry1.dso.mil
-          username: ${{ secrets.IRONBANK_USERNAME }}
-          # The resolved value, so the login and build-container's fallback check
-          # cannot disagree about whether credentials exist.
-          password: ${{ env.IRONBANK_TOKEN }}
+        shell: bash
+        env:
+          IRONBANK_USERNAME: ${{ secrets.IRONBANK_USERNAME }}
+          RETRY_DELAY: "15"
+        run: |
+          source tools/bin/_common.sh
+          ib_login() {
+            printf '%s' "${IRONBANK_TOKEN}" \
+              | docker login registry1.dso.mil --username "${IRONBANK_USERNAME}" --password-stdin
+          }
+          if ! common::retry 4 ib_login; then
+            echo "registry1.dso.mil did not answer after 4 attempts" >&2
+            exit 1
+          fi
       - name: Build and audit runtime package
         uses: ./.github/actions/build-and-audit-runtime
         with:

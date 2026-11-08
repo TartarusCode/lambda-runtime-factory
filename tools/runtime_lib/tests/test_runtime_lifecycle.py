@@ -1878,11 +1878,34 @@ def test_the_iron_bank_login_reads_what_the_fallback_check_reads() -> None:
                 assert env.get("IRONBANK_TOKEN") == "${{ secrets.IRONBANK_TOKEN }}", (
                     f"{path.name}:{name} must resolve IRONBANK_TOKEN from the secret"
                 )
-                assert step.get("with", {}).get("password") == "${{ env.IRONBANK_TOKEN }}", (
-                    f"{path.name}:{name} must log in with the resolved IRONBANK_TOKEN, "
-                    "not a separately spelled secret name"
-                )
+                assert step.get("with", {}).get("password") in (
+                    None,
+                    "${{ env.IRONBANK_TOKEN }}",
+                ), f"{path.name}:{name} must log in with the resolved IRONBANK_TOKEN"
+                run = step.get("run", "")
+                if run:
+                    assert "${IRONBANK_TOKEN}" in run, (
+                        f"{path.name}:{name} must log in with the resolved IRONBANK_TOKEN, "
+                        "not a separately spelled secret name"
+                    )
                 assert "IRONBANK_TOKEN" in str(step.get("if", "")), (
                     f"{path.name}:{name} must gate the login on the same variable"
                 )
     assert sites, "no workflow logs in to Iron Bank"
+
+
+def test_the_iron_bank_login_is_retried_without_silently_changing_base() -> None:
+    """registry1.dso.mil answers `context deadline exceeded` often enough that a
+    single attempt fails an otherwise healthy cell. Retrying is safe; falling back
+    to the Red Hat mirror is not, because the published image would then not be on
+    the Iron Bank base the whole project exists to build on."""
+    for name in ("ci.yml", "release-runtime.yml"):
+        text = (_REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+        assert "Log in to Iron Bank Registry" in text, name
+        block = text.split("Log in to Iron Bank Registry", 1)[1].split("- name:", 1)[0]
+
+        assert "common::retry 4 ib_login" in block, name
+        assert "registry1.dso.mil did not answer after 4 attempts" in block, name
+        assert "USE_FALLBACK_UBI" not in block, (
+            f"{name}: a retry must fail rather than publish on another base"
+        )
