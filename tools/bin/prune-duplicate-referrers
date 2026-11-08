@@ -44,7 +44,7 @@ try:
     print(json.load(sys.stdin)["digest"])
 except Exception:
     sys.exit(1)') || {
-        echo "::notice::${reference}: not published, nothing to prune"
+        echo "::notice::${reference}: not published, or not readable with the current credentials"
         continue
     }
     subject="${repository}@${digest}"
