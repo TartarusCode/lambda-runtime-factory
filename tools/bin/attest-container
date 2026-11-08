@@ -64,15 +64,20 @@ for reference in "${references[@]}"; do
 
     # `oras attach` for every artifact rather than cosign's per-type subcommands:
     # the media type travels with the blob, so `oras discover` lists the whole set
-    # and a consumer picks the format it ingests.
-    oras attach --artifact-type application/spdx+json \
-        "${reference}" "${stem}.spdx.json:application/spdx+json" >/dev/null
-    oras attach --artifact-type application/vnd.cyclonedx+json \
-        "${reference}" "${stem}.cdx.json:application/vnd.cyclonedx+json" >/dev/null
-    oras attach --artifact-type application/vnd.grype.report.v1+json \
-        "${reference}" "${stem}.grype.json:application/vnd.grype.report.v1+json" >/dev/null
-    oras attach --artifact-type application/vnd.lambda-runtime.provenance.v1+json \
-        "${reference}" "${stem}.provenance.json:application/vnd.lambda-runtime.provenance.v1+json" >/dev/null
+    # and a consumer picks the format it ingests. The paths are relative because
+    # oras refuses an absolute path by default: a reference must not leak the
+    # layout of the host that produced it.
+    (
+        cd "${compliance_dir}"
+        oras attach --artifact-type application/spdx+json \
+            "${reference}" "${runtime_id}-${arch}.spdx.json:application/spdx+json" >/dev/null
+        oras attach --artifact-type application/vnd.cyclonedx+json \
+            "${reference}" "${runtime_id}-${arch}.cdx.json:application/vnd.cyclonedx+json" >/dev/null
+        oras attach --artifact-type application/vnd.grype.report.v1+json \
+            "${reference}" "${runtime_id}-${arch}.grype.json:application/vnd.grype.report.v1+json" >/dev/null
+        oras attach --artifact-type application/vnd.lambda-runtime.provenance.v1+json \
+            "${reference}" "${runtime_id}-${arch}.provenance.json:application/vnd.lambda-runtime.provenance.v1+json" >/dev/null
+    )
 
     if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         {

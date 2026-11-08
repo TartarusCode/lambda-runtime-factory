@@ -290,3 +290,22 @@ def test_the_image_builds_its_lineage_assertion_into_the_layer() -> None:
     assert "os-release present" in dockerfile, "the assertion must be observable in the build log"
     assert "rm -f /usr/bin/microdnf /usr/bin/dnf /usr/bin/yum" in dockerfile
     assert "microdnf install -y --nodocs --setopt=install_weak_deps=0" in dockerfile
+
+
+def test_attaching_the_bundle_uses_paths_oras_accepts() -> None:
+    """`oras attach` refuses an absolute path by default, because the reference
+    must not describe the host that produced it. A release that passed the
+    artifact's full path failed with "absolute file paths are insecure" after the
+    image had already been signed, so the attach runs from the bundle directory
+    with bare filenames."""
+    script = (_REPO_ROOT / "tools" / "bin" / "attest-container").read_text(encoding="utf-8")
+
+    assert 'cd "${compliance_dir}"' in script
+    assert "--disable-path-validation" not in script, "the path check is the guard, not an obstacle"
+
+    # The existence check above the loop may use the absolute stem; the attach
+    # itself may not.
+    attach = script.split('cd "${compliance_dir}"', 1)[1]
+    assert "${stem}" not in attach, "oras gets the absolute stem, which it rejects"
+    for name in ("spdx", "cdx", "grype", "provenance"):
+        assert f"\"${{runtime_id}}-${{arch}}.{name}.json:" in attach
