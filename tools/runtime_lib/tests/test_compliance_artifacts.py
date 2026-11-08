@@ -309,3 +309,27 @@ def test_attaching_the_bundle_uses_paths_oras_accepts() -> None:
     assert "${stem}" not in attach, "oras gets the absolute stem, which it rejects"
     for name in ("spdx", "cdx", "grype", "provenance"):
         assert f"\"${{runtime_id}}-${{arch}}.{name}.json:" in attach
+
+
+def test_signing_and_attaching_pin_the_digest_not_the_tag() -> None:
+    """A tag can be repointed, so a signature over it does not cover the bytes a
+    consumer later pulls — cosign says so itself when handed a tag. The digest is
+    resolved from the registry once and both the signature and every attachment
+    name that digest; the tag stays the human-facing handle."""
+    script = (_REPO_ROOT / "tools" / "bin" / "attest-container").read_text(encoding="utf-8")
+
+    assert "oras manifest fetch --descriptor" in script, "the digest must come from the registry"
+    assert 'reference="${repository}@${digest}"' in script
+
+    body = script.split('for registry in "${registries[@]}"; do', 1)[1]
+    # Join the `\` continuations so each registry call is one logical command.
+    joined = body.replace("\\\n", " ")
+    pinned = [
+        line.strip()
+        for line in joined.splitlines()
+        if line.strip().startswith(("cosign", "oras attach"))
+    ]
+    assert pinned, "the loop must sign and attach something"
+    for line in pinned:
+        assert "tag_reference" not in line, f"a tag reached the registry call: {line}"
+        assert '"${reference}"' in line, f"not pinned to the digest: {line}"

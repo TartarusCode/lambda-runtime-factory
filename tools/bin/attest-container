@@ -33,6 +33,10 @@ if ! type -P cosign >/dev/null; then
     echo "Install cosign to sign and attest: https://docs.sigstore.dev/cosign/installation/" >&2
     exit 1
 fi
+if ! type -P oras >/dev/null; then
+    echo "Install oras to resolve the digest and attach the bundle: https://oras.land/docs/installation" >&2
+    exit 1
+fi
 
 compliance_dir="${ARTIFACT_DIR}/compliance"
 stem="${compliance_dir}/${runtime_id}-${arch}"
@@ -51,14 +55,24 @@ elif [[ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" && -z "${SIGSTORE_ID_TOKEN:-}" 
     exit 0
 fi
 
-references=()
 mapfile -t registries < <(python3 -c 'import json,sys
 for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIES_OVERRIDE:-${CONTAINER_REGISTRIES}}")
-for registry in "${registries[@]}"; do
-    references+=("${registry}/${RUNTIME_ID}:${CONTAINER_TAG}-${CONTAINER_ARCH}")
-done
 
-for reference in "${references[@]}"; do
+for registry in "${registries[@]}"; do
+    repository="${registry}/${RUNTIME_ID}"
+    tag_reference="${repository}:${CONTAINER_TAG}-${CONTAINER_ARCH}"
+
+    # A tag is mutable, so a signature over it says nothing about the bytes a
+    # consumer pulls later: the tag can be repointed between the push and the
+    # pull. Resolve it once, here, and pin every signature and attachment to the
+    # digest the registry is serving right now.
+    digest=$(oras manifest fetch --descriptor "${tag_reference}" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])') || {
+        echo "Cannot resolve ${tag_reference} to a digest; push the image first" >&2
+        exit 1
+    }
+    reference="${repository}@${digest}"
+
     echo "Signing ${reference}"
     cosign "${sign_args[@]}" "${reference}"
 
