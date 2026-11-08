@@ -1185,7 +1185,25 @@ def test_every_runtime_publishes_to_the_primary_registry_and_ecr_public(monkeypa
 
         assert env["CONTAINER_REGISTRY"] in registries, runtime_id
         assert env["CONTAINER_IMAGE"].startswith(env["CONTAINER_REGISTRY"] + "/"), runtime_id
-        assert "public.ecr.aws/tartaruscode/lambda-runtime-factory" in registries, runtime_id
+        assert (
+            f"public.ecr.aws/{runtime_manifest.DEFAULT_ECR_PUBLIC_ALIAS}/lambda-runtime-factory"
+            in registries
+        ), runtime_id
+
+
+def test_the_live_ecr_alias_is_the_default_and_the_environment_overrides_it(monkeypatch) -> None:
+    """An unset ECR_PUBLIC_ALIAS must resolve to an alias that answers, so a local
+    lookup or a script run without the variable finds the published image rather
+    than a 404 under the alias the project intends to move to."""
+    monkeypatch.delenv("ECR_PUBLIC_ALIAS", raising=False)
+    assert runtime_manifest.DEFAULT_ECR_PUBLIC_ALIAS == "q7s5j4e1"
+    registries = json.loads(runtime_manifest.runtime_env("pypy311", "x86_64")["CONTAINER_REGISTRIES"])
+    assert "public.ecr.aws/q7s5j4e1/lambda-runtime-factory" in registries
+
+    monkeypatch.setenv("ECR_PUBLIC_ALIAS", "anotheralias")
+    registries = json.loads(runtime_manifest.runtime_env("pypy311", "x86_64")["CONTAINER_REGISTRIES"])
+    assert "public.ecr.aws/anotheralias/lambda-runtime-factory" in registries
+    assert not any("q7s5j4e1" in registry for registry in registries), "the override wins"
 
 
 def test_the_ecr_repository_name_excludes_the_account_alias() -> None:
@@ -1214,7 +1232,11 @@ def test_the_ecr_repository_name_excludes_the_account_alias() -> None:
     ).stdout
 
     assert "(repository name lambda-runtime-factory/pypy311)" in output
-    assert "public.ecr.aws/tartaruscode/lambda-runtime-factory/pypy311" in output
+    assert (
+        f"public.ecr.aws/{runtime_manifest.DEFAULT_ECR_PUBLIC_ALIAS}"
+        "/lambda-runtime-factory/pypy311"
+        in output
+    )
 
 
 def test_a_container_can_pass_the_handler_as_cmd() -> None:

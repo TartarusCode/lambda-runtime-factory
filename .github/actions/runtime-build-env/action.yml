@@ -82,47 +82,9 @@ runs:
         fi
         echo "${GRYPE_INSTALL_DIR}" >> "$GITHUB_PATH"
 
-    # Skipped when the week's entry already exists: the entry is immutable, so the
-    # refresh would be discarded at the end of the job.
-    - name: Cache Syft, Cosign and Oras
-      uses: actions/cache@v6
-      with:
-        path: ${{ runner.temp }}/compliance-tools
-        # v2: the entry holds a binary built for this runner's CPU. Entries under
-        # v1 were written before the install consulted `uname -m`, so an ARM64 key
-        # could hold an x86_64 binary and keep being restored.
-        key: compliance-tools-v2-${{ runner.os }}-${{ runner.arch }}-${{ env.SYFT_VERSION }}-${{ env.COSIGN_VERSION }}-${{ env.ORAS_VERSION }}
-
-    - name: Install Syft, Cosign and Oras
-      # The compliance bundle needs a cataloguer (Syft), a signer (Cosign) and an
-      # artifact mover (Oras). Cached by pinned version so a matrix cell does not
-      # pay for three downloads, and pinned at all so a release is reproducible.
-      shell: bash
-      env:
-        COMPLIANCE_TOOL_DIR: ${{ runner.temp }}/compliance-tools
-      run: |
-        set -euo pipefail
-        # The release assets are named for the CPU, not the runner label: an arm64
-        # runner that downloads the x86_64 binary installs something it cannot
-        # exec, and the failure only surfaces at the first registry call.
-        case "$(uname -m)" in
-          x86_64) tool_arch=amd64 ;;
-          aarch64 | arm64) tool_arch=arm64 ;;
-          *) echo "No compliance tooling published for $(uname -m)" >&2; exit 1 ;;
-        esac
-        mkdir -p "${COMPLIANCE_TOOL_DIR}"
-        if [[ -x "${COMPLIANCE_TOOL_DIR}/syft" && -x "${COMPLIANCE_TOOL_DIR}/cosign" && -x "${COMPLIANCE_TOOL_DIR}/oras" ]]; then
-          echo "Compliance tooling restored from cache"
-        else
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
-            | sh -s -- -b "${COMPLIANCE_TOOL_DIR}" "${SYFT_VERSION}"
-          curl -sSfL -o "${COMPLIANCE_TOOL_DIR}/cosign" \
-            "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-${tool_arch}"
-          curl -sSfL "https://github.com/oras-project/oras/releases/download/${ORAS_VERSION}/oras_${ORAS_VERSION#v}_linux_${tool_arch}.tar.gz" \
-            | tar -xz -C "${COMPLIANCE_TOOL_DIR}" oras
-          chmod +x "${COMPLIANCE_TOOL_DIR}/cosign" "${COMPLIANCE_TOOL_DIR}/oras"
-        fi
-        echo "${COMPLIANCE_TOOL_DIR}" >> "${GITHUB_PATH}"
+    # Syft, Cosign and Oras, installed for this runner's CPU. The merge job signs
+    # from the same action, so the architecture mapping exists in one place.
+    - uses: ./.github/actions/compliance-tools
 
     - name: Update vulnerability database
       id: dbupdate

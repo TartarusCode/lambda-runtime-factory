@@ -137,6 +137,10 @@ CONTAINER_ARCH_SLUGS: Dict[str, str] = {
 
 _ECR_PUBLIC_PREFIX = "public.ecr.aws/"
 _ECR_ALIAS = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+# The alias this account can actually push to and pull from. The manifest names
+# the alias the project intends to end up on; until that alias is live, an unset
+# ECR_PUBLIC_ALIAS resolves to the working one instead of an alias that answers 404.
+DEFAULT_ECR_PUBLIC_ALIAS = "q7s5j4e1"
 
 
 def with_ecr_alias(registries: List[str]) -> List[str]:
@@ -144,14 +148,12 @@ def with_ecr_alias(registries: List[str]) -> List[str]:
 
     A custom ECR Public alias can sit pending in the console while the account's
     default alias (an auto-generated name) already works, and a release cannot push
-    into an alias the registry does not consider active. So the manifest names the
+    into an alias the registry does not consider active. The manifest names the
     alias the project *wants* — the one the docs and the image URIs use — and
-    `ECR_PUBLIC_ALIAS` names the one that is live today. Empty or unset means "use
-    the manifest".
+    `ECR_PUBLIC_ALIAS` names the one that is live today, defaulting to the account
+    alias that answers.
     """
-    alias = os.environ.get("ECR_PUBLIC_ALIAS", "").strip()
-    if not alias:
-        return registries
+    alias = os.environ.get("ECR_PUBLIC_ALIAS", "").strip() or DEFAULT_ECR_PUBLIC_ALIAS
     if not _ECR_ALIAS.match(alias):
         raise ValueError(
             f"ECR_PUBLIC_ALIAS '{alias}' is not a valid ECR Public alias "

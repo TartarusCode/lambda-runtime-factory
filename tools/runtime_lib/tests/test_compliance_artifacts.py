@@ -335,12 +335,62 @@ def test_signing_and_attaching_pin_the_digest_not_the_tag() -> None:
         assert '"${reference}"' in line, f"not pinned to the digest: {line}"
 
 
+def test_every_published_reference_gets_its_own_signature() -> None:
+    """A consumer verifies the digest it actually pulls. The SOCI copy and the two
+    merged indexes are different digests from the per-arch image, so each needs its
+    own signature — a signed manifest underneath an unsigned index proves nothing
+    to someone pulling the tag."""
+    script = (_REPO_ROOT / "tools" / "bin" / "attest-container").read_text(encoding="utf-8")
+    assert "--target" in script and "--sign-only" in script
+    for target in ("standard", "soci", "merged", "merged-soci"):
+        assert f"{target}) tag=" in script, f"attest-container cannot target {target}"
+    assert "CONTAINER_SOCI_SUFFIX" in script
+
+    workflow = yaml.safe_load(
+        (_REPO_ROOT / ".github/workflows/release-runtime.yml").read_text(encoding="utf-8")
+    )
+    publish_steps = workflow["jobs"]["publish-containers"]["steps"]
+    sign = next(s for s in publish_steps if s.get("name") == "Sign and attest the image")
+    assert "--target soci" in sign["run"], "the SOCI copy is published unsigned"
+    assert "inputs.publish_soci" in sign["run"], "only sign a copy this run published"
+
+    merge_steps = workflow["jobs"]["merge-containers"]["steps"]
+    merge_sign = next(s for s in merge_steps if s.get("name") == "Sign the multi-arch indexes")
+    assert "--target merged --sign-only" in merge_sign["run"]
+    assert "--target merged-soci" in merge_sign["run"]
+    assert "inputs.publish_soci" in merge_sign["run"]
+
+    # The tools have to be on PATH before the signing step, and the tags have to
+    # exist before the digests can be resolved.
+    tools_at = next(
+        index
+        for index, step in enumerate(merge_steps)
+        if step.get("uses") == "./.github/actions/compliance-tools"
+    )
+    assert tools_at < merge_steps.index(merge_sign), "cosign and oras must be installed first"
+    tags_at = next(index for index, step in enumerate(merge_steps)
+                   if step.get("name") == "Create the multi-arch tags")
+    assert tags_at < merge_steps.index(merge_sign), "the index must exist before it is signed"
+
+
+def test_signing_an_index_attaches_no_bundle() -> None:
+    """The multi-arch index describes no single SBOM: each platform manifest
+    carries its own. `--sign-only` skips both the attachment and the requirement
+    that the artifacts be on disk, which is what lets the merge job sign."""
+    script = (_REPO_ROOT / "tools" / "bin" / "attest-container").read_text(encoding="utf-8")
+
+    assert "if (( ! sign_only )); then" in script
+    guarded = script.split("if (( ! sign_only )); then")
+    assert len(guarded) == 3, "both the artifact check and the attach block are gated"
+    assert "oras attach" in guarded[2], "the attach block sits behind the gate"
+
+
 def test_the_compliance_tools_match_the_runner_architecture() -> None:
     """Release assets are named for the CPU. An arm64 runner that downloads the
     x86_64 asset installs a binary it cannot exec, and nothing notices until the
     signing step calls it — inside a release, after the image is already pushed."""
     action = yaml.safe_load(
-        (_REPO_ROOT / ".github/actions/runtime-build-env/action.yml").read_text(encoding="utf-8")
+        (_REPO_ROOT / ".github/actions/compliance-tools/action.yml").read_text(encoding="utf-8")
     )
     step = next(
         s for s in action["runs"]["steps"] if s.get("name") == "Install Syft, Cosign and Oras"

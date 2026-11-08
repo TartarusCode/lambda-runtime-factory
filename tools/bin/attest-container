@@ -6,7 +6,13 @@
 # long-lived key to leak, and the certificate names the workflow that produced the
 # image — which is the property an ATO reviewer is actually asking about.
 #
-#   attest-container <runtime_id> <arch> [--key <path>]
+#   attest-container <runtime_id> <arch> [--target standard|soci|merged|merged-soci]
+#                                     [--key <path>] [--sign-only]
+#
+#   --target     which published reference to attest: the per-arch image (default),
+#                its SOCI copy, the merged multi-arch index, or the merged SOCI one.
+#   --sign-only  sign the digest without attaching the bundle; the merged index has
+#                no artifacts of its own.
 #
 # Outside CI (or without `id-token: write`) there is no OIDC token, so the script
 # records that and exits 0 rather than pretending it signed anything. A local build
@@ -16,10 +22,14 @@ set -euo pipefail
 source "$(dirname "$0")/_common.sh"
 
 key=""
+target="standard"
+sign_only=0
 positional=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --key) key=${2:-}; shift 2 ;;
+        --target) target=${2:-}; shift 2 ;;
+        --sign-only) sign_only=1; shift ;;
         -*) echo "Unknown option: $1" >&2; exit 2 ;;
         *) positional+=("$1"); shift ;;
     esac
@@ -28,6 +38,17 @@ done
 runtime_id=$(common::require_runtime_id "${positional[0]:-}")
 arch=$(common::require_arch "${positional[1]:-}")
 common::load_runtime_env "${runtime_id}" "${arch}"
+
+# Each published reference is signed and attested on its own: the per-arch image,
+# its SOCI copy, and the multi-arch index that combines them. A consumer verifies
+# whatever digest it pulls, so none of them may be left unsigned.
+case "${target}" in
+    standard) tag="${CONTAINER_TAG}-${CONTAINER_ARCH}" ;;
+    soci) tag="${CONTAINER_TAG}-${CONTAINER_ARCH}${CONTAINER_SOCI_SUFFIX}" ;;
+    merged) tag="${CONTAINER_TAG}" ;;
+    merged-soci) tag="${CONTAINER_TAG}${CONTAINER_SOCI_SUFFIX}" ;;
+    *) echo "Unknown target: ${target} (standard, soci, merged, merged-soci)" >&2; exit 2 ;;
+esac
 
 if ! type -P cosign >/dev/null; then
     echo "Install cosign to sign and attest: https://docs.sigstore.dev/cosign/installation/" >&2
@@ -40,12 +61,17 @@ fi
 
 compliance_dir="${ARTIFACT_DIR}/compliance"
 stem="${compliance_dir}/${runtime_id}-${arch}"
-for artifact in "${stem}.spdx.json" "${stem}.cdx.json" "${stem}.grype.json" "${stem}.provenance.json"; do
-    if [[ ! -f "${artifact}" ]]; then
-        echo "Missing ${artifact}: run generate-compliance-artifacts first" >&2
-        exit 1
-    fi
-done
+# The multi-arch index has no artifact of its own: each platform manifest carries
+# its bundle, and the index is signed so a consumer that pulls the tag and
+# verifies the resolved digest has something to check.
+if (( ! sign_only )); then
+    for artifact in "${stem}.spdx.json" "${stem}.cdx.json" "${stem}.grype.json" "${stem}.provenance.json"; do
+        if [[ ! -f "${artifact}" ]]; then
+            echo "Missing ${artifact}: run generate-compliance-artifacts first" >&2
+            exit 1
+        fi
+    done
+fi
 
 sign_args=(sign --yes)
 if [[ -n "${key}" ]]; then
@@ -60,7 +86,7 @@ for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIE
 
 for registry in "${registries[@]}"; do
     repository="${registry}/${RUNTIME_ID}"
-    tag_reference="${repository}:${CONTAINER_TAG}-${CONTAINER_ARCH}"
+    tag_reference="${repository}:${tag}"
 
     # A tag is mutable, so a signature over it says nothing about the bytes a
     # consumer pulls later: the tag can be repointed between the push and the
@@ -85,24 +111,30 @@ except Exception:
     # and a consumer picks the format it ingests. The paths are relative because
     # oras refuses an absolute path by default: a reference must not leak the
     # layout of the host that produced it.
-    (
-        cd "${compliance_dir}"
-        oras attach --artifact-type application/spdx+json \
-            "${reference}" "${runtime_id}-${arch}.spdx.json:application/spdx+json" >/dev/null
-        oras attach --artifact-type application/vnd.cyclonedx+json \
-            "${reference}" "${runtime_id}-${arch}.cdx.json:application/vnd.cyclonedx+json" >/dev/null
-        oras attach --artifact-type application/vnd.grype.report.v1+json \
-            "${reference}" "${runtime_id}-${arch}.grype.json:application/vnd.grype.report.v1+json" >/dev/null
-        oras attach --artifact-type application/vnd.lambda-runtime.provenance.v1+json \
-            "${reference}" "${runtime_id}-${arch}.provenance.json:application/vnd.lambda-runtime.provenance.v1+json" >/dev/null
-    )
+    if (( ! sign_only )); then
+        (
+            cd "${compliance_dir}"
+            oras attach --artifact-type application/spdx+json \
+                "${reference}" "${runtime_id}-${arch}.spdx.json:application/spdx+json" >/dev/null
+            oras attach --artifact-type application/vnd.cyclonedx+json \
+                "${reference}" "${runtime_id}-${arch}.cdx.json:application/vnd.cyclonedx+json" >/dev/null
+            oras attach --artifact-type application/vnd.grype.report.v1+json \
+                "${reference}" "${runtime_id}-${arch}.grype.json:application/vnd.grype.report.v1+json" >/dev/null
+            oras attach --artifact-type application/vnd.lambda-runtime.provenance.v1+json \
+                "${reference}" "${runtime_id}-${arch}.provenance.json:application/vnd.lambda-runtime.provenance.v1+json" >/dev/null
+        )
+    fi
 
     if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         {
-            echo "#### Signed and attested: ${runtime_id} (${arch})"
+            echo "#### Signed and attested: ${runtime_id} (${arch}) ${tag}"
             echo
             echo "- \`${reference}\`"
-            echo "- SBOMs, CVE report and provenance attached to the digest"
+            if (( sign_only )); then
+                echo "- signature only: the platform manifests carry the bundle"
+            else
+                echo "- SBOMs, CVE report and provenance attached to the digest"
+            fi
             echo
         } >> "${GITHUB_STEP_SUMMARY}"
     fi

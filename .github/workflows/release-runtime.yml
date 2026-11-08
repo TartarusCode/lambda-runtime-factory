@@ -298,9 +298,15 @@ jobs:
       - name: Sign and attest the image
         # Keyless: the OIDC token this job already has becomes a Fulcio
         # certificate, and the SBOMs, CVE report and provenance are attached to
-        # the digest that was just pushed.
+        # the digest that was just pushed. The SOCI copy is a different digest, so
+        # it is signed and attested separately — otherwise a consumer running the
+        # lazy-loaded image gets an unverifiable one.
         if: ${{ github.event.inputs.dry_run != 'true' }}
-        run: bash tools/bin/attest-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
+        run: |
+          bash tools/bin/attest-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
+          if [ "${{ inputs.publish_soci }}" = "true" ]; then
+            bash tools/bin/attest-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --target soci
+          fi
       - name: Upload the compliance bundle
         # The same files, without a registry client: this is what an auditor
         # downloads from the release run.
@@ -363,14 +369,30 @@ jobs:
         run: |
           aws ecr-public get-login-password --region us-east-1 \
             | docker login --username AWS --password-stdin public.ecr.aws
+      - uses: ./.github/actions/compliance-tools
       - name: Create the multi-arch tags
         # Every registry in the manifest gets the same tags, for the standard
-        # image and (where the family has one) the debug image. A dispatch that
-        # targeted one architecture leaves the per-arch tags alone with a notice.
+        # image and, when this run published them, the SOCI copies. A dispatch
+        # that targeted one architecture leaves the per-arch tags alone with a
+        # notice.
         run: |
           arguments=("${{ matrix.runtime }}")
           if [ "${{ inputs.publish_soci }}" = "true" ]; then arguments+=(--soci); fi
           bash tools/bin/merge-container-tags "${arguments[@]}"
+
+      - name: Sign the multi-arch indexes
+        # The merged tags are new digests that reference the per-arch manifests, so
+        # a consumer pulling `:<version>` and verifying the digest it resolves to
+        # checks the index, not the manifest underneath. Signed here, with the
+        # bundle left on each platform manifest rather than duplicated onto the
+        # index, which describes no single SBOM.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash tools/bin/attest-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --target merged --sign-only
+          if [ "${{ inputs.publish_soci }}" = "true" ]; then
+            bash tools/bin/attest-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --target merged-soci --sign-only
+          fi
 
 
   # SOCI publishing lives in `publish-containers` (per architecture) and
