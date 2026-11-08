@@ -66,8 +66,12 @@ for registry in "${registries[@]}"; do
     # consumer pulls later: the tag can be repointed between the push and the
     # pull. Resolve it once, here, and pin every signature and attachment to the
     # digest the registry is serving right now.
-    digest=$(oras manifest fetch --descriptor "${tag_reference}" \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])') || {
+    digest=$(oras manifest fetch --descriptor "${tag_reference}" 2>/dev/null \
+        | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin)["digest"])
+except Exception:
+    sys.exit(1)') || {
         echo "Cannot resolve ${tag_reference} to a digest; push the image first" >&2
         exit 1
     }

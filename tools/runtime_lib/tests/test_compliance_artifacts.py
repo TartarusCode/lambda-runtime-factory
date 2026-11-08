@@ -333,3 +333,29 @@ def test_signing_and_attaching_pin_the_digest_not_the_tag() -> None:
     for line in pinned:
         assert "tag_reference" not in line, f"a tag reached the registry call: {line}"
         assert '"${reference}"' in line, f"not pinned to the digest: {line}"
+
+
+def test_the_compliance_tools_match_the_runner_architecture() -> None:
+    """Release assets are named for the CPU. An arm64 runner that downloads the
+    x86_64 asset installs a binary it cannot exec, and nothing notices until the
+    signing step calls it — inside a release, after the image is already pushed."""
+    action = yaml.safe_load(
+        (_REPO_ROOT / ".github/actions/runtime-build-env/action.yml").read_text(encoding="utf-8")
+    )
+    step = next(
+        s for s in action["runs"]["steps"] if s.get("name") == "Install Syft, Cosign and Oras"
+    )
+    run = step["run"]
+
+    assert "uname -m" in run, "the asset arch comes from the runner, not a constant"
+    assert "cosign-linux-${tool_arch}" in run
+    assert "linux_${tool_arch}.tar.gz" in run
+    assert "cosign-linux-amd64" not in run, "a hardcoded arch silently breaks the other runner"
+    assert "_amd64.tar.gz" not in run
+
+    cache_step = next(
+        s for s in action["runs"]["steps"] if s.get("name") == "Cache Syft, Cosign and Oras"
+    )
+    assert cache_step["with"]["key"].startswith("compliance-tools-v2-"), (
+        "a v1 entry may hold a binary for another CPU"
+    )
