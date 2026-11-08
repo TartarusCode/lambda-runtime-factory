@@ -83,6 +83,11 @@ fi
 printf '%-12s %-8s %6s %6s %7s %6s  %s\n' runtime arch image soci merged msoci verdict
 printf '%s\n' "--------------------------------------------------------------------------------"
 
+# discover_with <reference>: the JSON referrer list, for common::retry.
+discover_with() {
+    oras discover --format json "$1" 2>/dev/null
+}
+
 problems=0
 for runtime_id in "${runtimes[@]}"; do
     for cell_arch in "${archs[@]}"; do
@@ -105,7 +110,10 @@ for runtime_id in "${runtimes[@]}"; do
                 msoci) reference="${repository}:${tag}${CONTAINER_SOCI_SUFFIX}" ;;
             esac
 
-            if ! document=$(oras discover --format json "${reference}" 2>/dev/null); then
+            # A registry can answer `not found` for a reference it is serving — the
+            # same transient the build retries — so a single miss is not evidence of
+            # a missing tag. Retry before reporting it.
+            if ! document=$(common::retry 3 discover_with "${reference}"); then
                 totals[${target}]="?"
                 missing=$((missing + 1))
                 if (( allow_missing )); then
