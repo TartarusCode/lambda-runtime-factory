@@ -1,3 +1,0 @@
-#!/bin/sh
-set -euo pipefail
-exec /opt/rust/bin/"${_HANDLER}"

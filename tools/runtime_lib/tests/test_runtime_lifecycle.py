@@ -941,10 +941,10 @@ def test_the_development_documentation_is_linked_and_present() -> None:
 
 # --- Manifest naming convention -------------------------------------------------
 #
-# `display_name` is what the published layer description is built from
-# ("{display_name} Lambda Runtime"), so a stale one ships to AWS. bun13, go126 and
-# rust194 still read "Bun 1.x", "Go 1.x" and "Rust 1.x" while every line added since
-# is named after its version line by _new_display_name().
+# `display_name` is what the published artifact description is built from
+# ("{display_name} Lambda Runtime"), so a stale one ships to AWS. bun13 and go126
+# still read "Bun 1.x" and "Go 1.x" while every line added since is named after
+# its version line by _new_display_name().
 
 _FAMILY_LABELS = {
     "bun": "Bun",
@@ -1805,7 +1805,7 @@ def test_an_unsatisfied_soname_must_be_declared_and_justified() -> None:
         if runtime_manifest.load_runtime(runtime_id)["container"]["unsatisfied_sonames"]
     }
     assert declared, "the rust family should declare its musl soname"
-    assert set(declared) == {"rust194", "rust198", "rust199"}, declared
+    assert set(declared) == {"rust198", "rust199"}, declared
     for runtime_id, names in declared.items():
         assert names == ["libc.so"], runtime_id
 

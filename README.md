@@ -107,7 +107,6 @@ so `rustc` itself cannot run inside a glibc image (UBI9 ships no musl loader). T
 | `graalpy313` | GraalPy 3.13 | 3.13 | GraalPy on Python, with the image's site-packages on `sys.path` |
 | `pypy311` | PyPy 3.11 | 3.11 | Portable PyPy build from python.org; ships the Runtime API bootstrap and the helper package |
 | `pypy312` | PyPy 3.12 | 3.12 | Portable PyPy build from python.org; ships the Runtime API bootstrap and the helper package |
-| `rust194` | Rust 1.96 | 1.96 | Rust musl toolchain image |
 | `rust198` | Rust 1.98 | 1.98 | Rust musl toolchain image |
 | `rust199` | Rust 1.99 | 1.99 | Rust musl toolchain image |
 
