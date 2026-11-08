@@ -647,7 +647,16 @@ def test_nothing_caches_the_built_payload() -> None:
     assert all(s.get("name") != _BUILT_ARTIFACT_CACHE for s in action["runs"]["steps"]), (
         "the built payload is produced fresh in every cell"
     )
-    assert "artifacts" not in yaml.safe_dump(action["runs"]["steps"]), (
+    # What a cache step restores is its `path`. A key may name a script under
+    # tools/bin (the SBOM cache keys on generate-compliance-artifacts) without
+    # restoring anything that script writes: ARTIFACT_DIR — the built payload and
+    # the bundle beside it — is never a cached path.
+    cached_paths = [
+        str(step.get("with", {}).get("path", ""))
+        for step in action["runs"]["steps"]
+        if isinstance(step.get("with"), dict)
+    ]
+    assert not [path for path in cached_paths if "artifacts" in path], (
         "no cache step may restore the built payload"
     )
 

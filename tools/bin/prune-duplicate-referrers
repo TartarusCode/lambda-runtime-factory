@@ -10,6 +10,9 @@
 # Dry run by default. `--delete` is the explicit opt-in, and it never removes the
 # only referrer of a type, nor anything whose type it cannot read: a policy that
 # deletes what it does not understand is how evidence disappears.
+#
+# Deletion goes through common::delete_referrer, which falls back to the ECR Public
+# API when the registry refuses a direct manifest DELETE on its OCI endpoint.
 set -euo pipefail
 
 source "$(dirname "$0")/_common.sh"
@@ -98,10 +101,10 @@ PY
     failed=0
     while read -r action referrer_digest artifact_type _created; do
         [[ "${action}" == "delete" ]] || continue
-        # `--force` is required: without it oras prompts for confirmation, reads
-        # EOF in a non-interactive shell and cancels — reporting nothing removed
-        # while the referrer stays.
-        if oras manifest delete --force "${repository}@${referrer_digest}" >/dev/null 2>&1; then
+        # `--force` is required inside common::delete_referrer: without it oras
+        # prompts for confirmation, reads EOF in a non-interactive shell and
+        # cancels — reporting nothing removed while the referrer stays.
+        if common::delete_referrer "${repository}" "${referrer_digest}"; then
             echo "  removed ${referrer_digest} (${artifact_type})"
             removed=$((removed + 1))
         else

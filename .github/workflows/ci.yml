@@ -134,10 +134,8 @@ jobs:
       # to the Red Hat UBI9 registry, so the Iron Bank artifact is still built and
       # smoke-tested on an external PR.
       # Resolved once here so the login step and `build-container`'s fallback
-      # check read the same variable. These are *environment* secrets on
-      # `release`, so CI only sees them if they are also set at the repository
-      # level — without them the cells still build and smoke-test the image on
-      # the Red Hat fallback.
+      # check read the same variable. These are repository secrets, so every job in
+      # this repository reads them; a fork's PR has none, and the fallback covers it.
       IRONBANK_TOKEN: ${{ secrets.IRONBANK_TOKEN }}
     steps:
       - uses: actions/checkout@v7

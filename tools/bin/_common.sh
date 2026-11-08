@@ -20,11 +20,16 @@ common::require_arch() {
 
 common::load_runtime_env() {
     local runtime_id=$1
-    local arch
+    local arch env_text
     arch=$(common::require_arch "${2:-}")
-    eval "$(
-        python3 "$(common::manifest_cli)" env --runtime "${runtime_id}" --arch "${arch}"
-    )"
+    # A dropped runtime has no manifest, and `eval "$(failed command)"` evaluates
+    # the empty string: the script then died on an unbound CONTAINER_TAG far from
+    # the cause. Fail here instead, with the generator's own error above it.
+    if ! env_text=$(python3 "$(common::manifest_cli)" env --runtime "${runtime_id}" --arch "${arch}"); then
+        echo "No environment for ${runtime_id} (${arch}): is the runtime still in the manifest?" >&2
+        exit 1
+    fi
+    eval "${env_text}"
 }
 
 common::ensure_runtime_built() {
@@ -91,6 +96,66 @@ for registry in candidates:
     if explicit or registry.startswith("public.ecr.aws/") or ".dkr.ecr." in registry:
         print(registry)
 PYEOF
+}
+
+# common::record_container_digest <field> <registry> <reference> <digest> <skipped>
+#
+# Record what a registry actually published in ${ARTIFACT_DIR}/container.json,
+# keyed by registry under <field> (`registry_digests` for the image itself,
+# `soci_digests` for its SOCI copy). The release reads one file for "what did we
+# publish" instead of re-resolving mutable tags, and a consumer can check the digest
+# the registry served against the record.
+common::record_container_digest() {
+    local field=$1 registry=$2 reference=$3 digest=$4 skipped=$5
+    local record="${ARTIFACT_DIR}/container.json"
+    if [[ ! -f "${record}" ]]; then
+        echo "::notice::${record} is missing; the digest for ${reference} was not recorded" >&2
+        return 0
+    fi
+    python3 - "${record}" "${field}" "${registry}" "${reference}" "${digest}" "${skipped}" <<'PYEOF'
+import json
+import sys
+
+path, field, registry, reference, digest, skipped = sys.argv[1:7]
+
+with open(path, encoding="utf-8") as handle:
+    document = json.load(handle)
+document.setdefault(field, {})[registry] = {
+    "reference": reference,
+    "digest": digest,
+    "skipped": skipped == "true",
+}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(document, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PYEOF
+}
+
+# common::delete_referrer <repository> <digest>
+#
+# Remove one referrer manifest. `oras manifest delete` is the portable path, but
+# Amazon ECR Public rejects a direct manifest DELETE on its OCI endpoint, so a
+# `public.ecr.aws` repository falls back to the ECR Public API, which addresses the
+# same manifest by digest. The repository name there is the part after the alias —
+# the alias is registry-level, not part of the repository.
+common::delete_referrer() {
+    local repository=$1 digest=$2 name
+    if oras manifest delete --force "${repository}@${digest}" >/dev/null 2>&1; then
+        return 0
+    fi
+    case "${repository}" in
+        public.ecr.aws/*)
+            name=${repository#public.ecr.aws/}
+            name=${name#*/}
+            if type -P aws >/dev/null; then
+                aws ecr-public batch-delete-image \
+                    --region "${ECR_PUBLIC_REGION:-us-east-1}" \
+                    --repository-name "${name}" \
+                    --image-ids "imageDigest=${digest}" >/dev/null && return 0
+            fi
+            ;;
+    esac
+    return 1
 }
 
 # common::retry <attempts> <command...>

@@ -1,0 +1,174 @@
+#!/bin/bash
+# Verify the referrers on every published digest, anonymously.
+#
+#   verify-referrers [--registry <registry>] [--runtime <id>] [--arch <arch>]
+#                    [--allow-missing]
+#
+# A published runtime is four digests, and each carries a fixed set of referrers:
+#
+#   <repo>:<tag>-<arch>       SBOMs, CVE report, provenance, signature   -> 5
+#   <repo>:<tag>-<arch>-soci  the same set, for the SOCI copy           -> 5
+#   <repo>:<tag>              the multi-arch index, signature only      -> 1
+#   <repo>:<tag>-soci         the merged SOCI index, signature only     -> 1
+#
+# Exactly that many, and no type repeated: a duplicate is a second `oras attach`
+# that a re-release should not have written, and a missing one is evidence a
+# consumer cannot fetch. The registry default is the ECR Public one from the
+# manifest — the copy Lambda reads, which is also anonymously readable, so this
+# checks what a consumer sees rather than what CI is allowed to see.
+#
+# Exit status: 0 when every digest matches, 1 when any does not.
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+
+registry=""
+runtime=""
+arch=""
+allow_missing=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --registry) registry=${2:-}; shift 2 ;;
+        --runtime) runtime=${2:-}; shift 2 ;;
+        --arch) arch=${2:-}; shift 2 ;;
+        --allow-missing) allow_missing=1; shift ;;
+        -*) echo "Unknown option: $1" >&2; exit 2 ;;
+        *) echo "Unexpected argument: $1" >&2; exit 2 ;;
+    esac
+done
+
+if [[ -z "${registry}" ]]; then
+    # Read the registry from the manifest rather than SOCI_REGISTRIES: this runs
+    # outside the build, so nothing has loaded a runtime's environment yet.
+    registry=$(python3 - "$(common::manifest_cli)" <<'PY'
+import json
+import subprocess
+import sys
+
+cli = sys.argv[1]
+runtimes = subprocess.run([sys.executable, cli, "list"], capture_output=True, text=True).stdout.split()
+if not runtimes:
+    sys.exit(0)
+env_text = subprocess.run(
+    [sys.executable, cli, "env", "--runtime", runtimes[0], "--arch", "x86_64"],
+    capture_output=True, text=True,
+).stdout
+env = {}
+for line in env_text.splitlines():
+    key, _, value = line.partition("=")
+    env[key] = value.strip("'\"")
+for candidate in json.loads(env.get("CONTAINER_REGISTRIES", "[]")):
+    if candidate.startswith("public.ecr.aws/"):
+        print(candidate)
+        break
+PY
+)
+fi
+if [[ -z "${registry}" ]]; then
+    echo "No ECR Public registry to verify; pass --registry" >&2
+    exit 1
+fi
+
+runtimes=()
+if [[ -n "${runtime}" ]]; then
+    runtimes=("${runtime}")
+else
+    mapfile -t runtimes < <(python3 "$(common::manifest_cli)" list)
+fi
+archs=("${arch:-}")
+if [[ -z "${archs[0]}" ]]; then
+    archs=(x86_64 arm64)
+fi
+
+printf '%-12s %-8s %6s %6s %7s %6s  %s\n' runtime arch image soci merged msoci verdict
+printf '%s\n' "--------------------------------------------------------------------------------"
+
+problems=0
+for runtime_id in "${runtimes[@]}"; do
+    for cell_arch in "${archs[@]}"; do
+        env_text=$(python3 "$(common::manifest_cli)" env --runtime "${runtime_id}" --arch "${cell_arch}")
+        tag=$(grep '^CONTAINER_TAG=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
+        slug=$(grep '^CONTAINER_ARCH=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
+        repository="${registry}/${runtime_id}"
+
+        declare -A counts=()
+        declare -A totals=()
+        verdict=""
+        missing=0
+        duplicates=0
+
+        for target in image soci merged msoci; do
+            case "${target}" in
+                image) reference="${repository}:${tag}-${slug}" ;;
+                soci) reference="${repository}:${tag}-${slug}${CONTAINER_SOCI_SUFFIX}" ;;
+                merged) reference="${repository}:${tag}" ;;
+                msoci) reference="${repository}:${tag}${CONTAINER_SOCI_SUFFIX}" ;;
+            esac
+
+            if ! document=$(oras discover --format json "${reference}" 2>/dev/null); then
+                totals[${target}]="?"
+                missing=$((missing + 1))
+                if (( allow_missing )); then
+                    verdict+="missing ${target} (allowed); "
+                else
+                    verdict+="MISSING ${target}; "
+                fi
+                continue
+            fi
+
+            # "<count> <duplicate-summary>" from one discover answer.
+            read -r total duplicates_at_target < <(python3 -c '
+import collections
+import json
+import sys
+
+document = json.load(sys.stdin)
+types = [referrer.get("artifactType", "") for referrer in document.get("referrers") or []]
+counted = collections.Counter(types)
+duplicates = [
+    "{}x{}".format(kind.split("/")[-1], count)
+    for kind, count in sorted(counted.items())
+    if count > 1
+]
+print(len(types), ",".join(duplicates))
+' <<<"${document}")
+
+            totals[${target}]="${total}"
+            if [[ -n "${duplicates_at_target}" ]]; then
+                verdict+="duplicate ${target} ${duplicates_at_target}; "
+                duplicates=$((duplicates + 1))
+            fi
+        done
+
+        # The expected count is the contract: the two per-arch digests carry the
+        # whole bundle, the two indexes carry only a signature.
+        for target in image soci; do
+            if [[ "${totals[${target}]:-?}" != "5" ]]; then
+                problems=$((problems + 1))
+                [[ "${verdict}" == *"${target}"* ]] || verdict+="${target}=${totals[${target}]:-?} expected 5; "
+            fi
+        done
+        for target in merged msoci; do
+            if [[ "${totals[${target}]:-?}" != "1" ]]; then
+                problems=$((problems + 1))
+                [[ "${verdict}" == *"${target}"* ]] || verdict+="${target}=${totals[${target}]:-?} expected 1; "
+            fi
+        done
+        (( duplicates )) && problems=$((problems + duplicates))
+
+        printf '%-12s %-8s %6s %6s %7s %6s  %s\n' \
+            "${runtime_id}" "${cell_arch}" \
+            "${totals[image]:-?}" "${totals[soci]:-?}" \
+            "${totals[merged]:-?}" "${totals[msoci]:-?}" \
+            "${verdict:-ok}"
+
+        unset totals counts
+    done
+done
+
+echo
+if (( problems )); then
+    echo "${problems} problem(s) on ${registry}" >&2
+    exit 1
+fi
+echo "${registry}: every published digest carries its full referrer set, no duplicates"

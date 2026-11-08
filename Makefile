@@ -8,7 +8,7 @@ DEV_BUILD_ENV := BUILD_BEST_EFFORT_AUDIT=0
 
 all: validate-runtimes build
 
-.PHONY: all list-runtimes validate-runtimes check build build-all build-all-arches audit compliance attest test container container-check container-invoke container-audit container-push container-merge container-soci container-repos clean check-updates bump bump-latest roll-off
+.PHONY: all list-runtimes validate-runtimes check build build-all build-all-arches audit compliance attest test container container-check container-invoke container-audit container-push container-merge container-soci container-repos verify-referrers prune-referrers clean check-updates bump bump-latest roll-off
 
 list-runtimes:
 	python3 tools/runtime_lib/runtime_manifest.py list
@@ -70,6 +70,15 @@ container-soci:
 
 container-repos:
 	bash tools/bin/ensure-container-repos "$(RUNTIME)"
+
+# The referrer contract every published digest has to satisfy: 5 on each per-arch
+# image and its SOCI copy, 1 signature on each merged index, no duplicates.
+verify-referrers:
+	bash tools/bin/verify-referrers $(if $(REGISTRY),--registry "$(REGISTRY)")
+
+# Report (or, with DELETE=1, remove) a referrer attached twice to one digest.
+prune-referrers:
+	bash tools/bin/prune-duplicate-referrers "$(RUNTIME)" "$(ARCH)" $(if $(DELETE),--delete)
 
 container-audit: compliance
 

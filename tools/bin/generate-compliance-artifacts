@@ -9,6 +9,12 @@
 #
 #   generate-compliance-artifacts <runtime_id> <arch> [--best-effort]
 #
+# The two SBOMs are cached under ${SBOM_CACHE_DIR} and verified by digest before
+# reuse: the entry records the image digest, the base image digest and the Syft
+# version, so a restored package list always describes the bytes being shipped. The
+# vulnerability report and provenance are recomputed on every run — a cached CVE
+# count would be wrong the moment Grype's database moves.
+#
 # Writes into ${ARTIFACT_DIR}/compliance/:
 #   <runtime>-<arch>.spdx.json        SPDX 2.3 JSON
 #   <runtime>-<arch>.cdx.json         CycloneDX JSON
@@ -58,19 +64,117 @@ fi
 # --- SBOMs ---------------------------------------------------------------------
 # all-layers: the shipped filesystem is the union of every layer, and a base
 # package removed in a later layer is still part of the story an auditor reads.
-echo "Generating SBOMs for ${CONTAINER_LOCAL_IMAGE}"
-syft "docker:${CONTAINER_LOCAL_IMAGE}" --scope all-layers -q \
-    -o "spdx-json=${stem}.spdx.json" \
-    -o "cyclonedx-json=${stem}.cdx.json"
+#
+# A cache hit is a digest match, not a filename match. The metadata file under
+# ${SBOM_CACHE_DIR} records the image digest, the base image digest and the Syft
+# version that produced the documents, so an image rebuilt on different bytes
+# never inherits another image's package list — the cache key only decides which
+# candidate to *look* at. Both documents are restored together: they come from one
+# Syft pass and must describe the same layer set.
+cache_dir="${SBOM_CACHE_DIR}/${runtime_id}/${arch}"
+cache_meta="${cache_dir}/sbom-cache-meta.json"
+cached_spdx="${cache_dir}/${runtime_id}-${arch}.spdx.json"
+cached_cdx="${cache_dir}/${runtime_id}-${arch}.cdx.json"
+
+record_field() {  # record_field <key> [default]: one value from container.json
+    python3 - "${ARTIFACT_DIR}/container.json" "$1" "${2:-}" <<'PY'
+import json
+import sys
+
+path, key, default = sys.argv[1:4]
+try:
+    with open(path, encoding="utf-8") as handle:
+        value = json.load(handle).get(key)
+except Exception:
+    value = None
+print(value or default)
+PY
+}
+
+image_digest=$(record_field image_digest)
+base_image_digest=$(record_field base_image_digest "${CONTAINER_BASE_IMAGE_DIGEST:-}")
+# Without container.json (a bare local run, before `build-container --finish`) the
+# local image id is still the same content hash, so the cache stays honest.
+if [[ -z "${image_digest}" ]]; then
+    image_digest=$(docker image inspect --format '{{.Id}}' "${CONTAINER_LOCAL_IMAGE}" 2>/dev/null || true)
+fi
+
+# Syft's own version is part of the key: a new Syft can recognise packages the old
+# one missed, so its output must never be served under an older entry.
+syft_version=$(syft version -o json 2>/dev/null \
+    | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin).get("version", ""))
+except Exception:
+    print("")' || true)
+if [[ -z "${syft_version}" ]]; then
+    syft_version=$(syft --version 2>/dev/null | awk 'NF { print $NF; exit }')
+fi
+
+cache_state=$(python3 - "${cache_meta}" "${cached_spdx}" "${cached_cdx}" \
+    "${image_digest}" "${base_image_digest}" "${syft_version}" <<'PY'
+import json
+import os
+import sys
+
+meta_path, spdx_path, cdx_path, image_digest, base_image_digest, syft_version = sys.argv[1:7]
+
+
+def readable(path):
+    return os.path.isfile(path) and os.path.getsize(path) > 0
+
+
+try:
+    with open(meta_path, encoding="utf-8") as handle:
+        meta = json.load(handle)
+except Exception:
+    print("miss:no metadata at {}".format(meta_path))
+    sys.exit(0)
+
+if not image_digest:
+    print("miss:no image digest to verify against")
+elif meta.get("image_digest") != image_digest:
+    print("miss:image digest {} -> {}".format(meta.get("image_digest"), image_digest))
+elif meta.get("base_image_digest") != base_image_digest:
+    print("miss:base digest {} -> {}".format(meta.get("base_image_digest"), base_image_digest))
+elif meta.get("syft_version") != syft_version:
+    print("miss:syft {} -> {}".format(meta.get("syft_version"), syft_version))
+elif not readable(spdx_path) or not readable(cdx_path):
+    print("miss:a cached document is missing or empty")
+else:
+    print("hit")
+PY
+)
+cache_hit=${cache_state%%:*}
+cache_reason=${cache_state#*:}
+
+sbom_cache_hit=false
+if [[ "${cache_hit}" == "hit" ]]; then
+    cp "${cached_spdx}" "${stem}.spdx.json"
+    cp "${cached_cdx}" "${stem}.cdx.json"
+    sbom_cache_hit=true
+    echo "SBOM cache hit for ${runtime_id} (${arch}) at ${image_digest}; restored ${cache_dir}"
+else
+    echo "Generating SBOMs for ${CONTAINER_LOCAL_IMAGE} (cache miss: ${cache_reason})"
+    # One pass, both formats: `syft` unpacks every layer once. Two invocations
+    # would unpack the same image twice for the same answer.
+    syft "docker:${CONTAINER_LOCAL_IMAGE}" --scope all-layers -q \
+        -o "spdx-json=${stem}.spdx.json" \
+        -o "cyclonedx-json=${stem}.cdx.json"
+fi
 
 # --- the SBOM must describe the image we ship ----------------------------------
 # An SBOM with only the payload, or only the base, describes a machine that is not
-# this image: the first hides the OS CVEs, the second hides the runtime.
-python3 - "${stem}.spdx.json" "${runtime_id}" "${stem}.sbom-stats.json" <<'PYEOF'
+# this image: the first hides the OS CVEs, the second hides the runtime. It runs on
+# every path — a restored entry is verified exactly like a fresh one, because the
+# cache is an optimisation, not a claim.
+python3 - "${stem}.spdx.json" "${runtime_id}" "${stem}.sbom-stats.json" \
+    "${stem}.cdx.json" <<'PYEOF'
 import json
 import sys
 
 sbom_path, runtime_id, stats_path = sys.argv[1:4]
+cdx_path = sys.argv[4] if len(sys.argv) > 4 else ""
 doc = json.load(open(sbom_path, encoding="utf-8"))
 packages = doc.get("packages") or []
 
@@ -106,6 +210,13 @@ if missing:
 if not runtime_packages:
     sys.exit(f"{sbom_path}: no runtime packages — the SBOM describes the base but not /opt")
 
+# The CycloneDX document travels with the SPDX one, so it carries the same claim:
+# an empty component list would attach an SBOM that attests to nothing.
+if cdx_path:
+    components = (json.load(open(cdx_path, encoding="utf-8")).get("components") or [])
+    if not components:
+        sys.exit(f"{cdx_path}: the CycloneDX document has no components")
+
 with open(stats_path, "w", encoding="utf-8") as handle:
     json.dump(
         {"total": len(packages), "rpm": len(rpm_packages), "runtime": len(runtime_packages)},
@@ -116,6 +227,38 @@ with open(stats_path, "w", encoding="utf-8") as handle:
     handle.write("\n")
 print(f"SBOM: {len(packages)} packages ({len(rpm_packages)} rpm, {len(runtime_packages)} runtime), base present")
 PYEOF
+
+# --- cache the documents, but only after the assertion accepted them ------------
+if [[ "${sbom_cache_hit}" != "true" ]]; then
+    mkdir -p "${cache_dir}"
+    cp "${stem}.spdx.json" "${cached_spdx}"
+    cp "${stem}.cdx.json" "${cached_cdx}"
+    python3 - "${cache_meta}" "${runtime_id}" "${arch}" "${image_digest}" \
+        "${base_image_digest}" "${syft_version}" "${stem}.sbom-stats.json" <<'PY'
+import json
+import sys
+
+path, runtime_id, arch, image_digest, base_image_digest, syft_version, stats = sys.argv[1:8]
+
+record = {
+    "runtime_id": runtime_id,
+    "arch": arch,
+    "image_digest": image_digest,
+    "base_image_digest": base_image_digest,
+    "syft_version": syft_version,
+}
+try:
+    with open(stats, encoding="utf-8") as handle:
+        record["packages"] = json.load(handle)
+except Exception:
+    pass
+
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(record, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+print(f"Cached SBOMs for {runtime_id} ({arch}) at {path}")
+PY
+fi
 
 # --- vulnerability report, produced from the SPDX we publish --------------------
 grype_config_args=()
@@ -164,7 +307,8 @@ if [[ ! -f "${payload_manifest}" ]]; then
     exit 1
 fi
 
-python3 - "${stem}" "${payload_manifest}" "${ARTIFACT_DIR}" "${CONTAINER_LOCAL_IMAGE}" <<'PYEOF'
+python3 - "${stem}" "${payload_manifest}" "${ARTIFACT_DIR}" "${CONTAINER_LOCAL_IMAGE}" \
+    "${sbom_cache_hit}" <<'PYEOF'
 import hashlib
 import json
 import os
@@ -172,6 +316,9 @@ import subprocess
 import sys
 
 stem, payload_manifest, artifact_dir, image = sys.argv[1:5]
+# Absent when the block is run on its own (the tests do that): a document without
+# the flag describes a fresh scan, which is what the default means.
+sbom_cache_hit = (sys.argv[5] if len(sys.argv) > 5 else "false").strip().lower() == "true"
 
 def load(path):
     with open(path, encoding="utf-8") as handle:
@@ -229,6 +376,10 @@ provenance = {
         "spdx": sha256(stem + ".spdx.json") if os.path.exists(stem + ".spdx.json") else "",
         "cdx": sha256(stem + ".cdx.json") if os.path.exists(stem + ".cdx.json") else "",
     },
+    # Recorded, not inferred: an auditor reading the release can tell whether the
+    # package list was regenerated for these bytes or restored from the cache, and
+    # the two documents' hashes above prove the restored bytes are the same ones.
+    "sbom_cache_hit": sbom_cache_hit,
     "grype_summary": counts,
 }
 

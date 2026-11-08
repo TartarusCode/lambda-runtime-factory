@@ -310,7 +310,7 @@ def test_attaching_the_bundle_uses_paths_oras_accepts() -> None:
     assert "${stem}" not in attach, "oras gets the absolute stem, which it rejects"
     assert 'oras attach --artifact-type "$2" "${reference}" "$1:$2"' in attach
     for name in ("spdx", "cdx", "grype", "provenance"):
-        assert f'attach_if_missing "${{runtime_id}}-${{arch}}.{name}.json" ' in attach
+        assert f'attach_artifact "${{runtime_id}}-${{arch}}.{name}.json" ' in attach
 
 
 def test_signing_and_attaching_pin_the_digest_not_the_tag() -> None:

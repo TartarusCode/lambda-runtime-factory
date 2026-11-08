@@ -10,6 +10,10 @@
 # The tag is <version>-<arch-slug>; the merge job creates <version> and the
 # version line from the two per-arch manifests. There is one image per runtime, so
 # there is no variant suffix.
+#
+# Re-running a release over an unchanged image hands the registry the same bytes it
+# already serves. That push is skipped: the digest is read back from the registry
+# and recorded in container.json instead.
 set -euo pipefail
 
 source "$(dirname "$0")/_common.sh"
@@ -31,20 +35,99 @@ if ! docker image inspect "${CONTAINER_LOCAL_IMAGE}" >/dev/null 2>&1; then
     exit 1
 fi
 
+local_digest=$(docker image inspect --format '{{.Id}}' "${CONTAINER_LOCAL_IMAGE}")
+
+# The digest the registry currently serves for a reference, or an empty string when
+# it serves nothing (404), or when the tag holds an index the caller must resolve
+# per platform. `oras` is the reader both push and attest already depend on; a
+# fallback to `docker buildx imagetools inspect` keeps a local run working without
+# it, the same way the release job would.
+remote_manifest_digest() {  # remote_manifest_digest <reference>
+    local reference=$1
+    if type -P oras >/dev/null; then
+        oras manifest fetch --descriptor "${reference}" 2>/dev/null \
+            | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin).get("digest", ""))
+except Exception:
+    pass'
+        return 0
+    fi
+    docker buildx imagetools inspect "${reference}" 2>/dev/null \
+        | awk '/^Digest:/ { print $2; exit }'
+}
+
+# The image *config* digest is what `docker image inspect {{.Id}}` reports, and the
+# registry's manifest names the same value in `config.digest`. Comparing manifests
+# to an image id would never match — the manifest hashes the manifest — so compare
+# the config digest the manifest points at.
+remote_config_digest() {  # remote_config_digest <reference>; 2 means "not a manifest"
+    local reference=$1 document
+    document=$(oras manifest fetch "${reference}" 2>/dev/null) || return 1
+    printf '%s' "${document}" | python3 -c 'import json, sys
+try:
+    document = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if document.get("manifests"):
+    sys.exit(2)
+print((document.get("config") or {}).get("digest", ""))'
+}
+
 mapfile -t registries < <(python3 -c 'import json,sys
 for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIES_OVERRIDE:-${CONTAINER_REGISTRIES}}")
 
 for registry in "${registries[@]}"; do
     reference="${registry}/${RUNTIME_ID}:${CONTAINER_TAG}-${CONTAINER_ARCH}"
-    docker tag "${CONTAINER_LOCAL_IMAGE}" "${reference}"
-    docker push "${reference}"
-    digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "${reference}" 2>/dev/null || true)
-    echo "Pushed ${reference}${digest:+ (${digest})}"
+    skipped=false
+
+    # Digest-level idempotency. A registry that already serves this exact config has
+    # the blobs, the manifest and the tag: re-pushing them churns the tag's
+    # descriptor for no change in content, and every downstream step then has to
+    # re-sign it. Any answer other than a matching config digest — nothing there, an
+    # index, an unreachable registry — falls through to the push, which is the
+    # operation that is always correct.
+    if remote_config=$(remote_config_digest "${reference}"); then
+        if [[ -n "${remote_config}" && "${remote_config}" == "${local_digest}" ]]; then
+            echo "Skipping push of ${reference}: the registry already serves ${local_digest}"
+            skipped=true
+        fi
+    fi
+
+    if [[ "${skipped}" == "true" ]]; then
+        digest=$(remote_manifest_digest "${reference}")
+        echo "Existing ${reference} resolves to ${digest:-an unreadable digest}"
+    else
+        docker tag "${CONTAINER_LOCAL_IMAGE}" "${reference}"
+        docker push "${reference}"
+        # RepoDigests is what Docker recorded from the push response: the digest the
+        # registry assigned to the bytes just written, not a local computation. An
+        # image pushed to two registries carries both, so the repo is matched
+        # exactly rather than taking the first entry — the first is whichever
+        # registry was pushed first.
+        repo="${reference%:*}"
+        digest=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+            "${reference}" 2>/dev/null | awk -F@ -v repo="${repo}" '$1 == repo { print $2; exit }' || true)
+        if [[ -z "${digest}" ]]; then
+            digest=$(remote_manifest_digest "${reference}")
+        fi
+        echo "Pushed ${reference}${digest:+ (${digest})}"
+    fi
+
+    if [[ -z "${digest}" ]]; then
+        echo "::warning::${reference} pushed but its registry digest could not be read; container.json was not updated for ${registry}" >&2
+    else
+        common::record_container_digest registry_digests "${registry}" \
+            "${reference}" "${digest}" "${skipped}"
+    fi
+
     if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         {
             echo "#### Container pushed: ${runtime_id} (${arch})"
             echo
             echo "- \`${reference}\`"
+            [[ "${skipped}" == "true" ]] && echo "- unchanged: the registry already served this digest"
+            [[ -n "${digest}" ]] && echo "- digest \`${digest}\`"
             echo
         } >> "${GITHUB_STEP_SUMMARY}"
     fi
