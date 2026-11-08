@@ -37,11 +37,22 @@ runs:
         if [[ -x "${COMPLIANCE_TOOL_DIR}/syft" && -x "${COMPLIANCE_TOOL_DIR}/cosign" && -x "${COMPLIANCE_TOOL_DIR}/oras" ]]; then
           echo "Compliance tooling restored from cache"
         else
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+          # A CDN 504 while fetching a 100 MB binary must not fail a 20-cell
+          # matrix, so every download retries with the same bounded flags.
+          curl --fail --silent --show-error --location \
+            --retry 5 --retry-all-errors --retry-delay 3 --retry-connrefused \
+            --connect-timeout 30 \
+            https://raw.githubusercontent.com/anchore/syft/main/install.sh \
             | sh -s -- -b "${COMPLIANCE_TOOL_DIR}" "${SYFT_VERSION}"
-          curl -sSfL -o "${COMPLIANCE_TOOL_DIR}/cosign" \
+          curl --fail --silent --show-error --location \
+            --retry 5 --retry-all-errors --retry-delay 3 --retry-connrefused \
+            --connect-timeout 30 \
+            -o "${COMPLIANCE_TOOL_DIR}/cosign" \
             "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-${tool_arch}"
-          curl -sSfL "https://github.com/oras-project/oras/releases/download/${ORAS_VERSION}/oras_${ORAS_VERSION#v}_linux_${tool_arch}.tar.gz" \
+          curl --fail --silent --show-error --location \
+            --retry 5 --retry-all-errors --retry-delay 3 --retry-connrefused \
+            --connect-timeout 30 \
+            "https://github.com/oras-project/oras/releases/download/${ORAS_VERSION}/oras_${ORAS_VERSION#v}_linux_${tool_arch}.tar.gz" \
             | tar -xz -C "${COMPLIANCE_TOOL_DIR}" oras
           chmod +x "${COMPLIANCE_TOOL_DIR}/cosign" "${COMPLIANCE_TOOL_DIR}/oras"
         fi

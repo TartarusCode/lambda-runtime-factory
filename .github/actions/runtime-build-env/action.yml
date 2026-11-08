@@ -77,7 +77,10 @@ runs:
       shell: bash
       run: |
         if [[ ! -x "${GRYPE_INSTALL_DIR}/grype" ]]; then
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh \
+          curl --fail --silent --show-error --location \
+            --retry 5 --retry-all-errors --retry-delay 3 --retry-connrefused \
+            --connect-timeout 30 \
+            https://raw.githubusercontent.com/anchore/grype/main/install.sh \
             | sh -s -- -b "${GRYPE_INSTALL_DIR}" "${GRYPE_VERSION}"
         fi
         echo "${GRYPE_INSTALL_DIR}" >> "$GITHUB_PATH"

@@ -354,13 +354,13 @@ def test_every_published_reference_gets_its_own_signature() -> None:
     publish_steps = workflow["jobs"]["publish-containers"]["steps"]
     sign = next(s for s in publish_steps if s.get("name") == "Sign and attest the image")
     assert "--target soci" in sign["run"], "the SOCI copy is published unsigned"
-    assert "inputs.publish_soci" in sign["run"], "only sign a copy this run published"
+    assert "PUBLISH_SOCI" in sign["run"], "only sign a copy this run published"
 
     merge_steps = workflow["jobs"]["merge-containers"]["steps"]
     merge_sign = next(s for s in merge_steps if s.get("name") == "Sign the multi-arch indexes")
     assert "--target merged --sign-only" in merge_sign["run"]
     assert "--target merged-soci" in merge_sign["run"]
-    assert "inputs.publish_soci" in merge_sign["run"]
+    assert "PUBLISH_SOCI" in merge_sign["run"]
 
     # The tools have to be on PATH before the signing step, and the tags have to
     # exist before the digests can be resolved.

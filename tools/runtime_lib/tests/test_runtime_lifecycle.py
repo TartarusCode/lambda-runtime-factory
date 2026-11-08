@@ -1129,18 +1129,19 @@ def test_the_javascript_helpers_initialize_the_environment_themselves() -> None:
 
 
 
-def test_soci_publishing_is_opt_in_and_needs_no_containerd() -> None:
-    """SOCI is a Lambda Managed Instances optimisation, not part of a working
-    image, and the conversion has to run without a containerd: `soci create` and
+def test_soci_publishing_is_on_by_default_and_needs_no_containerd() -> None:
+    """A release ships the SOCI copies: Lambda Managed Instances read them, so a
+    tag that omits them names a runtime a function cannot lazy-load. The
+    conversion still has to run without a containerd — `soci create` and
     `soci push` resolve the image through the containerd image service, which a
-    runner that builds with Docker does not have. `soci convert --standalone`
+    runner that builds with Docker does not have; `soci convert --standalone`
     reads an OCI layout instead, and oras moves it."""
     release = _workflow("release-runtime.yml")
     inputs = _triggers("release-runtime.yml")["workflow_dispatch"]["inputs"]
-    assert inputs["publish_soci"]["default"] is False
+    assert inputs["publish_soci"]["default"] is True
 
     publish = {step.get("name"): step for step in release["jobs"]["publish-containers"]["steps"]}
-    assert "inputs.publish_soci" in publish["Publish the SOCI-enabled copy"]["if"]
+    assert "env.PUBLISH_SOCI" in publish["Publish the SOCI-enabled copy"]["if"]
 
     merge = {step.get("name"): step for step in release["jobs"]["merge-containers"]["steps"]}
     assert "--soci" in merge["Create the multi-arch tags"]["run"]
@@ -1912,3 +1913,43 @@ def test_the_iron_bank_login_is_retried_without_silently_changing_base() -> None
         assert "USE_FALLBACK_UBI" not in block, (
             f"{name}: a retry must fail rather than publish on another base"
         )
+
+
+def test_every_tool_download_retries() -> None:
+    """A CDN 504 while fetching a tool binary took down half a 20-cell matrix,
+    because a bare `curl -sSfL` retries nothing."""
+    for name in (
+        ".github/actions/compliance-tools/action.yml",
+        ".github/actions/runtime-build-env/action.yml",
+    ):
+        text = (_REPO_ROOT / name).read_text(encoding="utf-8")
+        curls = [
+            " ".join(part.split())
+            for part in text.split("curl ")
+            if part.strip() and not part.startswith('"')
+        ]
+        assert curls, f"{name}: no downloads found"
+        for command in curls[1:]:
+            head = command.split("\n")[0]
+            assert "--retry 5" in command or "--retry 5" in text, f"{name}: {head}"
+            assert "--retry-all-errors" in command or "--retry-all-errors" in text, name
+        assert "curl -sSfL" not in text, f"{name}: a bare download can still fail the matrix"
+
+
+def test_a_tag_push_publishes_the_soci_copies() -> None:
+    """A tag is the release, and a release ships the SOCI copies Lambda Managed
+    Instances read. Reading only the dispatch input left every `-soci` tag to a
+    second, manual run."""
+    workflow = _workflow("release-runtime.yml")
+    env = workflow["env"]
+
+    assert env["PUBLISH_SOCI"] == "${{ github.event_name == 'push' || inputs.publish_soci }}"
+    assert workflow[True]["workflow_dispatch"]["inputs"]["publish_soci"]["default"] is True
+
+    publish = workflow["jobs"]["publish-containers"]["steps"]
+    soci = next(s for s in publish if s.get("name") == "Publish the SOCI-enabled copy")
+    assert "env.PUBLISH_SOCI" in soci["if"]
+
+    for step in publish + workflow["jobs"]["merge-containers"]["steps"]:
+        run = step.get("run") or ""
+        assert "inputs.publish_soci" not in run, f"{step.get('name')} reads the dispatch input"
