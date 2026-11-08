@@ -386,8 +386,6 @@ jobs:
         # checks the index, not the manifest underneath. Signed here, with the
         # bundle left on each platform manifest rather than duplicated onto the
         # index, which describes no single SBOM.
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           bash tools/bin/attest-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --target merged --sign-only
           if [ "${{ inputs.publish_soci }}" = "true" ]; then
