@@ -1,0 +1,108 @@
+#!/bin/bash
+# Report or remove duplicate referrers on a published digest.
+#
+#   prune-duplicate-referrers <runtime_id> <arch> [--tag <tag>] [--delete]
+#
+# A duplicate is two referrers on one digest carrying the same artifactType. The
+# bytes are identical — both were attached from the same compliance bundle — so
+# the earliest is kept: it is the one any external record already points at.
+#
+# Dry run by default. `--delete` is the explicit opt-in, and it never removes the
+# only referrer of a type, nor anything whose type it cannot read: a policy that
+# deletes what it does not understand is how evidence disappears.
+set -euo pipefail
+
+source "$(dirname "$0")/_common.sh"
+
+runtime_id=$(common::require_runtime_id "${1:-}")
+arch=$(common::require_arch "${2:-}")
+shift 2
+
+tag=""
+delete=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --tag) tag=${2:-}; shift 2 ;;
+        --delete) delete=1; shift ;;
+        *) echo "Unknown option: $1" >&2; exit 2 ;;
+    esac
+done
+
+common::load_runtime_env "${runtime_id}" "${arch}"
+tag=${tag:-${CONTAINER_TAG}-${CONTAINER_ARCH}}
+
+mapfile -t registries < <(python3 -c 'import json,sys
+for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIES_OVERRIDE:-${CONTAINER_REGISTRIES}}")
+
+for registry in "${registries[@]}"; do
+    repository="${registry}/${RUNTIME_ID}"
+    reference="${repository}:${tag}"
+
+    digest=$(oras manifest fetch --descriptor "${reference}" 2>/dev/null \
+        | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin)["digest"])
+except Exception:
+    sys.exit(1)') || {
+        echo "::notice::${reference}: not published, nothing to prune"
+        continue
+    }
+    subject="${repository}@${digest}"
+
+    # Print "<delete|keep> <referrer-digest> <artifactType> <created>" per referrer.
+    discover_json="$(common::temp_root)/referrers-${RUNTIME_ID}-${CONTAINER_ARCH}.json"
+    mkdir -p "$(dirname "${discover_json}")"
+    oras discover --format json "${subject}" > "${discover_json}" 2>/dev/null \
+        || echo '{}' > "${discover_json}"
+    plan=$(python3 - "${discover_json}" <<'PY'
+import collections
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        document = json.load(handle)
+except Exception:
+    sys.exit(0)
+
+groups = collections.defaultdict(list)
+for referrer in document.get("referrers") or []:
+    annotations = referrer.get("annotations") or {}
+    groups[referrer.get("artifactType", "")].append(
+        (annotations.get("org.opencontainers.image.created", ""), referrer.get("digest", ""))
+    )
+
+for artifact_type, entries in sorted(groups.items()):
+    # Oldest first; the digest breaks a tie so the plan is deterministic.
+    entries.sort()
+    for index, (created, referrer_digest) in enumerate(entries):
+        action = "keep" if index == 0 else "delete"
+        print(action, referrer_digest, artifact_type or "(no type)", created or "(none)")
+PY
+)
+
+    if [[ -z "${plan}" ]]; then
+        echo "${runtime_id} (${arch}) ${subject}: no referrers"
+        continue
+    fi
+
+    echo "=== ${runtime_id} (${arch}) ${subject}"
+    echo "${plan}" | awk '{ printf "  %-6s %s %s %s\n", $1, $2, $3, $4 }'
+
+    if (( ! delete )); then
+        echo "  dry run: $(echo "${plan}" | grep -c '^delete' || true) duplicate(s) would be removed"
+        continue
+    fi
+
+    removed=0
+    while read -r action referrer_digest artifact_type _created; do
+        [[ "${action}" == "delete" ]] || continue
+        if oras manifest delete "${repository}@${referrer_digest}" >/dev/null 2>&1; then
+            echo "  removed ${referrer_digest} (${artifact_type})"
+            removed=$((removed + 1))
+        else
+            echo "  could not remove ${referrer_digest} (${artifact_type})" >&2
+        fi
+    done <<< "${plan}"
+    echo "  removed ${removed}"
+done

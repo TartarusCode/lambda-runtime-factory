@@ -576,3 +576,86 @@ def test_a_partial_previous_run_is_completed_not_repeated(tmp_path: Path) -> Non
     assert "COSIGN" not in calls
     attached = sorted(calls[i + 1] for i, call in enumerate(calls) if call == "ATTACH")
     assert attached == [ARTIFACT_TYPES[2], ARTIFACT_TYPES[3]]
+
+
+def test_pruning_keeps_one_referrer_of_each_type_and_only_deletes_on_request(
+    tmp_path: Path,
+) -> None:
+    """Releases used to append a second copy of every referrer on an unchanged
+    digest. Pruning keeps the oldest of each type — the one existing records point
+    at — and removes nothing at all unless `--delete` is passed."""
+    referrers = tmp_path / "referrers.json"
+    referrers.write_text(
+        json.dumps(
+            {
+                "referrers": [
+                    {
+                        "artifactType": "application/spdx+json",
+                        "digest": "sha256:old",
+                        "annotations": {
+                            "org.opencontainers.image.created": "2026-11-08T03:00:00Z"
+                        },
+                    },
+                    {
+                        "artifactType": "application/spdx+json",
+                        "digest": "sha256:new",
+                        "annotations": {
+                            "org.opencontainers.image.created": "2026-11-08T04:00:00Z"
+                        },
+                    },
+                    {"artifactType": SIGNATURE, "digest": "sha256:only"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    deleted = tmp_path / "deleted.log"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    oras = bin_dir / "oras"
+    oras.write_text(
+        "#!/bin/sh\n"
+        f'if [ "$1" = "manifest" ] && [ "$2" = "delete" ]; then echo "$3" >> "{deleted}"; exit 0; fi\n'
+        """if [ "$1" = "manifest" ]; then echo '{"digest":"sha256:deadbeef"}'; exit 0; fi\n"""
+        f'if [ "$1" = "discover" ]; then cat "{referrers}"; exit 0; fi\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    oras.chmod(0o755)
+
+    def run(*arguments: str):
+        environment = dict(os.environ)
+        environment.update(
+            {
+                "PATH": f"{bin_dir}:/usr/bin:/bin",
+                "RUNNER_TEMP": str(tmp_path),
+                "CONTAINER_REGISTRIES_OVERRIDE": '["public.ecr.aws/alias/project"]',
+            }
+        )
+        return subprocess.run(
+            [
+                "bash",
+                str(_REPO_ROOT / "tools/bin/prune-duplicate-referrers"),
+                "pypy311",
+                "x86_64",
+                *arguments,
+            ],
+            capture_output=True,
+            text=True,
+            env=environment,
+            cwd=_REPO_ROOT,
+        )
+
+    dry = run()
+    assert dry.returncode == 0, dry.stderr
+    assert "keep   sha256:old" in dry.stdout
+    assert "delete sha256:new" in dry.stdout
+    assert "1 duplicate(s) would be removed" in dry.stdout
+    assert not deleted.exists(), "a dry run must not delete anything"
+
+    real = run("--delete")
+    assert real.returncode == 0, real.stderr
+    assert "removed sha256:new" in real.stdout
+    removals = deleted.read_text(encoding="utf-8").split()
+    assert len(removals) == 1, "the only signature on the digest must survive"
+    assert removals[0].endswith("@sha256:new")
