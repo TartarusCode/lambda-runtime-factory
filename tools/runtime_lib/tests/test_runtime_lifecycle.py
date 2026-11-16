@@ -1231,8 +1231,9 @@ def test_the_ecr_repository_name_excludes_the_account_alias() -> None:
     output = subprocess.run(
         [
             "bash",
-            str(_REPO_ROOT / "tools" / "bin" / "ensure-container-repos"),
+            str(_REPO_ROOT / "tools" / "bin" / "push-container"),
             "pypy311",
+            "--ensure-only",
             "--dry-run",
         ],
         capture_output=True,
@@ -1794,7 +1795,8 @@ def test_the_release_publishes_to_ecr_public_and_writes_a_soci_index() -> None:
     ecr_login = publish["Log in to Amazon ECR Public"]["run"]
     assert "aws ecr-public get-login-password" in ecr_login
     assert "docker login --username AWS" in ecr_login
-    assert "ensure-container-repos" in publish["Ensure the image repositories exist"]["run"]
+    assert "push-container" in publish["Ensure the image repositories exist"]["run"]
+    assert "--ensure-only" in publish["Ensure the image repositories exist"]["run"]
     assert "check-container" in publish["Check the image contract"]["run"]
 
     # SOCI runs beside the image it converts, not in a job that re-fetches it.

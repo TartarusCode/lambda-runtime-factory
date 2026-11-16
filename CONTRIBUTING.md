@@ -172,8 +172,8 @@ its 10 GB container limit, and it does not depend on the daemon.
 no `--fail-on`: the report and its SARIF carry the findings an operator can act on, and the pass/fail
 decision is taken afterwards, in Python, over that report. A **fixable High or Critical** finding
 fails an Iron Bank build. The only thing that releases one is an entry in
-`tools/compliance/ubi-lag-waivers.json`, and only when the entry names that CVE, that package, the
-installed build and the fixed build Grype reports.
+`tools/compliance/ubi-lag-waivers.json`, and only when the entry names that CVE and that package and
+has not expired. `fixed_evr` is not part of matching: it is what the retirement job watches for.
 
 The gate is enforced only on an image whose `base_image_ref` is `registry1.dso.mil`. A build from
 the Red Hat fallback — a fork PR, or any local run without `IRONBANK_TOKEN` — still runs Syft and
@@ -192,12 +192,10 @@ it, and `provenance.json` keeps `grype_summary` as the raw counts while adding
 `ubi_lag_waived_high`, `unwaived_blocking_cves` and `active_poam_advisories`. The job summary row
 renders that as `0/14/9/0 · 0 (14 UBI-lag waived)`, so a high count is never left without a verdict.
 
-Each entry expires, in three ways:
+Each entry ends in one of two ways:
 
 - `expires_on` is the last day it releases anything. The day after, the findings block again and the
   cell log names the expired advisory.
-- An installed build that matches neither `installed_evr` nor `fixed_evr` is `mismatched`: an Iron
-  Bank run fails, because the record would name a package the image does not carry.
 - An entry whose `fixed_evr` — or anything newer — the image now carries is `resolved`. That is a
   `::notice::` in the cell log, not a failure: the image already carries the fix, so the entry
   releases nothing; the weekly retainer deletes it and the notice prompts the cleanup.
@@ -309,7 +307,7 @@ repository name: `public.ecr.aws/tartaruscode/lambda-runtime-factory/pypy311` is
 account, assigned with its first public repository — plus any **custom aliases** requested in the
 ECR console under Public registry settings, and *any active alias* can be used for pulls. That
 is why the manifest names `tartaruscode`: it matches the project and the GHCR path, so only the
-registry host differs between the two. `ensure-container-repos` creates the repository
+registry host differs between the two. `push-container --ensure-only` creates the repository
 idempotently and fails with the account's real aliases when `tartaruscode` is not among them,
 which is a far better error than a push that goes nowhere.
 

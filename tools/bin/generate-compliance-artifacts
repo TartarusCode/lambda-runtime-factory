@@ -25,6 +25,9 @@
 # counts, but records the verdict as advisory and exits 0. The fallback never
 # publishes, so an unenforced scan cannot reach a consumer.
 #
+# This script orchestrates the tools; the gate, the SBOM assertion and the
+# provenance document live in tools/runtime_lib/compliance.py.
+#
 # Writes into ${ARTIFACT_DIR}/compliance/:
 #   <runtime>-<arch>.spdx.json        SPDX 2.3 JSON
 #   <runtime>-<arch>.cdx.json         CycloneDX JSON
@@ -52,6 +55,7 @@ common::load_runtime_env "${runtime_id}" "${arch}"
 compliance_dir="${ARTIFACT_DIR}/compliance"
 mkdir -p "${compliance_dir}"
 stem="${compliance_dir}/${runtime_id}-${arch}"
+compliance_cli="$(common::repo_root)/tools/runtime_lib/compliance.py"
 
 missing_tool() {
     local message="Install $1 to produce the compliance bundle: $2"
@@ -71,11 +75,6 @@ if ! docker image inspect "${CONTAINER_LOCAL_IMAGE}" >/dev/null 2>&1; then
     common::load_runtime_env "${runtime_id}" "${arch}"
 fi
 
-# --- SBOMs ---------------------------------------------------------------------
-# all-layers: the shipped filesystem is the union of every layer, and a base
-# package removed in a later layer is still part of the story an auditor reads.
-# One Syft pass emits both formats: the SPDX document is what Grype scans, and the
-# CycloneDX copy travels beside it on the image digest.
 record_field() {  # record_field <key> [default]: one value from container.json
     python3 - "${ARTIFACT_DIR}/container.json" "$1" "${2:-}" <<'PY'
 import json
@@ -106,73 +105,19 @@ if [[ "${base_source}" == "fallback" ]] || (( best_effort )); then
     enforcement="advisory"
 fi
 
+# --- SBOMs ---------------------------------------------------------------------
+# all-layers: the shipped filesystem is the union of every layer, and a base
+# package removed in a later layer is still part of the story an auditor reads.
 echo "Generating SBOMs for ${CONTAINER_LOCAL_IMAGE}"
 syft "docker:${CONTAINER_LOCAL_IMAGE}" --scope all-layers -q \
     -o "spdx-json=${stem}.spdx.json" \
     -o "cyclonedx-json=${stem}.cdx.json"
 
-# --- the SBOM must describe the image we ship ----------------------------------
-# An SBOM with only the payload, or only the base, describes a machine that is not
-# this image: the first hides the OS CVEs, the second hides the runtime.
-python3 - "${stem}.spdx.json" "${runtime_id}" "${stem}.sbom-stats.json" \
-    "${stem}.cdx.json" <<'PYEOF'
-import json
-import sys
-
-sbom_path, runtime_id, stats_path = sys.argv[1:4]
-cdx_path = sys.argv[4] if len(sys.argv) > 4 else ""
-doc = json.load(open(sbom_path, encoding="utf-8"))
-packages = doc.get("packages") or []
-
-if not packages:
-    sys.exit(f"{sbom_path}: the SBOM has no packages at all")
-
-def purls(package):
-    return [
-        ref.get("referenceLocator", "")
-        for ref in (package.get("externalRefs") or [])
-        if str(ref.get("referenceType", "")).lower() == "purl"
-    ]
-
-rpm_packages = [p for p in packages if any(loc.startswith("pkg:rpm/") for loc in purls(p))]
-runtime_packages = [p for p in packages if p not in rpm_packages]
-
-# The base must be visible by name: without it the SBOM describes only the
-# payload, so every OS CVE would be missing from the report.
-base_names = ("glibc", "zlib", "openssl-libs", "ca-certificates")
-seen = {name: False for name in base_names}
-for package in packages:
-    label = (package.get("name") or "").lower()
-    for wanted in base_names:
-        if label == wanted or label.startswith(wanted + "-"):
-            seen[wanted] = True
-missing = [name for name, found in seen.items() if not found]
-if missing:
-    sys.exit(
-        f"{sbom_path}: no UBI9 base packages ({', '.join(missing)}) — the RPM database "
-        "did not reach Syft, so this SBOM cannot carry RHEL backport lineage"
-    )
-
-if not runtime_packages:
-    sys.exit(f"{sbom_path}: no runtime packages — the SBOM describes the base but not /opt")
-
-# The CycloneDX document travels with the SPDX one, so it carries the same claim:
-# an empty component list would attach an SBOM that attests to nothing.
-if cdx_path:
-    components = (json.load(open(cdx_path, encoding="utf-8")).get("components") or [])
-    if not components:
-        sys.exit(f"{cdx_path}: the CycloneDX document has no components")
-
-with open(stats_path, "w", encoding="utf-8") as handle:
-    json.dump(
-        {"total": len(packages), "rpm": len(rpm_packages), "runtime": len(runtime_packages)},
-        handle,
-        indent=2,
-        sort_keys=True,
-    )
-    handle.write("\n")
-print(f"SBOM: {len(packages)} packages ({len(rpm_packages)} rpm, {len(runtime_packages)} runtime), base present")
-PYEOF
+python3 "${compliance_cli}" sbom-check \
+    --spdx "${stem}.spdx.json" \
+    --runtime "${runtime_id}" \
+    --stats "${stem}.sbom-stats.json" \
+    --cdx "${stem}.cdx.json"
 
 # --- vulnerability report, produced from the SPDX we publish --------------------
 grype_config_args=()
@@ -185,7 +130,7 @@ set +e
 # `--fail-on` is deliberately absent: the severity decision belongs to the gate
 # below, which reads this report and applies the UBI-lag POA&M. `--only-fixed` stays,
 # so the report and the counts derived from it describe the findings an operator can
-# actually act on — the policy this pipeline has always published.
+# actually act on.
 grype "${grype_config_args[@]}" "sbom:${stem}.spdx.json" \
     -o "json=${stem}.grype.json" \
     -o "sarif=${stem}.grype.sarif" --only-fixed -q
@@ -198,323 +143,24 @@ if (( grype_status != 0 )); then
 fi
 
 # --- the severity gate ---------------------------------------------------------
-# A fixable High or Critical finding fails the cell unless an active entry in the
-# UBI-lag POA&M file names that exact CVE, package and installed build. Keeping the
-# acknowledgement outside Grype is what lets the report stay complete; keeping it in
-# a separate file with an expiry is what stops it becoming permanent. An entry stops
-# covering anything on its expiry date, and once the installed package reaches the
-# fixed build the entry is reported for removal instead of quietly outliving the lag.
+# A fixable High or Critical finding fails an Iron Bank cell unless an active entry
+# in the UBI-lag POA&M file names that CVE and package. Keeping the acknowledgement
+# outside Grype is what lets the report stay complete; keeping it in a separate file
+# with an expiry is what stops it becoming permanent. Retirement is the weekly
+# prune-waivers run's job, so a stale entry is reported rather than enforced.
 waiver_file="${UBI_LAG_WAIVERS:-$(common::repo_root)/tools/compliance/ubi-lag-waivers.json}"
 gate_file="${stem}.grype-gate.json"
 set +e
-python3 - "${stem}.grype.json" "${waiver_file}" "${gate_file}" "${stem}.spdx.json" \
-    "${UBI_LAG_WAIVER_TODAY:-}" "${runtime_id}" "${arch}" "$(common::repo_root)" \
-    "${enforcement}" "${base_source}" <<'PYEOF'
-import json
-import os
-import sys
-from datetime import date
-
-report_path, waivers_path, gate_path = sys.argv[1:4]
-spdx_path = sys.argv[4] if len(sys.argv) > 4 else ""
-day_arg = sys.argv[5] if len(sys.argv) > 5 else ""
-runtime_id = sys.argv[6] if len(sys.argv) > 6 else ""
-arch = sys.argv[7] if len(sys.argv) > 7 else ""
-repo_root = sys.argv[8] if len(sys.argv) > 8 else ""
-enforcement = sys.argv[9] if len(sys.argv) > 9 else "enforced"
-base_source = sys.argv[10] if len(sys.argv) > 10 else "ironbank"
-
-SEVERITIES = ("critical", "high")
-REQUIRED = ("advisory", "package", "installed_evr", "fixed_evr", "expires_on", "reason", "cves")
-# Waiver states the gate refuses to pass: the acknowledgement names a build the
-# image does not carry, so the record an auditor reads is wrong. "resolved" is
-# deliberately absent — the fixed RPM is already in the image, so there is nothing
-# left to release; retirement belongs to the weekly `prune-waivers` run, and a
-# notice here is enough to prompt the cleanup. "expired" releases nothing and the
-# findings block on their own; "absent" is a record for a package this image does
-# not carry.
-STALE_STATES = ("mismatched",)
-
-
-def label(text):
-    return f"{runtime_id} ({arch}): {text}" if runtime_id else text
-
-
-# One implementation of RPM ordering for the whole pipeline: the weekly retainer
-# retires an entry with the same comparison the gate uses to call one stale.
-if repo_root:
-    sys.path.insert(0, os.path.join(repo_root, "tools", "runtime_lib"))
-try:
-    from ubi_repo import is_at_least, normalize_evr
-except ImportError as error:
-    print(
-        f"::error::cannot load tools/runtime_lib/ubi_repo.py from {repo_root or 'the checkout'}: {error}",
-        file=sys.stderr,
-    )
-    sys.exit(2)
-
-
-def fail(text):
-    # Exit 2 for a policy failure: the same code Grype uses for "found something",
-    # so a caller keying on the status cannot mistake it for success.
-    message = label(text)
-    print(f"::error::{message}" if runtime_id else message, file=sys.stderr)
-    sys.exit(2)
-
-
-def load(path, what):
-    try:
-        with open(path, encoding="utf-8") as handle:
-            return json.load(handle)
-    except OSError as error:
-        fail(f"{what}: {error}")
-    except ValueError as error:
-        fail(f"{what} is not valid JSON: {error}")
-
-
-def evr(value):
-    """`0:1.21.1-10.el9_8.1`, `1.21.1-10.el9_8.1` and `1.21.1-10.el9_8.1.x86_64`
-    name one build, so the epoch and the arch suffix cannot decide a match."""
-    return normalize_evr(value)
-
-
-def installed_versions(package):
-    """What the image actually carries, read from the SBOM the report came from —
-    a match only exists for a package that has a finding, so an upgraded (now clean)
-    package would be invisible here."""
-    if not spdx_path:
-        return set()
-    try:
-        with open(spdx_path, encoding="utf-8") as handle:
-            document = json.load(handle)
-    except (OSError, ValueError):
-        return set()
-    wanted = package.lower()
-    return {
-        evr(entry.get("versionInfo"))
-        for entry in (document.get("packages") or [])
-        if str(entry.get("name") or "").lower() == wanted
-    }
-
-
-raw = load(waivers_path, f"the UBI-lag POA&M file {waivers_path}")
-entries = raw.get("waivers") if isinstance(raw, dict) else None
-# An empty list is the end state, not a broken file: the weekly update run removes
-# the last entry the week the fixed RPM lands, and the file stays as the record of
-# where acknowledgements go.
-if not isinstance(entries, list):
-    fail(f"{waivers_path} has no 'waivers' list")
-
-waivers = []
-for index, entry in enumerate(entries):
-    where = f"{waivers_path} waiver #{index + 1}"
-    missing = [key for key in REQUIRED if not entry.get(key)]
-    if missing:
-        fail(f"{where} is missing {', '.join(missing)}")
-    cves = entry.get("cves")
-    if not isinstance(cves, list) or not cves:
-        fail(f"{where} lists no CVEs")
-    try:
-        expires = date.fromisoformat(str(entry["expires_on"]))
-    except ValueError:
-        fail(f"{where} has expires_on={entry['expires_on']!r}, which is not YYYY-MM-DD")
-    waivers.append(
-        {
-            "advisory": str(entry["advisory"]),
-            "package": str(entry["package"]),
-            "installed_evr": evr(entry["installed_evr"]),
-            "fixed_evr": evr(entry["fixed_evr"]),
-            "expires_on": expires,
-            "cves": {str(cve).upper() for cve in cves},
-        }
-    )
-
-report = load(report_path, f"the Grype report {report_path}")
-today = date.fromisoformat(day_arg) if day_arg else date.today()
-
-poam = []
-for waiver in waivers:
-    versions = installed_versions(waiver["package"])
-    if not versions:
-        state = "absent"
-        detail = "the image carries no package by that name"
-    elif waiver["installed_evr"] in versions:
-        state = "active"
-        detail = f"the image carries the waived build {waiver['installed_evr']}"
-    elif any(is_at_least(version, waiver["fixed_evr"]) for version in versions):
-        state = "resolved"
-        detail = (
-            f"the image carries {', '.join(sorted(versions))}, at or past the fixed build "
-            f"{waiver['fixed_evr']}, so the lag window has closed and the entry is dead"
-        )
-    else:
-        state = "mismatched"
-        detail = (
-            f"the image carries {', '.join(sorted(versions))}, which is neither the waived "
-            f"build {waiver['installed_evr']} nor the fixed one {waiver['fixed_evr']}"
-        )
-    if waiver["expires_on"] < today:
-        state = "expired"
-        detail = f"expired on {waiver['expires_on'].isoformat()}; {detail}"
-    poam.append(
-        {
-            "advisory": waiver["advisory"],
-            "package": waiver["package"],
-            "state": state,
-            "expires_on": waiver["expires_on"].isoformat(),
-            "detail": detail,
-            "installed_versions": sorted(versions),
-            "cves": sorted(waiver["cves"]),
-        }
-    )
-
-blocking = []
-waived = []
-for match in report.get("matches") or []:
-    vulnerability = match.get("vulnerability") or {}
-    severity = str(vulnerability.get("severity") or "").lower()
-    if severity not in SEVERITIES:
-        continue
-    fix = vulnerability.get("fix") or {}
-    fixed_versions = [evr(version) for version in (fix.get("versions") or [])]
-    if str(fix.get("state") or "").lower() != "fixed" or not fixed_versions:
-        continue
-    artifact = match.get("artifact") or {}
-    package = str(artifact.get("name") or "")
-    installed_version = evr(artifact.get("version"))
-    cve = str(vulnerability.get("id") or "").upper()
-    covering = next(
-        (
-            waiver
-            for waiver in waivers
-            if waiver["package"].lower() == package.lower()
-            and cve in waiver["cves"]
-            and waiver["installed_evr"] == installed_version
-            and waiver["fixed_evr"] in fixed_versions
-            and waiver["expires_on"] >= today
-        ),
-        None,
-    )
-    record = {
-        "cve": cve,
-        "package": package,
-        "installed_version": installed_version,
-        "fixed_version": fixed_versions[0],
-        "severity": severity,
-    }
-    if covering is None:
-        blocking.append(record)
-    else:
-        waived.append(
-            {
-                **record,
-                "advisory": covering["advisory"],
-                "expires_on": covering["expires_on"].isoformat(),
-            }
-        )
-
-# A stale entry fails the run on its own when it names a build the image does not
-# carry (`mismatched`): the record an auditor reads is wrong. `resolved` is not a
-# failure — the image already carries the fix, so nothing is being released; the
-# weekly retainer deletes the entry and the notice below prompts the cleanup.
-# "absent" is a notice and "expired" releases nothing, so its findings block by
-# themselves rather than through this check.
-result = "fail" if blocking or any(entry["state"] in STALE_STATES for entry in poam) else "pass"
-
-gate = {
-    "runtime_id": runtime_id,
-    "arch": arch,
-    "today": today.isoformat(),
-    "result": result,
-    # Enforcement is a property of the base, not of the findings. An Iron Bank
-    # image is the release artifact, so its verdict is enforced; a Red Hat
-    # fallback build records the same verdict without failing, because it never
-    # publishes. Provenance keeps both facts so a reader can tell them apart.
-    "enforcement": enforcement,
-    "base_source": base_source,
-    "policy": (
-        "fixable High and Critical findings fail an Iron Bank build unless an active, "
-        "unexpired UBI-lag POA&M entry names that CVE, package and installed build; a "
-        "fallback build records the verdict without enforcing it"
-    ),
-    "blocking": blocking,
-    "waived": waived,
-    "waived_high": sum(1 for item in waived if item["severity"] == "high"),
-    "waived_critical": sum(1 for item in waived if item["severity"] == "critical"),
-    "active_advisories": sorted({item["advisory"] for item in waived}),
-    "poam": poam,
-}
-with open(gate_path, "w", encoding="utf-8") as handle:
-    json.dump(gate, handle, indent=2, sort_keys=True)
-    handle.write("\n")
-
-for record in blocking:
-    print(
-        label(
-            f"  blocking {record['cve']} {record['package']} "
-            f"{record['installed_version']} -> {record['fixed_version']}"
-        ),
-        file=sys.stderr,
-    )
-for record in waived:
-    print(
-        label(
-            f"  waived {record['cve']} {record['package']} {record['installed_version']} "
-            f"-> {record['fixed_version']} [{record['advisory']}]"
-        ),
-        file=sys.stderr,
-    )
-for entry in poam:
-    if entry["state"] == "active":
-        print(
-            label(
-                f"POA&M {entry['advisory']}: {entry['package']} {entry['installed_versions']} "
-                f"waived until {entry['expires_on']} ({len(entry['cves'])} CVE(s))"
-            ),
-            file=sys.stderr,
-        )
-    elif entry["state"] == "resolved":
-        # The lag window closed: the image carries the fixed build, so the entry
-        # releases nothing. The weekly retainer owns the deletion; this is the
-        # friendly prompt, not a red build.
-        notice = label(
-            f"POA&M {entry['advisory']} is now resolved upstream — "
-            "time to clean up tools/compliance/ubi-lag-waivers.json"
-        )
-        print(f"::notice::{notice}", file=sys.stderr)
-    else:
-        message = label(
-            f"POA&M {entry['advisory']} for {entry['package']} is {entry['state']}: "
-            f"{entry['detail']} — remove it from tools/compliance/ubi-lag-waivers.json"
-        )
-        # A mismatched entry is an error: it fails this run. Absent and expired
-        # are warnings — the record is informational and the findings block on
-        # their own where they still apply.
-        level = "error" if entry["state"] in STALE_STATES else "warning"
-        print(f"::{level}::{message}" if runtime_id else message, file=sys.stderr)
-
-summary = (
-    f"{len(blocking)} unwaived fixable High/Critical CVE(s), "
-    f"{len(waived)} waived ({gate['waived_high']} High, {gate['waived_critical']} Critical)"
-)
-if result == "fail" and enforcement == "advisory":
-    # The fallback image is not a release artifact. Keep the verdict, keep the
-    # blocking list in the log, and let the cell succeed so a fork PR can be
-    # exercised without Iron Bank credentials.
-    advisory = label(
-        "the severity gate recorded a failure but did not enforce it: "
-        f"this image was built from the {base_source} base, which is not a release "
-        f"artifact; {summary}"
-    )
-    print(f"::warning::{advisory}", file=sys.stderr)
-    sys.exit(0)
-if result == "fail":
-    print(f"::error::{label('the severity gate failed: ' + summary)}" if runtime_id else label(
-        f"the severity gate failed: {summary}"
-    ), file=sys.stderr)
-    sys.exit(2)
-print(label(f"the severity gate passed: {summary}"), file=sys.stderr)
-PYEOF
+python3 "${compliance_cli}" gate \
+    --report "${stem}.grype.json" \
+    --waivers "${waiver_file}" \
+    --gate-out "${gate_file}" \
+    --spdx "${stem}.spdx.json" \
+    --today "${UBI_LAG_WAIVER_TODAY:-}" \
+    --runtime "${runtime_id}" \
+    --arch "${arch}" \
+    --enforcement "${enforcement}" \
+    --base-source "${base_source}"
 gate_status=$?
 set -e
 if (( gate_status != 0 )) && (( best_effort )); then
@@ -546,139 +192,17 @@ if [[ ! -f "${payload_manifest}" ]]; then
     exit 1
 fi
 
-python3 - "${stem}" "${payload_manifest}" "${ARTIFACT_DIR}" "${CONTAINER_LOCAL_IMAGE}" \
-    "${gate_file}" <<'PYEOF'
-import hashlib
-import json
-import os
-import subprocess
-import sys
-
-stem, payload_manifest, artifact_dir, image = sys.argv[1:5]
-# Absent when the block is run on its own (the tests do that): a document without a
-# gate verdict has nothing waiver-related to record.
-gate_path = sys.argv[5] if len(sys.argv) > 5 else ""
-
-def load(path):
-    with open(path, encoding="utf-8") as handle:
-        return json.load(handle)
-
-def sha256(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-def docker_format(template, ref):
-    try:
-        return subprocess.run(
-            ["docker", "image", "inspect", "--format", template, ref],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-    except subprocess.CalledProcessError:
-        return ""
-
-payload = load(payload_manifest)
-container_record = {}
-record_path = os.path.join(artifact_dir, "container.json")
-if os.path.exists(record_path):
-    container_record = load(record_path)
-
-grype_path = stem + ".grype.json"
-counts = {"Critical": 0, "High": 0, "Medium": 0, "Low": 0, "Negligible": 0, "Unknown": 0}
-if os.path.exists(grype_path):
-    for match in (load(grype_path).get("matches") or []):
-        severity = ((match.get("vulnerability") or {}).get("severity") or "Unknown").capitalize()
-        counts[severity if severity in counts else "Unknown"] += 1
-
-provenance = {
-    "runtime_id": payload.get("runtime_id"),
-    "arch": payload.get("arch"),
-    "distribution_version": payload.get("distribution_version"),
-    "upstream_archive_url": payload.get("upstream_archive_url"),
-    "upstream_sha256": payload.get("upstream_sha256"),
-    "base_image_ref": container_record.get("base_image_ref", ""),
-    "base_image_digest": container_record.get("base_image_digest", ""),
-    # The digest this build replaced in the registry, resolved before the push moved
-    # the tag. null means nothing was replaced (a new tag, an unchanged image, or a
-    # registry this run could not read), which is why it is quoted rather than implied.
-    "supersedes_digest": container_record.get("supersedes_digest"),
-    "image_digest": docker_format("{{.Id}}", image),
-    "unpacked_size_bytes": container_record.get("unpacked_size_bytes", 0),
-    "stig_verification": {
-        "user": container_record.get("user", ""),
-        "package_managers_removed": container_record.get("package_managers_removed", False),
-        "rpm_db_present": container_record.get("rpm_db_present", False),
-        "read_only_rootfs_verified": container_record.get("read_only_rootfs_verified", False),
-    },
-    "sbom": {
-        "packages": load(stem + ".sbom-stats.json") if os.path.exists(stem + ".sbom-stats.json") else {},
-    },
-    "sbom_sha256": {
-        "spdx": sha256(stem + ".spdx.json") if os.path.exists(stem + ".spdx.json") else "",
-        "cdx": sha256(stem + ".cdx.json") if os.path.exists(stem + ".cdx.json") else "",
-    },
-    "grype_summary": counts,
-}
-
-# The gate verdict and the POA&M it applied, recorded beside the raw counts: the
-# summary above stays raw, because a waived finding is still a finding and an
-# artifact that reported high=0 would misdescribe the image. These keys say how
-# many findings the severity gate let through, under which advisory, and until when.
-gate = {}
-if gate_path and os.path.exists(gate_path):
-    gate = load(gate_path)
-if gate:
-    provenance.update(
-        {
-            "cve_gate": gate.get("result", ""),
-            # Whether that verdict was enforced, and which base produced it. A
-            # fallback build carries "advisory" here even when the gate found
-            # blocking CVEs, because the image never publishes.
-            "cve_gate_enforcement": gate.get("enforcement", "enforced"),
-            "cve_gate_base_source": gate.get("base_source", "ironbank"),
-            "ubi_lag_waived_high": gate.get("waived_high", 0),
-            "ubi_lag_waived_critical": gate.get("waived_critical", 0),
-            "waived_cve_ids": sorted(
-                item.get("cve", "") for item in (gate.get("waived") or [])
-            ),
-            "unwaived_blocking_cves": len(gate.get("blocking") or []),
-            "unwaived_blocking_cve_ids": sorted(
-                item.get("cve", "") for item in (gate.get("blocking") or [])
-            ),
-            "active_poam_advisories": gate.get("active_advisories") or [],
-        }
-    )
-
-out = stem + ".provenance.json"
-with open(out, "w", encoding="utf-8") as handle:
-    json.dump(provenance, handle, indent=2, sort_keys=True)
-    handle.write("\n")
-print(f"Provenance: {out}")
-print(f"CVEs: critical={counts['Critical']} high={counts['High']} medium={counts['Medium']} low={counts['Low']}")
-PYEOF
+python3 "${compliance_cli}" provenance \
+    --stem "${stem}" \
+    --payload-manifest "${payload_manifest}" \
+    --artifact-dir "${ARTIFACT_DIR}" \
+    --image "${CONTAINER_LOCAL_IMAGE}" \
+    --gate "${gate_file}"
 
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
-    python3 - "${stem}.provenance.json" "${GITHUB_STEP_SUMMARY}" <<'PYEOF'
-import json
-import sys
-
-provenance = json.load(open(sys.argv[1], encoding="utf-8"))
-counts = provenance["grype_summary"]
-base = "IronBank" if "registry1.dso.mil" in provenance["base_image_ref"] else "UBI-Fallback"
-with open(sys.argv[2], "a", encoding="utf-8") as handle:
-    handle.write(
-        "| {runtime_id} | {arch} | {base} | {size:.1f} | {sbom} | {c}/{h}/{m}/{l} |\n".format(
-            runtime_id=provenance["runtime_id"],
-            arch=provenance["arch"],
-            base=base,
-            size=(provenance["unpacked_size_bytes"] or 0) / 1048576,
-            sbom="spdx+cdx",
-            c=counts["Critical"], h=counts["High"], m=counts["Medium"], l=counts["Low"],
-        )
-    )
-PYEOF
+    python3 "${compliance_cli}" summary \
+        --provenance "${stem}.provenance.json" \
+        --summary "${GITHUB_STEP_SUMMARY}"
 fi
 
 echo "Compliance bundle for ${runtime_id} (${arch}) written to ${compliance_dir}"

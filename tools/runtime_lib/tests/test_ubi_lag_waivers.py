@@ -21,23 +21,13 @@ import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _SCRIPT = _REPO_ROOT / "tools" / "bin" / "generate-compliance-artifacts"
+_COMPLIANCE = _REPO_ROOT / "tools" / "runtime_lib" / "compliance.py"
 _POAM = _REPO_ROOT / "tools" / "compliance" / "ubi-lag-waivers.json"
 _BUILD_CONTAINER = _REPO_ROOT / "tools" / "bin" / "build-container"
 
 KRB5_INSTALLED = "1.21.1-10.el9_8.1"
 KRB5_FIXED = "1.21.1-10.el9_9.2"
 TODAY = "2026-11-16"
-
-# The POA&M block is the second heredoc; the SBOM assertion above it is the first.
-_GATE_BLOCK = 1
-_PROVENANCE_BLOCK = 2
-
-
-def _block(index: int) -> str:
-    text = _SCRIPT.read_text(encoding="utf-8")
-    blocks = re.findall(r"<<'PYEOF'\n(.*?)\nPYEOF", text, flags=re.S)
-    assert len(blocks) >= 4, "the SBOM check, the gate, the provenance and the row are all blocks"
-    return blocks[index]
 
 
 def shipped_waiver() -> dict:
@@ -104,17 +94,25 @@ def _gate(
     result = subprocess.run(
         [
             sys.executable,
-            "-c",
-            _block(_GATE_BLOCK),
+            str(_COMPLIANCE),
+            "gate",
+            "--report",
             str(report),
+            "--waivers",
             str(waivers),
+            "--gate-out",
             str(gate_path),
+            "--spdx",
             str(spdx),
+            "--today",
             today,
+            "--runtime",
             "pypy311",
+            "--arch",
             "x86_64",
-            str(_REPO_ROOT),
+            "--enforcement",
             enforcement,
+            "--base-source",
             base_source,
         ],
         capture_output=True,
@@ -152,21 +150,6 @@ def test_an_expired_waiver_stops_covering_its_findings(tmp_path: Path) -> None:
     assert gate["poam"][0]["state"] == "expired"
     assert gate["waived"] == []
     assert len(gate["blocking"]) == 1
-
-
-def test_a_waiver_for_a_build_the_image_no_longer_carries_fails(tmp_path: Path) -> None:
-    """The record must describe the image. An installed build that matches neither
-    the waived one nor the fixed one means the POA&M is stale in a way a reader
-    cannot see from the CVE list alone — so the run fails even with no finding left
-    to block on."""
-    report, spdx, waivers = _fixture(tmp_path, [], installed="1.21.1-10.el9_8.2")
-
-    result, gate = _gate(tmp_path, report, spdx, waivers)
-
-    assert gate["blocking"] == [], "there is nothing left to block on"
-    assert gate["poam"][0]["state"] == "mismatched"
-    assert "1.21.1-10.el9_8.2" in gate["poam"][0]["detail"]
-    assert result.returncode == 2, result.stderr
 
 
 def test_a_resolved_waiver_is_a_notice_not_a_failure(tmp_path: Path) -> None:
@@ -291,6 +274,21 @@ def test_the_active_rhsa_waiver_passes_while_the_finding_stays_in_the_report(
     assert len(kept) == len(cves)
 
 
+def test_a_waiver_matches_on_cve_and_package_not_the_installed_build(tmp_path: Path) -> None:
+    """A POA&M acknowledges a CVE for a package until a date. The old exact-build
+    match made the entry fail whenever either base patched on a different day, which
+    is the whole problem a single waiver list cannot solve."""
+    waiver = shipped_waiver()
+    waiver["installed_evr"] = "0:9.9.9-1.el9"  # an extra field must not affect matching
+    report, spdx, waivers = _fixture(tmp_path, [_match()], waiver=waiver)
+
+    result, gate = _gate(tmp_path, report, spdx, waivers)
+
+    assert result.returncode == 0, result.stderr
+    assert len(gate["waived"]) == 1
+    assert gate["blocking"] == []
+
+
 def test_a_finding_without_a_published_fix_does_not_block(tmp_path: Path) -> None:
     """`--only-fixed` used to express this; the gate has to carry it now, or every
     wont-fix and unfixed advisory in the base turns the pipeline red."""
@@ -369,12 +367,17 @@ def test_the_provenance_keeps_raw_counts_and_adds_the_poam_verdict(tmp_path: Pat
     run = subprocess.run(
         [
             sys.executable,
-            "-c",
-            _block(_PROVENANCE_BLOCK),
+            str(_COMPLIANCE),
+            "provenance",
+            "--stem",
             str(stem),
+            "--payload-manifest",
             str(payload),
+            "--artifact-dir",
             str(tmp_path),
+            "--image",
             "example.invalid/pypy311:3.11",
+            "--gate",
             str(gate_path),
         ],
         capture_output=True,
@@ -402,14 +405,12 @@ def test_the_shipped_poam_is_a_usable_record() -> None:
         assert {
             "advisory",
             "package",
-            "installed_evr",
             "fixed_evr",
             "expires_on",
             "reason",
             "cves",
         } <= set(entry)
         assert re.fullmatch(r"RHSA-\d{4}:\d+", entry["advisory"]), entry["advisory"]
-        assert entry["installed_evr"] != entry["fixed_evr"], "a waiver for an unchanged build is a no-op"
         try:
             date.fromisoformat(entry["expires_on"])
         except ValueError:
@@ -448,14 +449,14 @@ def test_the_gate_decides_the_policy_not_grypes_fail_on() -> None:
 
 
 def test_the_provenance_step_is_handed_the_gate_verdict() -> None:
-    """The gate file is a positional argument, and dropping it fails silently: the
+    """The gate file is a named argument, and dropping it fails silently: the
     provenance would simply carry no waiver record, so the artifact would stop saying
     which findings the gate released and under which advisory."""
     script = _SCRIPT.read_text(encoding="utf-8")
-    invocation = script.split('python3 - "${stem}" "${payload_manifest}"', 1)[1]
-    invocation = invocation.split("<<'PYEOF'", 1)[0]
+    invocation = script.split('python3 "${compliance_cli}" provenance', 1)[1]
+    invocation = invocation.split("\n\n", 1)[0]
 
-    assert '"${gate_file}"' in invocation, "the provenance block never sees the verdict"
+    assert '"${gate_file}"' in invocation, "the provenance step never sees the verdict"
 
 
 def test_a_compliance_change_builds_the_canary_cell() -> None:

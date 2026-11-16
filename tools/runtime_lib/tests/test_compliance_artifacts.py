@@ -19,6 +19,7 @@ import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _TOOLS = _REPO_ROOT / "tools" / "bin"
+_COMPLIANCE = _REPO_ROOT / "tools" / "runtime_lib" / "compliance.py"
 
 
 def _heredoc(script: Path, index: int = 0) -> str:
@@ -123,10 +124,22 @@ def test_the_provenance_manifest_records_the_evidence_a_cato_asks_for(tmp_path: 
         encoding="utf-8",
     )
 
-    result = _run(
-        # Blocks in order: the SBOM assertion, the CVE detail, this manifest, the row.
-        _heredoc(_TOOLS / "generate-compliance-artifacts", index=2),
-        [str(stem), str(payload), str(tmp_path), "example.invalid/pypy311:3.11"],
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_COMPLIANCE),
+            "provenance",
+            "--stem",
+            str(stem),
+            "--payload-manifest",
+            str(payload),
+            "--artifact-dir",
+            str(tmp_path),
+            "--image",
+            "example.invalid/pypy311:3.11",
+        ],
+        capture_output=True,
+        text=True,
     )
     assert result.returncode == 0, result.stderr
 

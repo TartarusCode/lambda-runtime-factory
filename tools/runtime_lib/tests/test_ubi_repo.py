@@ -150,7 +150,6 @@ def test_a_waiver_is_retired_only_when_the_fixed_evr_is_published(tmp_path: Path
     assert retired[0]["package"] == "krb5-libs"
     assert retired[0]["fixed_evr"] == "0:" + FIXED
     assert retired[0]["published_evrs"] == sorted(["0:" + FIXED])
-    assert retired[0]["installed_evr"] == "0:" + INSTALLED
 
     document = json.loads(path.read_text(encoding="utf-8"))
     assert document["waivers"] == [], "the entry is deleted, and the file remains a valid record"
@@ -198,12 +197,9 @@ def test_the_shipped_waiver_file_is_where_the_retainer_writes() -> None:
     document = json.loads(_POAM.read_text(encoding="utf-8"))
     assert "waivers" in document
     for entry in document["waivers"]:
-        # The retainer needs these three keys to decide anything at all.
+        # The retainer needs these keys to decide anything at all.
         assert entry["package"] and entry["fixed_evr"]
         date.fromisoformat(entry["expires_on"])
-        assert compare_evr(entry["fixed_evr"], entry["installed_evr"]) > 0, (
-            "a waiver for a build that is already fixed would retire on the next run"
-        )
 
 
 def test_the_update_workflow_prunes_and_carries_the_change_into_its_pull_request() -> None:

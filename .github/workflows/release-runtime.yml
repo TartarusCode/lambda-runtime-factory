@@ -297,7 +297,7 @@ jobs:
         # A first push to a new runtime fails on ECR Public unless the repository
         # exists; GHCR creates the package itself.
         if: ${{ github.event.inputs.dry_run != 'true' }}
-        run: bash tools/bin/ensure-container-repos "${{ matrix.runtime }}"
+        run: bash tools/bin/push-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --ensure-only
       - name: Prepare the image build
         env:
           CONTAINER_BUILD_CACHE: gha

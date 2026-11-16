@@ -5,11 +5,14 @@
 # the local image first and only then publish exactly the bytes that passed. The
 # per-arch tag is what the merge job combines into the multi-arch tag.
 #
-#   push-container <runtime_id> <arch>
+#   push-container <runtime_id> <arch> [--ensure-only]
 #
 # The tag is <version>-<arch-slug>; the merge job creates <version> and the
 # version line from the two per-arch manifests. There is one image per runtime, so
 # there is no variant suffix.
+#
+# --ensure-only creates the registry repositories without pushing, for a release
+# that wants the first-push setup to fail before the matrix starts.
 #
 # Re-running a release over an unchanged image hands the registry the same bytes it
 # already serves. That push is skipped: the digest is read back from the registry
@@ -18,9 +21,13 @@ set -euo pipefail
 
 source "$(dirname "$0")/_common.sh"
 
+ensure_only=0
+dry_run=0
 positional=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --ensure-only) ensure_only=1; shift ;;
+        --dry-run) dry_run=1; shift ;;
         -*) echo "Unknown option: $1" >&2; exit 2 ;;
         *) positional+=("$1"); shift ;;
     esac
@@ -29,6 +36,69 @@ done
 runtime_id=$(common::require_runtime_id "${positional[0]:-}")
 arch=$(common::require_arch "${positional[1]:-}")
 common::load_runtime_env "${runtime_id}" "${arch}"
+
+mapfile -t registries < <(python3 -c 'import json,sys
+for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIES_OVERRIDE:-${CONTAINER_REGISTRIES}}")
+
+# ECR Public does not create a repository on first push, and the repository name
+# excludes the account alias: public.ecr.aws/<alias>/<prefix>/<image> is repository
+# <prefix>/<image>. Anything that cannot be created is reported and left to the
+# push, which surfaces the real reason.
+ensure_repository() {  # ensure_repository <registry>
+    local registry=$1 path alias prefix repo registry_json account_aliases
+    case "${registry}" in
+        public.ecr.aws/*) ;;
+        *) return 0 ;;
+    esac
+    if ! type -P aws >/dev/null; then
+        echo "::notice::aws CLI is not installed; ${registry} is assumed to exist"
+        return 0
+    fi
+
+    path="${registry#public.ecr.aws/}"
+    alias="${path%%/*}"
+    prefix=""
+    if [[ "${path}" == */* ]]; then
+        prefix="${path#*/}"
+    fi
+    repo="${prefix:+${prefix}/}${runtime_id}"
+
+    if (( dry_run )); then
+        echo "would create public.ecr.aws/${alias}/${repo} (repository name ${repo})"
+        return 0
+    fi
+
+    registry_json=$(aws ecr-public describe-registries --output json 2>/dev/null || true)
+    if [[ -z "${registry_json}" ]]; then
+        echo "::warning::could not read this registry's aliases; skipping the alias check" >&2
+    else
+        account_aliases=$(python3 -c 'import json,sys
+print(" ".join(json.loads(sys.stdin.read())["registries"][0].get("aliases") or []))' <<<"${registry_json}")
+        if [[ -z "${account_aliases}" ]]; then
+            echo "::error::this account has no ECR Public alias yet. One is assigned when the first public repository is created in the console." >&2
+            exit 1
+        fi
+        if [[ " ${account_aliases} " != *" ${alias} "* ]]; then
+            echo "::error::public.ecr.aws/${alias} is not an active alias for this registry (active: ${account_aliases})." >&2
+            exit 1
+        fi
+    fi
+
+    if aws ecr-public describe-repositories --repository-names "${repo}" >/dev/null 2>&1; then
+        echo "public.ecr.aws/${alias}/${repo} exists"
+    elif aws ecr-public create-repository --repository-name "${repo}" >/dev/null 2>&1; then
+        echo "Created public.ecr.aws/${alias}/${repo}"
+    else
+        echo "::warning::could not create public.ecr.aws/${alias}/${repo}; the push will report the real reason" >&2
+    fi
+}
+
+if (( ensure_only )); then
+    for registry in "${registries[@]}"; do
+        ensure_repository "${registry}"
+    done
+    exit 0
+fi
 
 if ! docker image inspect "${CONTAINER_LOCAL_IMAGE}" >/dev/null 2>&1; then
     echo "${CONTAINER_LOCAL_IMAGE} is not built; run build-container first" >&2
@@ -41,10 +111,8 @@ local_digest=$(docker image inspect --format '{{.Id}}' "${CONTAINER_LOCAL_IMAGE}
 # live in _common.sh: generate-compliance-artifacts resolves the same lineage before
 # the push, so there is one implementation of "what does this reference serve".
 
-mapfile -t registries < <(python3 -c 'import json,sys
-for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIES_OVERRIDE:-${CONTAINER_REGISTRIES}}")
-
 for registry in "${registries[@]}"; do
+    ensure_repository "${registry}"
     reference="${registry}/${RUNTIME_ID}:${CONTAINER_TAG}-${CONTAINER_ARCH}"
     skipped=false
 
