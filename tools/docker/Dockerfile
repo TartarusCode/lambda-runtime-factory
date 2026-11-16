@@ -50,6 +50,21 @@ FROM ${BASE_IMAGE} AS runtime
 ARG NONROOT_UID=1001
 ARG NONROOT_GID=1001
 
+# The day the base's RPM repository was last consulted. `microdnf upgrade` fetches
+# remote repodata, and BuildKit keys a RUN by its instruction text and parent
+# layers — it does not track what the network returned. Without this stamp the OS
+# layer below is replayed from the `type=gha` cache with the package set of the day
+# it was first built, and a patched RPM published to ubi-9-baseos-rpms would never
+# be installed. The value is referenced inside that RUN, so changing it invalidates
+# exactly that layer. build-container derives it from UBI_RPM_EPOCH (UTC date by
+# default) and forwards it from every build call site.
+#
+# Declared inside the stage on purpose: an ARG above the first FROM is only in scope
+# for FROM lines, and the RUN below would expand it to the empty string while the
+# instruction text stayed byte-identical — the stamp would never move and the
+# upgrade would be skipped on every cached build.
+ARG UBI_RPM_EPOCH=unspecified
+
 # The extracted trust store, with the injected CAs baked in.
 COPY --from=builder /etc/pki/ca-trust/extracted /etc/pki/ca-trust/extracted
 
@@ -66,11 +81,22 @@ ENV SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt \
 # owning package (Grype then cannot match a RHEL backport and reports false
 # positives) and `/etc/ld.so.cache` stale.
 #
+# The upgrade runs first, in the same layer, because a security advisory names a
+# fixed RPM that reaches ubi-9-baseos-rpms days before Red Hat republishes the
+# ubi9-minimal tag this base resolves to. Installing the floor alone would leave
+# every other base package at the image's build day, and the severity gate in
+# tools/bin/generate-compliance-artifacts blocks any fixable High that no POA&M entry
+# covers — so the image has to take the patched RPM as soon as the repository has it.
+# The stamp is echoed so this instruction's cache key moves with UBI_RPM_EPOCH and
+# the upgrade is not skipped.
+#
 # The list is the union of every runtime's `DT_NEEDED` requirements, which today
 # is exactly this set for all of them — container_image.prepare refuses a runtime
 # whose needs fall outside it, so this stays one shared layer rather than growing
 # a per-runtime install below.
-RUN microdnf install -y --nodocs --setopt=install_weak_deps=0 \
+RUN echo "UBI RPM snapshot: ${UBI_RPM_EPOCH}" && \
+    microdnf upgrade -y --nodocs --setopt=install_weak_deps=0 && \
+    microdnf install -y --nodocs --setopt=install_weak_deps=0 \
         ca-certificates \
         zlib \
         libffi \

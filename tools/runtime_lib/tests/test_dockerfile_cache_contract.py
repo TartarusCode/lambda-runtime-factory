@@ -25,6 +25,9 @@ _DOCKERFILE = _REPO_ROOT / "tools" / "docker" / "Dockerfile"
 _BUILD_CONTAINER = _REPO_ROOT / "tools" / "bin" / "build-container"
 
 
+_SHARED_INSTALL = "microdnf install -y"
+
+
 def _dockerfile_lines() -> list[str]:
     return _DOCKERFILE.read_text(encoding="utf-8").splitlines()
 
@@ -37,7 +40,9 @@ def _index_of(needle: str) -> int:
 
 
 def test_dockerfile_keeps_the_shared_os_layer_above_every_runtime_specific_instruction() -> None:
-    floor_index = _index_of("RUN microdnf install")
+    # The floor install shares one RUN with the daily `microdnf upgrade`, so the
+    # needle names the install itself rather than the start of the instruction.
+    floor_index = _index_of(_SHARED_INSTALL)
 
     for runtime_specific in (
         "@@LABELS@@",
@@ -57,7 +62,7 @@ def test_nothing_above_the_shared_layer_is_runtime_specific() -> None:
     """The region above `RUN microdnf install` must be identical for all twelve
     runtimes, so it may contain no substitution placeholder at all — the renderer
     substitutes those from the manifest — and no label."""
-    floor_index = _index_of("RUN microdnf install")
+    floor_index = _index_of(_SHARED_INSTALL)
     above = "\n".join(_dockerfile_lines()[:floor_index])
 
     placeholders = sorted(set(re.findall(r"@@[A-Z_]+@@", above)))
@@ -70,7 +75,7 @@ def test_nothing_above_the_shared_layer_is_runtime_specific() -> None:
 
 
 def test_the_library_floor_matches_the_dockerfile_and_the_manifest() -> None:
-    floor_index = _index_of("RUN microdnf install")
+    floor_index = _index_of(_SHARED_INSTALL)
     install_block = []
     for line in _dockerfile_lines()[floor_index:]:
         install_block.append(line)

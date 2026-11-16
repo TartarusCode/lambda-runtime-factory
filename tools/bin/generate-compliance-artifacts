@@ -15,6 +15,12 @@
 # vulnerability report and provenance are recomputed on every run — a cached CVE
 # count would be wrong the moment Grype's database moves.
 #
+# The report is not filtered by policy: every fixable finding Grype resolves stays in
+# it, and the severity gate is applied over that document against
+# tools/compliance/ubi-lag-waivers.json. An advisory whose fixed RPM the base image
+# cannot install yet is a time-boxed POA&M entry there, so the scan keeps naming the
+# CVE while the build is allowed to ship.
+#
 # Writes into ${ARTIFACT_DIR}/compliance/:
 #   <runtime>-<arch>.spdx.json        SPDX 2.3 JSON
 #   <runtime>-<arch>.cdx.json         CycloneDX JSON
@@ -268,36 +274,285 @@ fi
 
 echo "Scanning ${stem}.spdx.json with Grype"
 set +e
+# `--fail-on` is deliberately absent: the severity decision belongs to the gate
+# below, which reads this report and applies the UBI-lag POA&M. `--only-fixed` stays,
+# so the report and the counts derived from it describe the findings an operator can
+# actually act on — the policy this pipeline has always published.
 grype "${grype_config_args[@]}" "sbom:${stem}.spdx.json" \
     -o "json=${stem}.grype.json" \
-    -o "sarif=${stem}.grype.sarif" \
-    --fail-on high --only-fixed -q
+    -o "sarif=${stem}.grype.sarif" --only-fixed -q
 grype_status=$?
 set -e
 
 if (( grype_status != 0 )); then
-    if [[ ! -s "${stem}.grype.json" ]]; then
-        echo "${runtime_id} (${arch}): Grype failed without writing a report; see its output above" >&2
-        exit "${grype_status}"
-    fi
-    echo "${runtime_id} (${arch}): Grype found a fixable High or Critical CVE" >&2
-    python3 - "${stem}.grype.json" <<'PYEOF'
+    echo "${runtime_id} (${arch}): Grype exited ${grype_status}; a report it may have written is not trusted" >&2
+    exit "${grype_status}"
+fi
+
+# --- the severity gate ---------------------------------------------------------
+# A fixable High or Critical finding fails the cell unless an active entry in the
+# UBI-lag POA&M file names that exact CVE, package and installed build. Keeping the
+# acknowledgement outside Grype is what lets the report stay complete; keeping it in
+# a separate file with an expiry is what stops it becoming permanent. An entry stops
+# covering anything on its expiry date, and once the installed package reaches the
+# fixed build the entry is reported for removal instead of quietly outliving the lag.
+waiver_file="${UBI_LAG_WAIVERS:-$(common::repo_root)/tools/compliance/ubi-lag-waivers.json}"
+gate_file="${stem}.grype-gate.json"
+set +e
+python3 - "${stem}.grype.json" "${waiver_file}" "${gate_file}" "${stem}.spdx.json" \
+    "${UBI_LAG_WAIVER_TODAY:-}" "${runtime_id}" "${arch}" <<'PYEOF'
 import json
 import sys
+from datetime import date
 
-report = json.load(open(sys.argv[1], encoding="utf-8"))
-for match in (report.get("matches") or []):
-    vuln = match.get("vulnerability") or {}
-    if (vuln.get("severity") or "").lower() not in ("critical", "high"):
+report_path, waivers_path, gate_path = sys.argv[1:4]
+spdx_path = sys.argv[4] if len(sys.argv) > 4 else ""
+day_arg = sys.argv[5] if len(sys.argv) > 5 else ""
+runtime_id = sys.argv[6] if len(sys.argv) > 6 else ""
+arch = sys.argv[7] if len(sys.argv) > 7 else ""
+
+SEVERITIES = ("critical", "high")
+REQUIRED = ("advisory", "package", "installed_evr", "fixed_evr", "expires_on", "reason", "cves")
+
+
+def label(text):
+    return f"{runtime_id} ({arch}): {text}" if runtime_id else text
+
+
+def fail(text):
+    # Exit 2 for a policy failure: the same code Grype uses for "found something",
+    # so a caller keying on the status cannot mistake it for success.
+    message = label(text)
+    print(f"::error::{message}" if runtime_id else message, file=sys.stderr)
+    sys.exit(2)
+
+
+def load(path, what):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except OSError as error:
+        fail(f"{what}: {error}")
+    except ValueError as error:
+        fail(f"{what} is not valid JSON: {error}")
+
+
+def evr(value):
+    """`0:1.21.1-10.el9_8.1`, `1.21.1-10.el9_8.1` and `1.21.1-10.el9_8.1.x86_64`
+    name one build, so the epoch and the arch suffix cannot decide a match."""
+    text = str(value or "").strip()
+    epoch, separator, rest = text.partition(":")
+    if separator and epoch.isdigit():
+        text = rest
+    for suffix in (".x86_64", ".aarch64", ".i686", ".noarch", ".s390x", ".ppc64le"):
+        if text.endswith(suffix):
+            return text[: -len(suffix)]
+    return text
+
+
+def installed_versions(package):
+    """What the image actually carries, read from the SBOM the report came from —
+    a match only exists for a package that has a finding, so an upgraded (now clean)
+    package would be invisible here."""
+    if not spdx_path:
+        return set()
+    try:
+        with open(spdx_path, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, ValueError):
+        return set()
+    wanted = package.lower()
+    return {
+        evr(entry.get("versionInfo"))
+        for entry in (document.get("packages") or [])
+        if str(entry.get("name") or "").lower() == wanted
+    }
+
+
+raw = load(waivers_path, f"the UBI-lag POA&M file {waivers_path}")
+entries = raw.get("waivers") if isinstance(raw, dict) else None
+if not isinstance(entries, list) or not entries:
+    fail(f"{waivers_path} declares no waivers")
+
+waivers = []
+for index, entry in enumerate(entries):
+    where = f"{waivers_path} waiver #{index + 1}"
+    missing = [key for key in REQUIRED if not entry.get(key)]
+    if missing:
+        fail(f"{where} is missing {', '.join(missing)}")
+    cves = entry.get("cves")
+    if not isinstance(cves, list) or not cves:
+        fail(f"{where} lists no CVEs")
+    try:
+        expires = date.fromisoformat(str(entry["expires_on"]))
+    except ValueError:
+        fail(f"{where} has expires_on={entry['expires_on']!r}, which is not YYYY-MM-DD")
+    waivers.append(
+        {
+            "advisory": str(entry["advisory"]),
+            "package": str(entry["package"]),
+            "installed_evr": evr(entry["installed_evr"]),
+            "fixed_evr": evr(entry["fixed_evr"]),
+            "expires_on": expires,
+            "cves": {str(cve).upper() for cve in cves},
+        }
+    )
+
+report = load(report_path, f"the Grype report {report_path}")
+today = date.fromisoformat(day_arg) if day_arg else date.today()
+
+poam = []
+for waiver in waivers:
+    versions = installed_versions(waiver["package"])
+    if not versions:
+        state = "absent"
+        detail = "the image carries no package by that name"
+    elif waiver["installed_evr"] in versions:
+        state = "active"
+        detail = f"the image carries the waived build {waiver['installed_evr']}"
+    elif waiver["fixed_evr"] in versions:
+        state = "resolved"
+        detail = f"the image carries the fixed build {waiver['fixed_evr']}, so the lag window has closed"
+    else:
+        state = "mismatched"
+        detail = (
+            f"the image carries {', '.join(sorted(versions))}, which is neither the waived "
+            f"build {waiver['installed_evr']} nor the fixed one {waiver['fixed_evr']}"
+        )
+    if waiver["expires_on"] < today:
+        state = "expired"
+        detail = f"expired on {waiver['expires_on'].isoformat()}; {detail}"
+    poam.append(
+        {
+            "advisory": waiver["advisory"],
+            "package": waiver["package"],
+            "state": state,
+            "expires_on": waiver["expires_on"].isoformat(),
+            "detail": detail,
+            "installed_versions": sorted(versions),
+            "cves": sorted(waiver["cves"]),
+        }
+    )
+
+blocking = []
+waived = []
+for match in report.get("matches") or []:
+    vulnerability = match.get("vulnerability") or {}
+    severity = str(vulnerability.get("severity") or "").lower()
+    if severity not in SEVERITIES:
+        continue
+    fix = vulnerability.get("fix") or {}
+    fixed_versions = [evr(version) for version in (fix.get("versions") or [])]
+    if str(fix.get("state") or "").lower() != "fixed" or not fixed_versions:
         continue
     artifact = match.get("artifact") or {}
-    fix = ((vuln.get("fix") or {}).get("versions") or ["?"])[0]
-    print(f"  {vuln.get('id')} {artifact.get('name')} {artifact.get('version')} -> {fix}")
+    package = str(artifact.get("name") or "")
+    installed_version = evr(artifact.get("version"))
+    cve = str(vulnerability.get("id") or "").upper()
+    covering = next(
+        (
+            waiver
+            for waiver in waivers
+            if waiver["package"].lower() == package.lower()
+            and cve in waiver["cves"]
+            and waiver["installed_evr"] == installed_version
+            and waiver["fixed_evr"] in fixed_versions
+            and waiver["expires_on"] >= today
+        ),
+        None,
+    )
+    record = {
+        "cve": cve,
+        "package": package,
+        "installed_version": installed_version,
+        "fixed_version": fixed_versions[0],
+        "severity": severity,
+    }
+    if covering is None:
+        blocking.append(record)
+    else:
+        waived.append(
+            {
+                **record,
+                "advisory": covering["advisory"],
+                "expires_on": covering["expires_on"].isoformat(),
+            }
+        )
+
+# A mismatched entry fails the run on its own: the POA&M then names a build the
+# image does not carry, so the record an auditor reads is wrong whether or not a
+# finding exists. "resolved" and "absent" are notices — nothing depends on them any
+# more, and the entry should be deleted in the next commit.
+result = "fail" if blocking or any(entry["state"] == "mismatched" for entry in poam) else "pass"
+
+gate = {
+    "runtime_id": runtime_id,
+    "arch": arch,
+    "today": today.isoformat(),
+    "result": result,
+    "policy": (
+        "fixable High and Critical findings fail unless an active, unexpired UBI-lag "
+        "POA&M entry names that CVE, package and installed build"
+    ),
+    "blocking": blocking,
+    "waived": waived,
+    "waived_high": sum(1 for item in waived if item["severity"] == "high"),
+    "waived_critical": sum(1 for item in waived if item["severity"] == "critical"),
+    "active_advisories": sorted({item["advisory"] for item in waived}),
+    "poam": poam,
+}
+with open(gate_path, "w", encoding="utf-8") as handle:
+    json.dump(gate, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+
+for record in blocking:
+    print(
+        label(
+            f"  blocking {record['cve']} {record['package']} "
+            f"{record['installed_version']} -> {record['fixed_version']}"
+        ),
+        file=sys.stderr,
+    )
+for record in waived:
+    print(
+        label(
+            f"  waived {record['cve']} {record['package']} {record['installed_version']} "
+            f"-> {record['fixed_version']} [{record['advisory']}]"
+        ),
+        file=sys.stderr,
+    )
+for entry in poam:
+    if entry["state"] == "active":
+        print(
+            label(
+                f"POA&M {entry['advisory']}: {entry['package']} {entry['installed_versions']} "
+                f"waived until {entry['expires_on']} ({len(entry['cves'])} CVE(s))"
+            ),
+            file=sys.stderr,
+        )
+    else:
+        message = label(
+            f"POA&M {entry['advisory']} for {entry['package']} is {entry['state']}: "
+            f"{entry['detail']} — update or remove tools/compliance/ubi-lag-waivers.json"
+        )
+        print(f"::warning::{message}" if runtime_id else message, file=sys.stderr)
+
+summary = (
+    f"{len(blocking)} unwaived fixable High/Critical CVE(s), "
+    f"{len(waived)} waived ({gate['waived_high']} High, {gate['waived_critical']} Critical)"
+)
+if result == "fail":
+    print(f"::error::{label('the severity gate failed: ' + summary)}" if runtime_id else label(
+        f"the severity gate failed: {summary}"
+    ), file=sys.stderr)
+    sys.exit(2)
+print(label(f"the severity gate passed: {summary}"), file=sys.stderr)
 PYEOF
-    if (( best_effort )); then
-        echo "  (best effort: recorded, not failing the build)" >&2
-        grype_status=0
-    fi
+gate_status=$?
+set -e
+if (( gate_status != 0 )) && (( best_effort )); then
+    echo "  (best effort: the gate verdict was recorded, not enforced)" >&2
+    gate_status=0
 fi
 
 # --- provenance ----------------------------------------------------------------
@@ -308,7 +563,7 @@ if [[ ! -f "${payload_manifest}" ]]; then
 fi
 
 python3 - "${stem}" "${payload_manifest}" "${ARTIFACT_DIR}" "${CONTAINER_LOCAL_IMAGE}" \
-    "${sbom_cache_hit}" <<'PYEOF'
+    "${sbom_cache_hit}" "${gate_file}" <<'PYEOF'
 import hashlib
 import json
 import os
@@ -319,6 +574,8 @@ stem, payload_manifest, artifact_dir, image = sys.argv[1:5]
 # Absent when the block is run on its own (the tests do that): a document without
 # the flag describes a fresh scan, which is what the default means.
 sbom_cache_hit = (sys.argv[5] if len(sys.argv) > 5 else "false").strip().lower() == "true"
+# Likewise absent on its own: without a gate verdict there is nothing to record.
+gate_path = sys.argv[6] if len(sys.argv) > 6 else ""
 
 def load(path):
     with open(path, encoding="utf-8") as handle:
@@ -383,6 +640,30 @@ provenance = {
     "grype_summary": counts,
 }
 
+# The gate verdict and the POA&M it applied, recorded beside the raw counts: the
+# summary above stays raw, because a waived finding is still a finding and an
+# artifact that reported high=0 would misdescribe the image. These keys say how
+# many findings the severity gate let through, under which advisory, and until when.
+gate = {}
+if gate_path and os.path.exists(gate_path):
+    gate = load(gate_path)
+if gate:
+    provenance.update(
+        {
+            "cve_gate": gate.get("result", ""),
+            "ubi_lag_waived_high": gate.get("waived_high", 0),
+            "ubi_lag_waived_critical": gate.get("waived_critical", 0),
+            "waived_cve_ids": sorted(
+                item.get("cve", "") for item in (gate.get("waived") or [])
+            ),
+            "unwaived_blocking_cves": len(gate.get("blocking") or []),
+            "unwaived_blocking_cve_ids": sorted(
+                item.get("cve", "") for item in (gate.get("blocking") or [])
+            ),
+            "active_poam_advisories": gate.get("active_advisories") or [],
+        }
+    )
+
 out = stem + ".provenance.json"
 with open(out, "w", encoding="utf-8") as handle:
     json.dump(provenance, handle, indent=2, sort_keys=True)
@@ -414,4 +695,7 @@ PYEOF
 fi
 
 echo "Compliance bundle for ${runtime_id} (${arch}) written to ${compliance_dir}"
-exit "${grype_status}"
+# The bundle is written before the verdict is returned: a cell that fails the gate
+# still publishes the report, the SARIF and the provenance an auditor needs, and the
+# step's red status is what carries the failure.
+exit "${gate_status}"

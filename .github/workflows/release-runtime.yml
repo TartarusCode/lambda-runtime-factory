@@ -309,6 +309,7 @@ jobs:
             BUILDER_IMAGE=${{ env.BUILD_BASE_IMAGE }}
             NONROOT_UID=${{ env.BUILD_NONROOT_UID }}
             NONROOT_GID=${{ env.BUILD_NONROOT_GID }}
+            UBI_RPM_EPOCH=${{ env.BUILD_UBI_RPM_EPOCH }}
           cache-from: |
             type=gha,scope=ubi9-base-${{ matrix.arch }}
             type=gha,scope=runtime-${{ matrix.runtime }}-${{ matrix.arch }}
