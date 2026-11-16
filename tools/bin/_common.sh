@@ -158,6 +158,102 @@ common::delete_referrer() {
     return 1
 }
 
+# common::remote_manifest_digest <reference>
+#
+# The digest the registry currently serves for a reference, or an empty string when
+# it serves nothing (404). `oras` is the reader push and attest already depend on; a
+# fallback to `docker buildx imagetools inspect` keeps a local run working without it.
+common::remote_manifest_digest() {
+    local reference=$1
+    if type -P oras >/dev/null; then
+        oras manifest fetch --descriptor "${reference}" 2>/dev/null \
+            | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin).get("digest", ""))
+except Exception:
+    pass'
+        return 0
+    fi
+    docker buildx imagetools inspect "${reference}" 2>/dev/null \
+        | awk '/^Digest:/ { print $2; exit }'
+}
+
+# common::remote_config_digest <reference>; 2 means "not a manifest"
+#
+# The image *config* digest a manifest points at. `docker image inspect {{.Id}}`
+# reports the same value, so this is what a push compares: manifest digests hash the
+# manifest and would never match an image id.
+common::remote_config_digest() {
+    local reference=$1 document
+    document=$(oras manifest fetch "${reference}" 2>/dev/null) || return 1
+    printf '%s' "${document}" | python3 -c 'import json, sys
+try:
+    document = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if document.get("manifests"):
+    sys.exit(2)
+print((document.get("config") or {}).get("digest", ""))'
+}
+
+# common::superseded_digest <image> <reference>
+#
+# The manifest digest a reference serves when it serves a *different* image than the
+# one about to be pushed, else empty. That digest is what a push turns into an
+# untagged manifest, and it is the value the provenance records and the pruner reads.
+# A registry that cannot be read (an audit run does not log in) answers empty, so the
+# lineage is recorded as unknown rather than guessed.
+common::superseded_digest() {
+    local image=$1 reference=$2 local_config remote_manifest remote_config
+    local_config=$(docker image inspect --format '{{.Id}}' "${image}" 2>/dev/null) || return 0
+    remote_manifest=$(common::remote_manifest_digest "${reference}")
+    if [[ -z "${remote_manifest}" ]]; then
+        return 0
+    fi
+    remote_config=$(common::remote_config_digest "${reference}" 2>/dev/null) || return 0
+    if [[ -z "${remote_config}" || "${remote_config}" == "${local_config}" ]]; then
+        return 0
+    fi
+    printf '%s' "${remote_manifest}"
+}
+
+# common::record_supersedes <registry> <reference> <digest>
+#
+# container.json carries the digest the reference served before this build replaced
+# it: `supersedes_digest` is the single value the provenance quotes (null when nothing
+# was replaced), and `supersedes_digests` keeps the per-registry detail so two
+# registries that drifted are both visible.
+common::record_supersedes() {
+    local registry=$1 reference=$2 digest=$3
+    local record="${ARTIFACT_DIR}/container.json"
+    if [[ ! -f "${record}" ]]; then
+        echo "::notice::${record} is missing; the superseded digest for ${reference} was not recorded" >&2
+        return 0
+    fi
+    if [[ -z "${digest}" ]]; then
+        echo "::notice::no superseded digest for ${reference}: the tag is new, or the registry serves these bytes" >&2
+        return 0
+    fi
+    python3 - "${record}" "${registry}" "${reference}" "${digest}" <<'PYEOF'
+import json
+import sys
+
+path, registry, reference, digest = sys.argv[1:5]
+
+with open(path, encoding="utf-8") as handle:
+    document = json.load(handle)
+document.setdefault("supersedes_digests", {})[registry] = {
+    "reference": reference,
+    "digest": digest,
+}
+# The first registry to report one wins the scalar; the map keeps the rest.
+document.setdefault("supersedes_digest", digest)
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(document, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+PYEOF
+}
+
 # common::retry <attempts> <command...>
 #
 # Run a command until it succeeds, up to <attempts> times, with a growing delay

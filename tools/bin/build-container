@@ -80,6 +80,13 @@ if [[ -n "${digest}" ]]; then
     base_image="${base_image%%@*}@${digest}"
 fi
 
+# The image's OS layer reads the base's RPM repository at build time and upgrades
+# from it (tools/docker/Dockerfile), so it must be rebuilt when that repository
+# may have moved — a security fix reaches ubi-9-baseos-rpms before the ubi9-minimal
+# tag is republished. This stamp is what invalidates the cached layer; a UTC date
+# bounds the rebuild to once per day per architecture, and UBI_RPM_EPOCH forces one.
+ubi_rpm_epoch="${UBI_RPM_EPOCH:-$(date -u +%Y-%m-%d)}"
+
 # A bare ref is a registry cache; a value that already names a type is passed
 # through so a caller can use a local or gha cache instead.
 cache_flag() {  # cache_flag <from|to> <value>
@@ -129,6 +136,7 @@ if (( prepare_only )); then
         echo "BUILD_BASE_IMAGE=${base_image}"
         echo "BUILD_NONROOT_UID=${CONTAINER_NONROOT_UID}"
         echo "BUILD_NONROOT_GID=${CONTAINER_NONROOT_GID}"
+        echo "BUILD_UBI_RPM_EPOCH=${ubi_rpm_epoch}"
         echo "BUILD_REVISION=${GITHUB_SHA:-$(git -C "$(common::repo_root)" rev-parse HEAD 2>/dev/null || echo unknown)}"
     } | tee "${state_file}" >> "${GITHUB_ENV:-/dev/null}"
     echo "Prepared ${context_dir}; the image build is the caller's step"
@@ -147,6 +155,7 @@ build_args=(
     --build-arg "BUILDER_IMAGE=${base_image}"
     --build-arg "NONROOT_UID=${CONTAINER_NONROOT_UID}"
     --build-arg "NONROOT_GID=${CONTAINER_NONROOT_GID}"
+    --build-arg "UBI_RPM_EPOCH=${ubi_rpm_epoch}"
     --label "org.opencontainers.image.revision=${GITHUB_SHA:-$(git -C "$(common::repo_root)" rev-parse HEAD 2>/dev/null || echo unknown)}"
     --tag "${image}"
     # --load keeps the image in the local daemon: `docker image inspect`,

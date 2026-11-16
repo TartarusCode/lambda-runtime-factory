@@ -942,7 +942,7 @@ def test_the_development_documentation_is_linked_and_present() -> None:
     assert contributing.exists()
     assert "CONTRIBUTING.md" in readme
 
-    for target in ("make build", "make local-invoke", "roll-off"):
+    for target in ("make build", "make container-invoke", "roll-off"):
         assert target in contributing.read_text(encoding="utf-8"), (
             f"CONTRIBUTING.md should document {target}"
         )
@@ -1437,10 +1437,11 @@ def test_the_matrix_action_can_narrow_to_changed_runtimes() -> None:
         step for step in action["runs"]["steps"] if step.get("id") == "matrix"
     )["run"]
 
-    assert "git diff --name-only" in generate
-    assert "'^runtimes/'" in generate
-    # A tooling-only change still proves the shared plumbing builds.
-    assert "pypy311" in generate and "canary" in generate.lower()
+    # The classification is the generator's, not a grep in this step: it owns the
+    # canary fallback and the compliance-path rule, and it is what the tests drive.
+    assert "runtime_manifest.py changed --base" in generate
+    assert "--shell" in generate
+    assert "eval " in generate, "the plan has to reach runtime/arch"
 
 
 def test_the_matrix_generator_accepts_several_runtimes_at_once() -> None:

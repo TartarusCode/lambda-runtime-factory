@@ -13,10 +13,11 @@ publishes — tag names, registries, architectures and how to verify them — se
 - Docker with BuildKit (`docker buildx`) is required for the container artifact
 - `readelf` (binutils) is used to resolve the payload's shared libraries
 - Transient build work is staged under `${BUILD_ROOT:-$RUNNER_TEMP}` or `/tmp` to avoid slow
-  cross-OS archive operations
+  cross-OS archive operations; the staged payload, `container.json`, `build-stats.json` and the
+  compliance bundle stay under `${ARTIFACT_DIR}` there
   - release and CI artifacts are built from temp storage by default
-  - set `EXPORT_ARTIFACT_DIR=/some/path` if you want a copy of the final zip preserved outside
-    temp storage
+  - the image is published, not exported: `runtime_env` still emits `EXPORT_ARTIFACT_DIR`, but
+    nothing in the pipeline copies build output out of temp storage
 
 ## Common commands
 
@@ -165,6 +166,81 @@ store and the uncompressed one on the classic overlay2 store, so the same image 
 a CI runner and 251,143,202 B on a developer box. The rootfs sum is the number Lambda counts against
 its 10 GB container limit, and it does not depend on the daemon.
 
+### The CVE gate, and the UBI lag POA&M
+
+`tools/bin/generate-compliance-artifacts` scans the published SPDX document with `--only-fixed` and
+no `--fail-on`: the report and its SARIF carry the findings an operator can act on, and the pass/fail
+decision is taken afterwards, in Python, over that report. A **fixable High or Critical** finding
+fails the cell. The only thing that releases one is an entry in
+`tools/compliance/ubi-lag-waivers.json`, and only when the entry names that CVE, that package, the
+installed build and the fixed build Grype reports.
+
+The file exists because Red Hat publishes a fix to `ubi-9-baseos-rpms` before it republishes the
+`ubi9-minimal` tag. In that window the CVE is real, the fix exists, and nothing the build can reach
+carries it — so the alternatives are a red pipeline nobody can repair and an ignore that deletes the
+finding from the artifact. The POA&M is neither: the finding stays in the report, the gate releases
+it, and `provenance.json` keeps `grype_summary` as the raw counts while adding
+`ubi_lag_waived_high`, `unwaived_blocking_cves` and `active_poam_advisories`. The job summary row
+renders that as `0/14/9/0 · 0 (14 UBI-lag waived)`, so a high count is never left without a verdict.
+
+Each entry expires, in three ways:
+
+- `expires_on` is the last day it releases anything. The day after, the findings block again and the
+  cell log names the expired advisory.
+- An installed build that matches neither `installed_evr` nor `fixed_evr` fails the run on its own
+  (`mismatched`): the record would name a package the image does not carry.
+- An entry whose `fixed_evr` — or anything newer — the image now carries is `resolved`, and that
+  **fails the run**: the acknowledgement is dead, so `main` would otherwise keep releasing a package
+  nobody needs released.
+
+The weekly `check-updates.yml` run retires the entry itself. `bump_version.py prune-waivers` reads the
+live UBI9 repodata for both architectures and deletes every waiver whose fixed build is published
+there, so the deletion arrives in the same automated pull request as the version bumps — with
+`[Security: Retire <advisory>]` in the title, the `release-required` label, and the release commands
+in the body. A retirement counts as an update even in a week where no tarball moved. `make
+prune-waivers DRY_RUN=1` shows what the next weekly run would do.
+
+The waiver file is compliance infrastructure for the diff routing too: a pull request that touches it
+builds the canary cell, so the un-waived build is proven by CI, and merging it runs the full matrix.
+CI's push run then prints a summary notice, because the images already published are still the
+pre-patch build until a release runs.
+
+Because the fixed RPM arrives in the repository first, the image takes it at build time: the OS layer
+runs `microdnf upgrade` before installing the library floor. BuildKit keys a `RUN` by its instruction
+and parent layers and does not track what the network returned, so `build-container` stamps that
+layer with `UBI_RPM_EPOCH` — the UTC date, overridable for a forced refresh — and every build call
+site forwards it. That rebuild is the price of picking up a patched RPM without waiting for a new
+base tag; a stamp dropped from one call site would replay the cached layer and silently keep the old
+package set.
+
+`tools/bin/audit-container` remains the raw scan: it reports every fixable High and Critical on the
+built image and applies no waiver, so it is expected to be red while an advisory's fixed RPM is
+unavailable. The policy lives in one place, in the gate.
+
+### Digest lineage, and removing what a refresh supersedes
+
+A refresh pushes new bytes over `<version>-<arch>`, so the digest that was there becomes untagged —
+but it stays pullable by digest, and its five referrers stay attached to it. Two things follow from
+that.
+
+The provenance quotes the digest the build replaces. `common::superseded_digest` resolves it before
+the push moves the tag (the comparison is on the config digest the manifest points at, because a
+manifest digest never equals an image id), and the value lands in `container.json` as
+`supersedes_digest` — `null` when the tag is new or the registry serves these bytes — and in
+`provenance.json` beside `base_image_digest`. A registry this job cannot read records nothing rather
+than a guess: an audit run does not log in, so its provenance says "unknown", not "no previous
+image".
+
+`tools/bin/prune-superseded-digests` removes those orphans, bottom-up. It is a dry run until
+`--delete`, and it never removes a digest that a tag points at, a platform manifest inside an active
+index, or any referrer attached to those — those are the published contract. Referrers go first,
+because deleting a subject leaves its referrers unreachable by discovery. Orphans are enumerated from
+the registry where an API lists untagged images (`describe-images` on ECR Public, with
+`--grace-days`, default 7, keeping a manifest that may be mid-publish) and otherwise come from
+`--superseded-digest`, which is what `release-runtime.yml` passes when `prune_superseded` is set. The
+release summary prints the `supersedes → published` mapping for every registry, so the rotation is
+readable after the fact even when nothing is pruned.
+
 ### The entrypoint, and the families that have no handler
 
 One entrypoint for every family: `/opt/bootstrap`, which applies the Lambda filesystem contract and
@@ -274,39 +350,39 @@ CMD ["app.handler"]
 ```
 
 The Go and Rust images are build environments (`FROM …/go126:1.26 AS build`); deliver the
-compiled bootstrap on `public.ecr.aws/lambda/provided:al2023`, as shown in the README.
+compiled bootstrap on `public.ecr.aws/lambda/provided:al2023`, as in
+`examples/docker/go-build-stage/`.
 
+## Local invocation
 
-## Local SAM test flow
-
-Each runtime carries its own local SAM assets, for example under `runtimes/pypy311/examples/sam/`:
-
-- `template.local.example.yaml`
-- `events/hello.json`
-- `hello/Makefile`
+`make build` stages the payload; `make container` builds the Iron Bank image from that payload;
+`make container-check` reads the STIG contract back out of the built bytes; and
+`make container-invoke` runs the smoke test under `--read-only`, a `/tmp` tmpfs owned by the
+runtime UID and `--user 1001:1001`, with `aws-lambda-rie` bind-mounted read-only from the host
+cache (`tools/bin/local-invoke-container`). The emulator is never baked into the image.
 
 ```bash
-make local-build RUNTIME=pypy311
-make local-invoke RUNTIME=pypy311
+make build            RUNTIME=pypy311 ARCH=x86_64
+make container-check  RUNTIME=pypy311 ARCH=x86_64
+make container-invoke RUNTIME=pypy311 ARCH=x86_64
 ```
 
-This flow builds the runtime package under temp storage, expands the local layer, renders a temp
-SAM template with resolved local paths, runs `sam build --use-container` with a temp build
-directory, and assembles a temp invoke bundle for `sam local invoke`. `local-invoke` asserts the
-handler actually answered (exit status and a `200` response carrying the handler payload), and
-skips `sam build` when `local-build` already produced the output.
+An image whose runtime has no handler — the Go and Rust toolchain images — runs the smoke test
+its manifest declares in `container.smoke_test` instead: `go version`, or the launcher's
+`_HANDLER is not set` diagnostic for Rust.
 
-Requirements:
-
-- Linux or WSL is required for Docker-backed SAM workflows
-- For best local SAM performance, keep the repo on the WSL filesystem instead of `/mnt/c/...`
-- Docker must be available, and `sam` installed in the environment running the commands
+Each runtime still carries local SAM assets under `runtimes/<id>/examples/sam/`
+(`template.local.example.yaml`, `events/hello.json`, `hello/`). They are declared in the
+manifest's `local_testing` block and `make check` validates that the referenced files exist, but
+no `make` target builds or invokes a SAM application: the container smoke test is the local
+execution path. CI does not install the SAM CLI; `requirements-ci.txt` pins it if you want to
+drive the template yourself.
 
 ## CI
 
 `.github/workflows/ci.yml` runs on every push to `main`, every PR (docs-only changes are
 skipped) and on demand via `workflow_dispatch`. It has **two tiers**, so a work-in-progress commit
-does not occupy all 24 runners:
+does not occupy all 20 matrix cells:
 
 - **Fast tier** — a draft PR, or a PR whose labels do not include `ready-to-merge`, runs only the
   cells whose files changed under `runtimes/` (computed by the `runtime-matrix` action from
@@ -320,33 +396,40 @@ Between the two:
 - `repo-checks` (once, < 1 min): manifest validation, `bash -n` over `tools/bin/`, a compile check
   per runtime and the online archive-URL check, plus the test suite
 - `grype-db` (once): refreshes and caches the ~2.8GB vulnerability database for the matrix
-- `runtime-checks` (matrix): builds every runtime × architecture, scans the ones whose pinned
-  payload changed, builds the Iron Bank image, scans and smoke-tests it, and checks its STIG
-  contract (`check-container`); on x86 it additionally runs the local SAM smoke test
-- caches: upstream runtime downloads, the built package, the Grype binary and database
-- artifacts: built zips upload on **push to `main` only**, `retention-days: 7`
+- `runtime-checks` (matrix): builds every runtime × architecture, builds the Iron Bank image,
+  smoke-tests it rootless and read-only (`local-invoke-container`), checks its STIG contract
+  (`check-container`) and generates the compliance bundle
+- caches: upstream runtime downloads, the SBOM cache, the Grype binary and the Grype database
+- artifacts: the per-cell compliance bundle uploads `if: always()` with `retention-days: 30`
+  (`90` in the release workflow)
 - superseded PR runs cancel via workflow concurrency
 
-Docker Buildx is set up with the `docker-container` driver, and every image build passes
-`--cache-from type=registry,ref=$CONTAINER_CACHE_REF`
-(`ghcr.io/tartaruscode/lambda-runtime-factory/<runtime>:buildcache-<arch>`, derived in the
-manifest so no caller invents its own). Only the default branch adds `--cache-to …,mode=max`, so a
-PR's cache never lands on a ref nothing else can read. That is what makes the base pull, the
-certificate extraction and the library installation cheap on a re-run.
+Docker Buildx runs with the `docker-container` driver and the image is built by
+`docker/build-push-action`, so BuildKit's `type=gha` cache is in play: `cache-from` and
+`cache-to` use two scopes, `ubi9-base-<arch>` — runtime-independent, so every runtime on an
+architecture reuses one `ubi9-minimal` pull plus its `microdnf install` layer — and
+`runtime-<id>-<arch>`, with `mode=max`. `tools/docker/Dockerfile` keeps every runtime-specific
+instruction below the shared setup, which is what makes that reuse possible.
+
+Outside Actions there is no cache service: `build-container --cache-from/--cache-to` accept a
+registry ref (pass `$CONTAINER_CACHE_REF` for the conventional
+`<image>:buildcache-<arch>` tag). CI does not use that path. The Grype database has its own rule:
+only the workflow's `grype-db` job writes the week's entry, and only on the default branch.
 
 Three composite actions in `.github/actions/` hold the whole per-cell procedure so the workflows
 cannot drift apart:
 
 - `runtime-matrix` — the build/publish matrix, generated from the manifest list (and narrowed to
   the changed runtimes for the fast tier)
-- `runtime-build-env` — the download, package, Grype-binary and Grype-database caches
+- `runtime-build-env` — the download, SBOM, Grype-binary and Grype-database caches
 - `build-and-audit-runtime` — archive tooling, Buildx setup, `make build`, the image build, the
   smoke test, the STIG contract check and `tools/bin/generate-compliance-artifacts`
 
 `.github/workflows/audit-runtimes.yml` runs the same matrix weekly to catch CVE-database drift,
 and `.github/workflows/check-updates.yml` opens the weekly version-bump PR.
 
-CI pins `aws-sam-cli` in `requirements-ci.txt` for reproducible SAM installs.
+CI installs `requirements-dev.txt` (pytest, pytest-mock, pyyaml) for the test suite.
+`requirements-ci.txt` pins the AWS SAM CLI for local use and is not read by any workflow.
 
 ## Cutting a release
 
@@ -377,14 +460,27 @@ run — dispatch it as a dry run:
 gh workflow run release-runtime.yml -f runtime=pypy311 -f arch=x86_64 -f dry_run=true
 ```
 
-Publishing is idempotent for unchanged bytes: the layer's own `Content.CodeSha256` decides
-whether a version is created, so re-running a release whose package is already published reuses
-that version instead of minting another. Set `PUBLISH_FORCE_NEW_VERSION=1` to publish
-unconditionally.
+Publishing is idempotent for content that has not changed:
 
-That only works because the package is deterministic. `build-runtime` pins every entry's mtime
-and zips with `-X`, because a zip that embeds "now" produces a different hash on every build —
-and then the reuse above can never match.
+- `push-container` compares the registry's manifest `config.digest` with the local image id and
+  skips the push when they match, recording the digest the registry serves in `container.json`.
+- `attest-container` lists the referrers already on the digest and attaches only the types it is
+  missing; `cosign sign` is skipped when a signature is present, so a re-run cannot double the
+  bundle. `--refresh-dynamic` replaces the Grype report and the provenance manifest instead of
+  appending to them, and prunes the referrer each one supersedes.
+- `publish-soci-index` reuses an existing `-soci` image when its layers match the image just
+  pushed (`--force` converts again).
+- `merge-container-tags` moves `latest` only on a tag-triggered run, so replaying an older
+  dispatch cannot roll the moving tag backwards.
+
+The evidence set is checked separately: `make verify-referrers` (optionally
+`REGISTRY=<registry>`) verifies the published contract — five referrers on each per-arch image and
+on its SOCI copy, one signature on each merged index. `make prune-referrers RUNTIME=<id>
+ARCH=<arch>` reports duplicates on one digest and, with `DELETE=1`, removes all but the earliest
+of each type.
+
+None of this skips validation: every build is measured, smoke-tested and scanned before a push, so
+a rebuild that produces different bytes gets a new digest and is signed and attested again.
 
 ## Adding a new runtime
 

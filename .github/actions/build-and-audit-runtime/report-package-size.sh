@@ -65,6 +65,13 @@ else:
         f"{counts.get('Medium', 0)}/{counts.get('Low', 0)}"
         if counts else "-"
     )
+    # The counts above stay raw, so the row still says how many findings the image
+    # carries; the waived and blocking figures say which of them the gate released
+    # and under which POA&M, so a reader is not left with a bare "14" and no verdict.
+    waived = provenance.get("ubi_lag_waived_high") or 0
+    if waived:
+        blocking = provenance.get("unwaived_blocking_cves") or 0
+        cves += f" · {blocking} ({waived} UBI-lag waived)"
 
     packages = (provenance.get("sbom") or {}).get("packages")
     packages_cell = f"{packages.get('rpm', 0)} + {packages.get('runtime', 0)}" if packages else "-"

@@ -93,6 +93,33 @@ jobs:
           pip install -r requirements-dev.txt
           python3 -m pytest tools/runtime_lib/tests -q
 
+      - name: Note a retired UBI-lag waiver
+        # A waiver that retires changes what the images carry: the next build installs
+        # the patched RPM, so the images already published carry the vulnerable
+        # package until a release runs. A green CI run is the one place a reader would
+        # not otherwise learn that, so the summary says it here.
+        if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          changed=$(gh api "repos/${GITHUB_REPOSITORY}/compare/${BEFORE}...${AFTER}" \
+            --jq '.files[].filename' 2>/dev/null || true)
+          if ! grep -qx 'tools/compliance/ubi-lag-waivers.json' <<< "${changed}"; then
+            echo "No UBI-lag waiver change in this push."
+            exit 0
+          fi
+          {
+            echo "## ⚠️ UBI9 Security Waiver Retired"
+            echo
+            echo '`tools/compliance/ubi-lag-waivers.json` changed in this push. The next build installs the'
+            echo 'patched RPM and the scan reports the package clean, but the images published from this commit'
+            echo 'are still the pre-patch build. Cut a `release-*` tag, or dispatch `release-runtime.yml`, to'
+            echo 'publish patched digests to ECR Public and GHCR.'
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "::warning::A UBI9 security waiver was retired; publish a release to ship the patched images."
+
   # The Grype vulnerability database is ~2.8GB and identical for every matrix
   # cell. Downloading it once here (and caching it) avoids paying ~60s per cell;
   # a warm restore is ~10s and the scan itself is ~1s.

@@ -232,6 +232,51 @@ def test_every_cell_adds_a_row_to_the_same_table(tmp_path: Path) -> None:
     assert "rust199 (arm64)" in text and "no image record" in text
 
 
+def test_the_row_says_why_a_high_count_did_not_block(tmp_path: Path) -> None:
+    """A row carrying `14` and no verdict reads as an unaddressed finding. The waived
+    and blocking figures beside the raw counts are what make the row true."""
+    (tmp_path / "container.json").write_text(
+        json.dumps(
+            {
+                "base_image_ref": "registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal:latest",
+                "unpacked_size_bytes": 1048576,
+                "read_only_rootfs_verified": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    compliance = tmp_path / "compliance"
+    compliance.mkdir()
+    (compliance / "pypy311-x86_64.provenance.json").write_text(
+        json.dumps(
+            {
+                "base_image_ref": "registry1.dso.mil/ironbank/redhat/ubi/ubi9-minimal:latest",
+                "grype_summary": {"Critical": 0, "High": 14, "Medium": 9, "Low": 0},
+                "ubi_lag_waived_high": 14,
+                "unwaived_blocking_cves": 0,
+                "active_poam_advisories": ["RHSA-2026:99715"],
+                "sbom": {"packages": {"total": 123, "rpm": 121, "runtime": 2}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    summary = tmp_path / "summary.md"
+
+    script = _REPO_ROOT / ".github" / "actions" / "build-and-audit-runtime" / "report-package-size.sh"
+    result = subprocess.run(
+        ["bash", str(script), "pypy311", "x86_64"],
+        capture_output=True,
+        text=True,
+        env={"ARTIFACT_DIR": str(tmp_path), "GITHUB_STEP_SUMMARY": str(summary), "PATH": "/usr/bin:/bin"},
+        cwd=_REPO_ROOT,
+    )
+    assert result.returncode == 0, result.stderr
+
+    text = summary.read_text(encoding="utf-8")
+    assert "0/14/9/0" in text, "the raw counts stay raw"
+    assert "0 (14 UBI-lag waived)" in text, "the row must say why 14 High did not block"
+
+
 def test_no_workflow_or_script_references_the_removed_layer_tools() -> None:
     """A stale call site is how a release dies minutes in, per cell. The tokens are
     full script paths so that legitimate names — `audit-runtimes.yml`, the

@@ -74,18 +74,13 @@ runs:
         arch="${INPUT_ARCH:-all}"
         if [[ "${{ inputs.changed-only }}" == "true" ]]; then
           base="origin/${GITHUB_BASE_REF:-main}"
-          changed=$(git diff --name-only "${base}...HEAD" 2>/dev/null \
-            | grep '^runtimes/' | cut -d/ -f2 | sort -u | paste -sd, - || true)
-          if [[ -z "${changed}" ]]; then
-            # Nothing under runtimes/ changed (tools, workflows, docs): one canary
-            # cell still proves the shared plumbing builds, without occupying every runner.
-            echo "No runtime files changed against ${base}; running the pypy311 canary cell."
-            runtime="pypy311"
-            arch="x86_64"
-          else
-            echo "Changed runtimes against ${base}: ${changed}"
-            runtime="${changed}"
-          fi
+          # The classification lives in the matrix generator, not in a grep here: a
+          # change that is not a runtime file builds the canary cell, and a change to
+          # the compliance waiver also adds it, because that file decides whether
+          # every cell passes. `runtime_manifest.py changed --files` is what the tests
+          # drive; this step only resolves the base ref.
+          eval "$(python3 tools/runtime_lib/runtime_manifest.py changed --base "${base}" --shell)"
+          echo "${cell_plan}"
         fi
         matrix=$(python3 tools/runtime_lib/runtime_manifest.py matrix \
           --runtime "${runtime}" \

@@ -1,0 +1,28 @@
+{
+  "waivers": [
+    {
+      "advisory": "RHSA-2026:99715",
+      "package": "krb5-libs",
+      "installed_evr": "0:1.21.1-10.el9_8.1",
+      "fixed_evr": "0:1.21.1-10.el9_9.2",
+      "expires_on": "2026-11-30",
+      "reason": "RHEL 9 advisory RHSA-2026:99715 published 2026-11-12; the fixed RPM 0:1.21.1-10.el9_9.2 is not yet published to UBI9 BaseOS repodata or Iron Bank ubi9-minimal, so no base image and no build-time upgrade can install it.",
+      "cves": [
+        "CVE-2026-107364",
+        "CVE-2026-112315",
+        "CVE-2026-112316",
+        "CVE-2026-112317",
+        "CVE-2026-112318",
+        "CVE-2026-112319",
+        "CVE-2026-112320",
+        "CVE-2026-112321",
+        "CVE-2026-112322",
+        "CVE-2026-112323",
+        "CVE-2026-118380",
+        "CVE-2026-119079",
+        "CVE-2026-71199",
+        "CVE-2026-71200"
+      ]
+    }
+  ]
+}

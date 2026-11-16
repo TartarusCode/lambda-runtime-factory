@@ -37,6 +37,14 @@ on:
         required: true
         default: true
         type: boolean
+      prune_superseded:
+        description: >-
+          After publishing, remove the untagged digests this release superseded
+          (and their referrers), so an unpatched image does not stay pullable by
+          digest. Opt-in because deletion is irreversible.
+        required: true
+        default: false
+        type: boolean
   push:
     tags:
       - "release-*"
@@ -309,6 +317,7 @@ jobs:
             BUILDER_IMAGE=${{ env.BUILD_BASE_IMAGE }}
             NONROOT_UID=${{ env.BUILD_NONROOT_UID }}
             NONROOT_GID=${{ env.BUILD_NONROOT_GID }}
+            UBI_RPM_EPOCH=${{ env.BUILD_UBI_RPM_EPOCH }}
           cache-from: |
             type=gha,scope=ubi9-base-${{ matrix.arch }}
             type=gha,scope=runtime-${{ matrix.runtime }}-${{ matrix.arch }}
@@ -327,6 +336,57 @@ jobs:
       - name: Push the per-architecture image
         if: ${{ github.event.inputs.dry_run != 'true' }}
         run: bash tools/bin/push-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
+      - name: Record the digest lineage
+        # A security refresh pushes new bytes over the tag, so the digest that was
+        # there — and its referrers — become untagged but stay pullable. The
+        # provenance already quotes the digest this build supersedes; this step is
+        # what puts the mapping where a release reviewer looks, and what the optional
+        # prune reads. A tag that is new, or unchanged, records nothing.
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          PRUNE_SUPERSEDED: ${{ github.event.inputs.prune_superseded == 'true' }}
+        run: |
+          source tools/bin/_common.sh
+          common::load_runtime_env "${{ matrix.runtime }}" "${{ matrix.arch }}"
+          record="${ARTIFACT_DIR}/container.json"
+
+          supersedes=$(python3 - "${record}" "${{ matrix.runtime }}" "${{ matrix.arch }}" \
+            "${GITHUB_STEP_SUMMARY:-/dev/null}" <<'PYLINE'
+          import json
+          import sys
+
+          record_path, runtime_id, arch, summary_path = sys.argv[1:5]
+          try:
+              document = json.load(open(record_path, encoding="utf-8"))
+          except (OSError, ValueError):
+              document = {}
+
+          superseded = document.get("supersedes_digest") or ""
+          per_registry = document.get("supersedes_digests") or {}
+          published = document.get("registry_digests") or {}
+
+          with open(summary_path, "a", encoding="utf-8") as handle:
+              handle.write(f"\n#### Digest lineage: {runtime_id} ({arch})\n\n")
+              if not superseded:
+                  handle.write("- nothing replaced: a new tag, an unchanged image, or a registry this run could not read\n")
+              else:
+                  handle.write("| Registry | Superseded | Published |\n| --- | --- | --- |\n")
+                  for registry, entry in sorted(per_registry.items()):
+                      digest = (published.get(registry) or {}).get("digest", "see the push log")
+                      handle.write(f"| `{registry}` | `{entry.get('digest')}` | `{digest}` |\n")
+              handle.write("\n")
+          print(superseded)
+          PYLINE
+          )
+
+          if [[ "${PRUNE_SUPERSEDED}" == "true" || "${PRUNE_SUPERSEDED}" == "True" ]]; then
+            if [[ -n "${supersedes}" ]]; then
+              bash tools/bin/prune-superseded-digests "${{ matrix.runtime }}" "${{ matrix.arch }}" \
+                --delete --superseded-digest "${supersedes}"
+            else
+              echo "No superseded digest recorded; nothing to prune."
+            fi
+          fi
       - name: Publish the SOCI-enabled copy
         # A second image per architecture, not a tag on the first: SOCI Index
         # Manifest v2 bundles the index into a new image, and Lambda lazy-loads the
