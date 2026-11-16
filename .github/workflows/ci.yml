@@ -125,18 +125,7 @@ jobs:
   # a warm restore is ~10s and the scan itself is ~1s.
   grype-db:
     if: ${{ !(github.event_name == 'pull_request' && github.actor == 'dependabot[bot]') }}
-    runs-on: ubuntu-26.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-      # This job is the week's only database writer: it refreshes the entry the
-      # matrix cells then restore instead of racing to download it. The refresh
-      # is skipped when the week's entry already exists, since an immutable cache
-      # entry can never be re-saved and the update would be discarded.
-      - uses: ./.github/actions/runtime-build-env
-        with:
-          # This job exists to refresh the database.
-          db-refresh: "true"
+    uses: ./.github/workflows/grype-db.yml
 
   runtime-checks:
     if: ${{ !(github.event_name == 'pull_request' && github.actor == 'dependabot[bot]') }}
@@ -174,39 +163,16 @@ jobs:
           # Cells only read the week's database; the grype-db job writes it.
           db-refresh: "false"
       - name: Log in to Iron Bank Registry
-        # Retried: registry1.dso.mil answers `context deadline exceeded` often
-        # enough that one attempt fails a healthy cell. A cell that never reaches
-        # it fails here rather than quietly building on the Red Hat mirror.
+        # The retry and the credential names live in the shared action, so every
+        # call site logs in the same way the build decides whether it has a token.
         if: ${{ env.IRONBANK_TOKEN != '' }}
-        shell: bash
-        env:
-          IRONBANK_USERNAME: ${{ secrets.IRONBANK_USERNAME }}
-          RETRY_DELAY: "15"
-        run: |
-          source tools/bin/_common.sh
-          ib_login() {
-            printf '%s' "${IRONBANK_TOKEN}" \
-              | docker login registry1.dso.mil --username "${IRONBANK_USERNAME}" --password-stdin
-          }
-          if ! common::retry 4 ib_login; then
-            echo "registry1.dso.mil did not answer after 4 attempts" >&2
-            exit 1
-          fi
+        uses: ./.github/actions/iron-bank-login
+        with:
+          token: ${{ secrets.IRONBANK_TOKEN }}
+          username: ${{ secrets.IRONBANK_USERNAME }}
       - name: Build and audit runtime package
         uses: ./.github/actions/build-and-audit-runtime
         with:
           runtime: ${{ matrix.runtime }}
           arch: ${{ matrix.arch }}
           container: "true"
-      - name: Upload the compliance bundle
-        # Auditors download this without a registry client: SBOMs, CVE report and
-        # provenance for the exact bytes this cell built.
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.runtime }}-${{ matrix.arch }}-compliance
-          path: |
-            ${{ runner.temp }}/lambda-runtime-monorepo/${{ matrix.runtime }}/${{ matrix.arch }}/artifacts/compliance/*
-            ${{ runner.temp }}/lambda-runtime-monorepo/${{ matrix.runtime }}/${{ matrix.arch }}/artifacts/container.json
-          if-no-files-found: warn
-          retention-days: 30

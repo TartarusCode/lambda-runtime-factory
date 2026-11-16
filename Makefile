@@ -69,7 +69,7 @@ container-soci:
 	bash tools/bin/publish-soci-index "$(RUNTIME)" "$(ARCH)" $(if $(PUSH),--push)
 
 container-repos:
-	bash tools/bin/ensure-container-repos "$(RUNTIME)"
+	bash tools/bin/push-container "$(RUNTIME)" "$(ARCH)" --ensure-only
 
 # The referrer contract every published digest has to satisfy: 5 on each per-arch
 # image and its SOCI copy, 1 signature on each merged index, no duplicates.

@@ -9,7 +9,6 @@ was replaced.
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -17,7 +16,7 @@ from pathlib import Path
 import yaml
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_GENERATOR = _REPO_ROOT / "tools" / "bin" / "generate-compliance-artifacts"
+_COMPLIANCE = _REPO_ROOT / "tools" / "runtime_lib" / "compliance.py"
 _RELEASE = _REPO_ROOT / ".github/workflows/release-runtime.yml"
 
 _OLD = "sha256:old"
@@ -38,20 +37,19 @@ def _provenance(tmp_path: Path, container: dict) -> dict:
     )
     (tmp_path / "container.json").write_text(json.dumps(container), encoding="utf-8")
 
-    blocks = re.findall(
-        r"<<'PYEOF'\n(.*?)\nPYEOF", _GENERATOR.read_text(encoding="utf-8"), flags=re.S
-    )
-    assert len(blocks) >= 3
     result = subprocess.run(
         [
             sys.executable,
-            "-c",
-            blocks[2],
+            str(_COMPLIANCE),
+            "provenance",
+            "--stem",
             str(stem),
+            "--payload-manifest",
             str(payload),
+            "--artifact-dir",
             str(tmp_path),
+            "--image",
             "example.invalid/pypy311:3.11",
-            "",
         ],
         capture_output=True,
         text=True,

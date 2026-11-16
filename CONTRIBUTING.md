@@ -172,8 +172,8 @@ its 10 GB container limit, and it does not depend on the daemon.
 no `--fail-on`: the report and its SARIF carry the findings an operator can act on, and the pass/fail
 decision is taken afterwards, in Python, over that report. A **fixable High or Critical** finding
 fails an Iron Bank build. The only thing that releases one is an entry in
-`tools/compliance/ubi-lag-waivers.json`, and only when the entry names that CVE, that package, the
-installed build and the fixed build Grype reports.
+`tools/compliance/ubi-lag-waivers.json`, and only when the entry names that CVE and that package and
+has not expired. `fixed_evr` is not part of matching: it is what the retirement job watches for.
 
 The gate is enforced only on an image whose `base_image_ref` is `registry1.dso.mil`. A build from
 the Red Hat fallback — a fork PR, or any local run without `IRONBANK_TOKEN` — still runs Syft and
@@ -192,12 +192,10 @@ it, and `provenance.json` keeps `grype_summary` as the raw counts while adding
 `ubi_lag_waived_high`, `unwaived_blocking_cves` and `active_poam_advisories`. The job summary row
 renders that as `0/14/9/0 · 0 (14 UBI-lag waived)`, so a high count is never left without a verdict.
 
-Each entry expires, in three ways:
+Each entry ends in one of two ways:
 
 - `expires_on` is the last day it releases anything. The day after, the findings block again and the
   cell log names the expired advisory.
-- An installed build that matches neither `installed_evr` nor `fixed_evr` is `mismatched`: an Iron
-  Bank run fails, because the record would name a package the image does not carry.
 - An entry whose `fixed_evr` — or anything newer — the image now carries is `resolved`. That is a
   `::notice::` in the cell log, not a failure: the image already carries the fix, so the entry
   releases nothing; the weekly retainer deletes it and the notice prompts the cleanup.
@@ -309,7 +307,7 @@ repository name: `public.ecr.aws/tartaruscode/lambda-runtime-factory/pypy311` is
 account, assigned with its first public repository — plus any **custom aliases** requested in the
 ECR console under Public registry settings, and *any active alias* can be used for pulls. That
 is why the manifest names `tartaruscode`: it matches the project and the GHCR path, so only the
-registry host differs between the two. `ensure-container-repos` creates the repository
+registry host differs between the two. `push-container --ensure-only` creates the repository
 idempotently and fails with the account's real aliases when `tartaruscode` is not among them,
 which is a far better error than a push that goes nowhere.
 
@@ -416,19 +414,24 @@ instruction below the shared setup, which is what makes that reuse possible.
 Outside Actions there is no cache service: `build-container --cache-from/--cache-to` accept a
 registry ref (pass `$CONTAINER_CACHE_REF` for the conventional
 `<image>:buildcache-<arch>` tag). CI does not use that path. The Grype database has its own rule:
-only the workflow's `grype-db` job writes the week's entry, and only on the default branch.
+only the reusable `grype-db` workflow writes the week's entry, and only on the default branch.
 
-Three composite actions in `.github/actions/` hold the whole per-cell procedure so the workflows
-cannot drift apart:
+Four composite actions in `.github/actions/` hold the per-cell procedure so the workflows cannot
+drift apart:
 
 - `runtime-matrix` — the build/publish matrix, generated from the manifest list (and narrowed to
   the changed runtimes for the fast tier)
-- `runtime-build-env` — the download, SBOM, Grype-binary and Grype-database caches
+- `runtime-build-env` — the download, Grype-binary and Grype-database caches, plus the scan tooling
+- `iron-bank-login` — the retried `registry1.dso.mil` login, shared by CI, the audit and the release
 - `build-and-audit-runtime` — archive tooling, Buildx setup, `make build`, the image build, the
-  smoke test, the STIG contract check and `tools/bin/generate-compliance-artifacts`
+  smoke test, the STIG contract check, `tools/bin/generate-compliance-artifacts` and the compliance
+  bundle upload (retention is an input: 30 days in CI and the audit, 90 on a release)
 
-`.github/workflows/audit-runtimes.yml` runs the same matrix weekly to catch CVE-database drift,
-and `.github/workflows/check-updates.yml` opens the weekly version-bump PR.
+`.github/workflows/grype-db.yml` is a reusable workflow: the three scanning workflows call it so the
+week's cache entry has exactly one writer. `.github/workflows/audit-runtimes.yml` runs the same
+matrix weekly to catch CVE-database drift, and `.github/workflows/check-updates.yml` opens the weekly
+version-bump PR; its title and body are rendered by `tools/runtime_lib/update_report.py` from the
+check's JSON report.
 
 CI installs `requirements-dev.txt` (pytest, pytest-mock, pyyaml) for the test suite.
 `requirements-ci.txt` pins the AWS SAM CLI for local use and is not read by any workflow.

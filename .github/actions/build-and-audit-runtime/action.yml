@@ -22,6 +22,10 @@ inputs:
       bundle. "false" stages the payload only.
     required: false
     default: "true"
+  retention-days:
+    description: How long the compliance bundle stays downloadable
+    required: false
+    default: "30"
 
 runs:
   using: composite
@@ -143,3 +147,18 @@ runs:
       run: >-
         bash .github/actions/build-and-audit-runtime/report-package-size.sh
         "${{ inputs.runtime }}" "${{ inputs.arch }}"
+
+    - name: Upload the compliance bundle
+      # Every call site publishes the same evidence for the same cell, so an
+      # auditor can download the SBOMs, CVE report and provenance without a
+      # registry client. The release keeps it longer; CI and the audit use the
+      # default.
+      if: always() && inputs.container == 'true'
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.runtime }}-${{ inputs.arch }}-compliance
+        path: |
+          ${{ runner.temp }}/lambda-runtime-monorepo/${{ inputs.runtime }}/${{ inputs.arch }}/artifacts/compliance/*
+          ${{ runner.temp }}/lambda-runtime-monorepo/${{ inputs.runtime }}/${{ inputs.arch }}/artifacts/container.json
+        if-no-files-found: warn
+        retention-days: ${{ inputs.retention-days }}

@@ -593,12 +593,15 @@ def test_one_database_refresher_per_scanning_workflow() -> None:
     sites = _build_env_call_sites()
     refreshers = {site for site, inputs in sites.items() if inputs.get("db-refresh") == "true"}
 
-    assert refreshers == {(workflow, primer) for workflow, (primer, _) in _DATABASE_PRIMERS.items()}
+    assert refreshers == {("grype-db.yml", "prime")}, (
+        "the reusable primer is the only database writer"
+    )
 
     for workflow, (primer, scanner) in _DATABASE_PRIMERS.items():
         jobs = yaml.safe_load(
             (_REPO_ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
         )["jobs"]
+        assert jobs[primer]["uses"] == "./.github/workflows/grype-db.yml", workflow
         needs = jobs[scanner].get("needs")
         needs = needs if isinstance(needs, list) else [needs]
 
@@ -830,12 +833,50 @@ def test_the_release_record_names_the_container_images() -> None:
     assert "release-notes.md" in images["run"]
 
 
+def test_the_shared_action_uploads_the_bundle_for_every_caller() -> None:
+    """Auditors download the bundle without a registry client, and the audit run is
+    one of the callers. Keeping the upload in the action is what stops the three
+    workflows from drifting; the release just asks for a longer retention."""
+    action = yaml.safe_load(
+        (_REPO_ROOT / ".github/actions/build-and-audit-runtime/action.yml").read_text(
+            encoding="utf-8"
+        )
+    )
+    upload = next(
+        step
+        for step in action["runs"]["steps"]
+        if step.get("name") == "Upload the compliance bundle"
+    )
+    assert upload["if"] == "always() && inputs.container == 'true'"
+    assert upload["with"]["retention-days"] == "${{ inputs.retention-days }}"
+
+    for workflow, job_name in (
+        ("ci.yml", "runtime-checks"),
+        ("audit-runtimes.yml", "audit"),
+        ("release-runtime.yml", "publish-containers"),
+    ):
+        job = yaml.safe_load(
+            (_REPO_ROOT / ".github" / "workflows" / workflow).read_text(encoding="utf-8")
+        )["jobs"][job_name]
+        assert any(
+            step.get("uses") == "./.github/actions/build-and-audit-runtime"
+            for step in job["steps"]
+        ), workflow
+        assert not any(
+            step.get("name") == "Upload the compliance bundle" for step in job["steps"]
+        ), f"{workflow}: the upload belongs to the action"
+
+
 def test_every_job_has_a_timeout() -> None:
     """The default is six hours: a hung download would bill the wall clock."""
     for path in sorted((_REPO_ROOT / ".github" / "workflows").glob("*.yml")):
         jobs = yaml.safe_load(path.read_text(encoding="utf-8")).get("jobs") or {}
 
         for job_name, job in jobs.items():
+            if job.get("uses"):
+                # A reusable-workflow call has no steps of its own; the timeout
+                # belongs to the jobs inside the called workflow.
+                continue
             assert job.get("timeout-minutes"), f"{path.name}:{job_name} needs timeout-minutes"
 
 
@@ -1231,8 +1272,9 @@ def test_the_ecr_repository_name_excludes_the_account_alias() -> None:
     output = subprocess.run(
         [
             "bash",
-            str(_REPO_ROOT / "tools" / "bin" / "ensure-container-repos"),
+            str(_REPO_ROOT / "tools" / "bin" / "push-container"),
             "pypy311",
+            "--ensure-only",
             "--dry-run",
         ],
         capture_output=True,
@@ -1757,13 +1799,14 @@ def test_the_release_builds_scans_and_pushes_one_image_per_runtime() -> None:
         assert "github.event.inputs.dry_run != 'true'" in steps[name]["if"], name
 
     # Every image is built, scanned, smoke-tested and checked before it is pushed,
-    # and there is no variant loop left to run twice.
-    build = steps["Measure, smoke-test and scan the image"]["run"]
-    for command in ("build-container", "generate-compliance-artifacts", "local-invoke-container"):
-        assert command in build, command
-    assert "--variant" not in build
+    # through the same action CI and the audit use.
+    scan = steps["Build, smoke-test and scan the image"]
+    assert scan["uses"] == "./.github/actions/build-and-audit-runtime"
+    assert scan["with"]["container"] == "true"
+    assert scan["with"]["retention-days"] == "90"
+    assert "Check the image contract" not in steps, "the action owns the STIG check"
+    assert "--variant" not in yaml.safe_dump(scan)
     assert "container-variants" not in _workflow_text("release-runtime.yml")
-    assert "check-container" in steps["Check the image contract"]["run"]
     assert "--ironbank" not in steps["Push the per-architecture image"]["run"]
 
     merge = jobs["merge-containers"]
@@ -1794,8 +1837,11 @@ def test_the_release_publishes_to_ecr_public_and_writes_a_soci_index() -> None:
     ecr_login = publish["Log in to Amazon ECR Public"]["run"]
     assert "aws ecr-public get-login-password" in ecr_login
     assert "docker login --username AWS" in ecr_login
-    assert "ensure-container-repos" in publish["Ensure the image repositories exist"]["run"]
-    assert "check-container" in publish["Check the image contract"]["run"]
+    assert "push-container" in publish["Ensure the image repositories exist"]["run"]
+    assert "--ensure-only" in publish["Ensure the image repositories exist"]["run"]
+    assert publish["Build, smoke-test and scan the image"]["uses"] == (
+        "./.github/actions/build-and-audit-runtime"
+    )
 
     # SOCI runs beside the image it converts, not in a job that re-fetches it.
     soci = publish["Publish the SOCI-enabled copy"]
@@ -1913,16 +1959,20 @@ def test_the_iron_bank_login_is_retried_without_silently_changing_base() -> None
     single attempt fails an otherwise healthy cell. Retrying is safe; falling back
     to the Red Hat mirror is not, because the published image would then not be on
     the Iron Bank base the whole project exists to build on."""
-    for name in ("ci.yml", "release-runtime.yml"):
-        text = (_REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
-        assert "Log in to Iron Bank Registry" in text, name
-        block = text.split("Log in to Iron Bank Registry", 1)[1].split("- name:", 1)[0]
-
-        assert "common::retry 4 ib_login" in block, name
-        assert "registry1.dso.mil did not answer after 4 attempts" in block, name
-        assert "USE_FALLBACK_UBI" not in block, (
-            f"{name}: a retry must fail rather than publish on another base"
+    action = yaml.safe_load(
+        (_REPO_ROOT / ".github" / "actions" / "iron-bank-login" / "action.yml").read_text(
+            encoding="utf-8"
         )
+    )
+    run = "\n".join(step.get("run", "") for step in action["runs"]["steps"])
+
+    assert "common::retry 4 ib_login" in run
+    assert "registry1.dso.mil did not answer after 4 attempts" in run
+    assert "USE_FALLBACK_UBI" not in run, "a retry must fail rather than publish on another base"
+
+    for name in ("ci.yml", "audit-runtimes.yml", "release-runtime.yml"):
+        text = (_REPO_ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+        assert "uses: ./.github/actions/iron-bank-login" in text, name
 
 
 def test_every_tool_download_retries() -> None:

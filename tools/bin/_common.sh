@@ -66,18 +66,8 @@ common::sha256_file() {
 }
 
 common::temp_root() {
-    python3 - <<'PY'
-import os
-from pathlib import Path
-
-temp_root = Path(
-    os.environ.get("BUILD_ROOT")
-    or os.environ.get("RUNNER_TEMP")
-    or os.environ.get("TMPDIR")
-    or "/tmp"
-) / "lambda-runtime-monorepo"
-print(temp_root)
-PY
+    printf '%s/lambda-runtime-monorepo' \
+        "${BUILD_ROOT:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}}"
 }
 
 # common::soci_registries

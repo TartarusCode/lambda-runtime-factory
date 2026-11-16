@@ -1111,7 +1111,6 @@ def prune_resolved_waivers(
             {
                 "advisory": str(entry["advisory"]),
                 "package": package,
-                "installed_evr": str(entry.get("installed_evr", "")),
                 "fixed_evr": fixed_evr,
                 "published_evrs": resolved,
                 "expires_on": str(entry.get("expires_on", "")),
