@@ -72,6 +72,10 @@ else:
     if waived:
         blocking = provenance.get("unwaived_blocking_cves") or 0
         cves += f" · {blocking} ({waived} UBI-lag waived)"
+    # A fallback build records its verdict but does not enforce it. Saying so in the
+    # row keeps a green cell from reading as a compliant Iron Bank artifact.
+    if provenance.get("cve_gate_enforcement") == "advisory":
+        cves += " · advisory (fallback base, not enforced)"
 
     packages = (provenance.get("sbom") or {}).get("packages")
     packages_cell = f"{packages.get('rpm', 0)} + {packages.get('runtime', 0)}" if packages else "-"

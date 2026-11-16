@@ -182,6 +182,19 @@ jobs:
           echo "Assuming ${AWS_RELEASE_ROLE_ARN} through OIDC."
           echo "This job presents the subject repo:${GITHUB_REPOSITORY}:environment:release"
 
+      - name: Require Iron Bank credentials
+        # A release publishes Iron Bank images. The Red Hat fallback records an
+        # advisory compliance verdict instead of failing, so a release without
+        # IRONBANK_TOKEN would publish bytes whose scan was never enforced. Pull
+        # requests still exercise the fallback; releases do not.
+        env:
+          IRONBANK_TOKEN: ${{ secrets.IRONBANK_TOKEN }}
+        run: |
+          if [[ -z "${IRONBANK_TOKEN}" ]]; then
+            echo "::error::IRONBANK_TOKEN is not set. A release builds and publishes the Iron Bank base; the Red Hat fallback is only for pull requests and local runs, and its compliance verdict is advisory."
+            exit 1
+          fi
+
       - name: Require a green CI run for this commit
         env:
           GH_TOKEN: ${{ github.token }}

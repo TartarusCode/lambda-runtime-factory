@@ -171,9 +171,18 @@ its 10 GB container limit, and it does not depend on the daemon.
 `tools/bin/generate-compliance-artifacts` scans the published SPDX document with `--only-fixed` and
 no `--fail-on`: the report and its SARIF carry the findings an operator can act on, and the pass/fail
 decision is taken afterwards, in Python, over that report. A **fixable High or Critical** finding
-fails the cell. The only thing that releases one is an entry in
+fails an Iron Bank build. The only thing that releases one is an entry in
 `tools/compliance/ubi-lag-waivers.json`, and only when the entry names that CVE, that package, the
 installed build and the fixed build Grype reports.
+
+The gate is enforced only on an image whose `base_image_ref` is `registry1.dso.mil`. A build from
+the Red Hat fallback — a fork PR, or any local run without `IRONBANK_TOKEN` — still runs Syft and
+Grype, still writes the full `provenance.json` with the raw counts and the blocking CVE list, and
+still logs the verdict, but exits 0. Its gate record says `"enforcement": "advisory"` and provenance
+carries `cve_gate_enforcement` / `cve_gate_base_source`; the job-summary row appends
+`advisory (fallback base, not enforced)`. The fallback is not a release artifact:
+`release-runtime.yml` refuses to run without Iron Bank credentials, so an advisory verdict cannot
+reach a published image.
 
 The file exists because Red Hat publishes a fix to `ubi-9-baseos-rpms` before it republishes the
 `ubi9-minimal` tag. In that window the CVE is real, the fix exists, and nothing the build can reach
@@ -187,11 +196,11 @@ Each entry expires, in three ways:
 
 - `expires_on` is the last day it releases anything. The day after, the findings block again and the
   cell log names the expired advisory.
-- An installed build that matches neither `installed_evr` nor `fixed_evr` fails the run on its own
-  (`mismatched`): the record would name a package the image does not carry.
-- An entry whose `fixed_evr` — or anything newer — the image now carries is `resolved`, and that
-  **fails the run**: the acknowledgement is dead, so `main` would otherwise keep releasing a package
-  nobody needs released.
+- An installed build that matches neither `installed_evr` nor `fixed_evr` is `mismatched`: an Iron
+  Bank run fails, because the record would name a package the image does not carry.
+- An entry whose `fixed_evr` — or anything newer — the image now carries is `resolved`. That is a
+  `::notice::` in the cell log, not a failure: the image already carries the fix, so the entry
+  releases nothing; the weekly retainer deletes it and the notice prompts the cleanup.
 
 The weekly `check-updates.yml` run retires the entry itself. `bump_version.py prune-waivers` reads the
 live UBI9 repodata for both architectures and deletes every waiver whose fixed build is published
