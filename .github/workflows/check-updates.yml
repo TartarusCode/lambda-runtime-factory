@@ -31,7 +31,7 @@ jobs:
       - name: Check for upstream updates
         id: check
         run: |
-          args=(check --json)
+          args=(check --json --prune-waivers)
           if [[ -n "${{ github.event.inputs.runtime }}" ]]; then
             args+=(--runtime "${{ github.event.inputs.runtime }}")
           fi
@@ -50,18 +50,20 @@ jobs:
               data = json.loads("\n".join(lines[start:end + 1]))
           outdated = data.get("outdated", {})
           new_lines = data.get("new_lines", {})
+          retired = data.get("retired_waivers", [])
+          json.dump({"outdated": outdated, "new_lines": new_lines, "retired_waivers": retired},
+                    open(os.environ["RUNNER_TEMP"] + "/updates.json", "w"))
           output = open(os.environ["GITHUB_OUTPUT"], "a")
-          if outdated or new_lines:
-              json.dump({"outdated": outdated, "new_lines": new_lines},
-                        open(os.environ["RUNNER_TEMP"] + "/updates.json", "w"))
-              output.write("outdated=true\n")
-          else:
-              output.write("outdated=false\n")
+          # A retired waiver is an update even in a week where no runtime tarball
+          # moved: the deletion has to reach a pull request, because the waiver is
+          # what stops the build failing on an unobtainable fix.
+          output.write(f"updates_found={'true' if (outdated or new_lines or retired) else 'false'}\n")
+          output.write(f"retired={'true' if retired else 'false'}\n")
           PYCHECK
 
       - name: Bump outdated runtimes and add new lines
         id: bump
-        if: steps.check.outputs.outdated == 'true'
+        if: steps.check.outputs.updates_found == 'true'
         # A runtime that cannot be updated (upstream archive renamed, transient
         # network error) must not discard the bumps that already succeeded.
         continue-on-error: true
@@ -72,8 +74,39 @@ jobs:
           fi
           python3 tools/runtime_lib/bump_version.py "${args[@]}"
 
+      - name: Compose the pull request title
+        id: title
+        if: steps.check.outputs.updates_found == 'true'
+        # The title is the only place a reviewer sees that this batch retires a
+        # security acknowledgement and therefore needs a release behind it.
+        run: |
+          python3 - "${RUNNER_TEMP}/updates.json" >> "${GITHUB_OUTPUT}" <<'PYTITLE'
+          import json
+          import sys
+
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          base = "chore: bump runtime distribution versions and add new lines"
+          retired = data.get("retired_waivers") or []
+          if retired:
+              advisories = ", ".join(sorted({str(item["advisory"]) for item in retired}))
+              print(f"title=[Security: Retire {advisories}] {base}")
+          else:
+              print(f"title={base}")
+          PYTITLE
+
+      - name: Ensure the release-required label exists
+        if: steps.check.outputs.retired == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # A pull request cannot carry a label the repository has not defined, and the
+        # first retirement in a fresh clone would fail rather than warn. `--force`
+        # makes this idempotent and keeps the colour and description current.
+        run: |
+          gh label create release-required --force --color B60205 \
+            --description "Merging retires a security waiver and needs a release"
+
       - name: Build PR description
-        if: steps.check.outputs.outdated == 'true'
+        if: steps.check.outputs.updates_found == 'true'
         run: |
           python3 << 'PYBODY'
           import json, os
@@ -89,6 +122,27 @@ jobs:
                         "New runtime packages were created for newly available version lines:", ""]
               for family, info in sorted(new_lines.items()):
                   lines.append(f"- **{info['id']}**: new {family} line {info['line']} at version {info['version']}")
+          retired = updates.get("retired_waivers", [])
+          if retired:
+              lines += ["", "## Retired Security Waivers", "",
+                        "The fixed RPM these acknowledgements were waiting for is now published by UBI9,",
+                        "so the entries were removed rather than renewed:", ""]
+              for item in retired:
+                  lines.append(
+                      f"- **{item['advisory']}** — `{item['package']}` {item['fixed_evr']}; "
+                      f"UBI9 now publishes {', '.join(item['published_evrs'])}"
+                  )
+              advisories = ", ".join(sorted({str(item["advisory"]) for item in retired}))
+              lines += ["", "## Release Required After Merge", "",
+                        "Merging this deletes the waiver, so the next build installs the fixed RPM and the",
+                        "scan reports the package clean. Publish the patched images rather than waiting for",
+                        "the weekly audit to notice:", "",
+                        "```bash",
+                        "git fetch origin main && git checkout main && git pull",
+                        f'git tag -s "release-$(date -u +%Y.%m.%d)" -m "Release $(date -u +%Y.%m.%d): UBI9 security update ({advisories})"',
+                        'git push origin "release-$(date -u +%Y.%m.%d)"',
+                        "```", "",
+                        "Or dispatch `.github/workflows/release-runtime.yml` from `main` for the affected runtimes."]
           lines += ["", "Checksums were fetched from the official upstream release channels."]
 
           failures = []
@@ -116,14 +170,22 @@ jobs:
           commit-message: "chore: bump runtime distribution versions and add new lines"
           branch: automated/bump-runtime-versions
           delete-branch: true
-          title: "chore: bump runtime distribution versions and add new lines"
+          title: ${{ steps.title.outputs.title }}
+          # `release-required` exists by now: the step above creates it before this
+          # one runs, because a missing label fails the whole pull request.
+          labels: >-
+            dependencies,automated${{ steps.check.outputs.retired == 'true' && ',release-required' || '' }}
+          # The waiver deletion must travel with the bump, and nothing else in the
+          # tree should ride along.
+          add-paths: |
+            runtimes/**
+            tools/compliance/ubi-lag-waivers.json
           body-path: ${{ runner.temp }}/pr_body.txt
-          labels: dependencies,automated
 
       - name: Report skipped runtimes
         # Run after the PR exists, then fail the job so skipped runtimes are
         # visible as a red run rather than being silently dropped.
-        if: steps.check.outputs.outdated == 'true' && steps.bump.outcome == 'failure'
+        if: steps.check.outputs.updates_found == 'true' && steps.bump.outcome == 'failure'
         run: |
           echo "::error::Some runtimes could not be updated — see the PR's 'Skipped Runtimes' section."
           if [[ -f "${RUNNER_TEMP}/bump_failures.json" ]]; then

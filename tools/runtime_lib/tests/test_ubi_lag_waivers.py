@@ -104,6 +104,7 @@ def _gate(tmp_path: Path, report: Path, spdx: Path, waivers: Path, today: str = 
             today,
             "pypy311",
             "x86_64",
+            str(_REPO_ROOT),
         ],
         capture_output=True,
         text=True,
@@ -157,20 +158,46 @@ def test_a_waiver_for_a_build_the_image_no_longer_carries_fails(tmp_path: Path) 
     assert result.returncode == 2, result.stderr
 
 
-def test_a_waiver_is_reported_for_removal_once_the_fixed_build_is_installed(
-    tmp_path: Path,
-) -> None:
-    """The lag window closing is the expected end: the finding is gone, the gate
-    passes, and the entry is named so the next commit deletes it instead of leaving
-    a waiver in the tree that describes a build nobody ships."""
+def test_a_resolved_waiver_fails_the_gate_until_it_is_deleted(tmp_path: Path) -> None:
+    """The lag window closing is not a pass. The image carries the fixed build, so the
+    acknowledgement is dead: leaving it in the tree would keep releasing a package
+    nobody needs released, and `main` would carry a POA&M entry for a fixed CVE. The
+    weekly retainer deletes it; until then this is a hard failure."""
     report, spdx, waivers = _fixture(tmp_path, [], installed=KRB5_FIXED)
+
+    result, gate = _gate(tmp_path, report, spdx, waivers)
+
+    assert result.returncode == 2, result.stderr
+    assert gate["result"] == "fail"
+    assert gate["blocking"] == [], "there is no finding left to block on"
+    assert gate["poam"][0]["state"] == "resolved"
+    assert "remove it from tools/compliance/ubi-lag-waivers.json" in result.stderr
+    assert "::error::" in result.stderr, "a stale entry is an error annotation, not a warning"
+
+
+def test_a_build_newer_than_the_fixed_one_is_resolved_too(tmp_path: Path) -> None:
+    """Red Hat will rebuild the package again; the waiver must not need a fresh edit
+    for every release after the one it named."""
+    report, spdx, waivers = _fixture(tmp_path, [], installed="1.21.1-10.el9_9.10")
+
+    result, gate = _gate(tmp_path, report, spdx, waivers)
+
+    assert result.returncode == 2, result.stderr
+    assert gate["poam"][0]["state"] == "resolved"
+
+
+def test_an_empty_waiver_file_is_the_valid_end_state(tmp_path: Path) -> None:
+    """The retainer deletes the last entry and leaves the file behind. A gate that
+    rejected an empty list would turn the fix into a red pipeline."""
+    report, spdx, waivers = _fixture(tmp_path, [], installed=KRB5_INSTALLED)
+    waivers.write_text(json.dumps({"waivers": []}), encoding="utf-8")
 
     result, gate = _gate(tmp_path, report, spdx, waivers)
 
     assert result.returncode == 0, result.stderr
     assert gate["result"] == "pass"
-    assert gate["poam"][0]["state"] == "resolved"
-    assert "remove tools/compliance/ubi-lag-waivers.json" in result.stderr
+    assert gate["waived"] == [] and gate["blocking"] == []
+    assert gate["poam"] == []
 
 
 def test_the_active_rhsa_waiver_passes_while_the_finding_stays_in_the_report(
@@ -230,10 +257,16 @@ def test_a_critical_finding_blocks_even_while_a_high_is_waived(tmp_path: Path) -
     assert gate["waived_critical"] == 0
 
 
-def test_a_missing_or_malformed_poam_fails_instead_of_waiving_nothing(tmp_path: Path) -> None:
+def test_a_malformed_poam_fails_instead_of_waiving_nothing(tmp_path: Path) -> None:
+    """A missing list is a broken file. An empty list is not — that is the end state
+    the retainer leaves behind."""
     report, spdx, waivers = _fixture(tmp_path, [_match()])
-    waivers.write_text(json.dumps({"waivers": []}), encoding="utf-8")
 
+    waivers.write_text(json.dumps({"entries": []}), encoding="utf-8")
+    result, _gate_doc = _gate(tmp_path, report, spdx, waivers)
+    assert result.returncode == 2, result.stderr
+
+    waivers.write_text(json.dumps({"waivers": "not-a-list"}), encoding="utf-8")
     result, _gate_doc = _gate(tmp_path, report, spdx, waivers)
     assert result.returncode == 2, result.stderr
 
@@ -360,6 +393,47 @@ def test_the_provenance_step_is_handed_the_gate_verdict() -> None:
     assert invocation.index("${sbom_cache_hit}") < invocation.index("${gate_file}"), (
         "the gate path is the argument after the cache flag"
     )
+
+
+def test_a_compliance_change_builds_the_canary_cell() -> None:
+    """Never an empty matrix: a job with no cells is green, built nothing, and reads as
+    a passing build. The waiver file is the input that decides whether every cell
+    passes, so changing it has to build one."""
+    from runtime_manifest import CANARY_ARCH, CANARY_RUNTIME, build_plan
+
+    plan = build_plan(["tools/compliance/ubi-lag-waivers.json"])
+    assert plan["mode"] == "canary"
+    assert plan["runtimes"] == [CANARY_RUNTIME]
+    assert plan["archs"] == [CANARY_ARCH]
+    assert "compliance waiver changed" in plan["reason"]
+
+    # Tooling and docs still build something rather than nothing.
+    assert build_plan(["README.md", "tools/bin/check-container"])["runtimes"] == [CANARY_RUNTIME]
+    assert build_plan([])["runtimes"] == [CANARY_RUNTIME], "an empty diff is still a canary"
+
+    # A runtime change narrows the matrix, and the waiver change adds the canary to it.
+    plan = build_plan(["runtimes/go127/runtime.yaml"])
+    assert plan["mode"] == "narrowed" and plan["runtimes"] == ["go127"]
+
+    plan = build_plan(["runtimes/go127/runtime.yaml", "tools/compliance/ubi-lag-waivers.json"])
+    assert plan["mode"] == "narrowed"
+    assert plan["runtimes"] == sorted([CANARY_RUNTIME, "go127"])
+
+    # A path that only looks like a runtime directory is not one.
+    assert build_plan(["runtimes/not-a-runtime/notes.txt"])["mode"] == "canary"
+
+
+def test_the_matrix_action_classifies_through_the_generator() -> None:
+    """The classification is one function, so it can be tested without a checkout. A
+    grep in the composite action would be a second implementation that drifts."""
+    action = yaml.safe_load(
+        (_REPO_ROOT / ".github/actions/runtime-matrix/action.yml").read_text(encoding="utf-8")
+    )
+    step = next(s for s in action["runs"]["steps"] if s.get("id") == "matrix")
+
+    assert "runtime_manifest.py changed --base" in step["run"]
+    assert "--shell" in step["run"], "the plan has to reach the matrix inputs"
+    assert "grep '^runtimes/'" not in step["run"], "the generator owns the classification"
 
 
 def test_the_os_layer_upgrades_the_base_and_is_restamped_by_every_build_call_site() -> None:

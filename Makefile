@@ -8,7 +8,7 @@ DEV_BUILD_ENV := BUILD_BEST_EFFORT_AUDIT=0
 
 all: validate-runtimes build
 
-.PHONY: all list-runtimes validate-runtimes check build build-all build-all-arches audit compliance attest test container container-check container-invoke container-audit container-push container-merge container-soci container-repos verify-referrers prune-referrers clean check-updates bump bump-latest roll-off
+.PHONY: all list-runtimes validate-runtimes check build build-all build-all-arches audit compliance attest test container container-check container-invoke container-audit container-push container-merge container-soci container-repos verify-referrers prune-referrers clean check-updates prune-waivers bump bump-latest roll-off
 
 list-runtimes:
 	python3 tools/runtime_lib/runtime_manifest.py list
@@ -90,6 +90,12 @@ container-push:
 
 check-updates:
 	bash tools/bin/bump-runtime check
+
+# Retire a UBI-lag waiver once the fixed RPM is published to the UBI9 repository.
+# The weekly update workflow runs `check --prune-waivers`, which calls the same
+# function; this target is for a local look. DRY_RUN=1 reports without writing.
+prune-waivers:
+	python3 tools/runtime_lib/bump_version.py prune-waivers $(if $(DRY_RUN),--dry-run)
 
 bump:
 	bash tools/bin/bump-runtime bump "$(RUNTIME)" "$(VERSION)"

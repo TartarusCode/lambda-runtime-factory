@@ -13,7 +13,7 @@ import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from runtime_manifest import (
     DEFAULT_ARCH,
@@ -23,12 +23,24 @@ from runtime_manifest import (
     is_deprecated,
     list_runtime_ids,
     load_runtime,
+    repo_root,
     runtime_manifest_path,
     runtimes_root,
 )
+from ubi_repo import available_evrs, is_at_least
 
 
 GITHUB_API = "https://api.github.com"
+
+# The UBI-lag acknowledgements the compliance gate reads. A waiver exists for a
+# window in which a security fix is published to RHEL but not yet to the UBI9
+# repository the images install from; the weekly update run retires it as soon as
+# that window closes.
+WAIVER_RELATIVE_PATH = "tools/compliance/ubi-lag-waivers.json"
+# Every architecture the images are built for. A waiver is retired only when the
+# fixed RPM is available for all of them: pruning on the x86_64 answer alone would
+# leave the arm64 cells carrying a finding that nothing they can reach will fix.
+WAIVER_RPM_ARCHS: Tuple[str, ...] = ("x86_64", "arm64")
 
 
 def _github_headers(accept: str = "application/vnd.github+json") -> Dict[str, str]:
@@ -1035,6 +1047,84 @@ def roll_off(
     return candidates
 
 
+def waiver_file() -> Path:
+    return repo_root() / WAIVER_RELATIVE_PATH
+
+
+def prune_resolved_waivers(
+    *,
+    path: Optional[Path] = None,
+    arches: Tuple[str, ...] = WAIVER_RPM_ARCHS,
+    available: Callable[[str, str], Set[str]] = available_evrs,
+    dry_run: bool = False,
+) -> List[Dict[str, Any]]:
+    """Retire every waiver whose fixed EVR the UBI9 mirror now publishes.
+
+    A waiver covers a window in which the fix is real but unobtainable. Once the
+    repository serves the fixed build — or anything newer — for every architecture
+    the images are built for, the window is closed: the entry is removed so the next
+    build upgrades the RPM, and the gate reports the finding clean instead of
+    releasing it again. An architecture that answers with nothing keeps the entry,
+    because a partly available fix cannot be installed everywhere.
+
+    Returns the retired entries, each naming the advisory, the package, the EVR it
+    was waiting for and what the repository publishes now.
+    """
+    target = Path(path) if path else waiver_file()
+    document = json.loads(target.read_text(encoding="utf-8"))
+    entries = document.get("waivers")
+    if not isinstance(entries, list):
+        raise SystemExit(f"{target} has no 'waivers' list")
+
+    retired: List[Dict[str, Any]] = []
+    kept: List[Any] = []
+    for entry in entries:
+        package = str(entry["package"])
+        fixed_evr = str(entry["fixed_evr"])
+        published_by_arch: Dict[str, Set[str]] = {
+            arch: available(package, arch) for arch in arches
+        }
+        # Every architecture has to be able to install a fixed build. One arch that is
+        # still behind keeps the entry: pruning on the x86_64 answer alone would leave
+        # the arm64 cells waiving a finding nothing they can reach will fix.
+        behind = [
+            arch
+            for arch, evrs in published_by_arch.items()
+            if not any(is_at_least(evr, fixed_evr) for evr in evrs)
+        ]
+        if behind:
+            kept.append(entry)
+            print(
+                f"  {entry['advisory']} ({package}) still pending: no build at or past "
+                f"{fixed_evr} for {', '.join(sorted(behind))}"
+            )
+            continue
+        resolved = sorted(
+            {
+                evr
+                for evrs in published_by_arch.values()
+                for evr in evrs
+                if is_at_least(evr, fixed_evr)
+            }
+        )
+        retired.append(
+            {
+                "advisory": str(entry["advisory"]),
+                "package": package,
+                "installed_evr": str(entry.get("installed_evr", "")),
+                "fixed_evr": fixed_evr,
+                "published_evrs": resolved,
+                "expires_on": str(entry.get("expires_on", "")),
+            }
+        )
+        print(f"  {entry['advisory']} ({package}) resolved: UBI9 publishes {', '.join(resolved)}")
+
+    if retired and not dry_run:
+        document["waivers"] = kept
+        target.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    return retired
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Bump runtime distribution versions and refresh checksums."
@@ -1049,6 +1139,23 @@ def build_parser() -> argparse.ArgumentParser:
     check_parser = subparsers.add_parser("check", help="Check all runtimes for available updates")
     check_parser.add_argument("--runtime", help="Check a specific runtime only")
     check_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    check_parser.add_argument(
+        "--prune-waivers",
+        action="store_true",
+        help=(
+            "Also retire UBI-lag waivers whose fixed RPM UBI9 now publishes; the "
+            "deletion lands in the same automated pull request"
+        ),
+    )
+
+    prune_waivers_parser = subparsers.add_parser(
+        "prune-waivers",
+        help="Retire UBI-lag waivers whose fixed RPM the UBI9 repository now publishes",
+    )
+    prune_waivers_parser.add_argument(
+        "--dry-run", action="store_true", help="Report what would be retired without writing"
+    )
+    prune_waivers_parser.add_argument("--json", action="store_true", help="Output as JSON")
 
     bump_all_parser = subparsers.add_parser("bump-latest", help="Bump all outdated runtimes to latest")
     bump_all_parser.add_argument("--runtime", help="Only bump a specific runtime")
@@ -1086,6 +1193,10 @@ def main() -> None:
     if args.command == "check":
         runtime_ids = [args.runtime] if args.runtime else None
         outdated, new_lines = check_and_report_new_lines(runtime_ids)
+        retired: List[Dict[str, Any]] = []
+        if args.prune_waivers:
+            print("\nChecking the UBI-lag waivers against the UBI9 repository ...")
+            retired = prune_resolved_waivers()
         if args.json:
             print(json.dumps(
                 {
@@ -1094,16 +1205,31 @@ def main() -> None:
                         for rid, (cur, lat) in outdated.items()
                     },
                     "new_lines": new_lines,
+                    "retired_waivers": retired,
                 },
                 indent=2,
             ))
-        if not outdated and not new_lines:
+        if not outdated and not new_lines and not retired:
             print("\nAll runtimes are up to date.")
         else:
             if outdated:
                 print(f"\n{len(outdated)} runtime(s) have updates available.")
             if new_lines:
                 print(f"\n{len(new_lines)} new runtime line(s) available.")
+            if retired:
+                print(f"\n{len(retired)} UBI-lag waiver(s) retired.")
+        return
+
+    if args.command == "prune-waivers":
+        retired = prune_resolved_waivers(dry_run=args.dry_run)
+        if args.json:
+            print(json.dumps({"retired_waivers": retired}, indent=2))
+        if not retired:
+            print("No waiver is resolved: every acknowledged fix is still unpublished.")
+        elif args.dry_run:
+            print(f"{len(retired)} waiver(s) would be retired (dry run, nothing written).")
+        else:
+            print(f"{len(retired)} waiver(s) retired from {WAIVER_RELATIVE_PATH}.")
         return
 
     if args.command == "bump-latest":

@@ -189,8 +189,21 @@ Each entry expires, in three ways:
   cell log names the expired advisory.
 - An installed build that matches neither `installed_evr` nor `fixed_evr` fails the run on its own
   (`mismatched`): the record would name a package the image does not carry.
-- An entry whose `fixed_evr` the image now carries is reported as `resolved` — the RPM landed, so the
-  entry is deleted in the next commit instead of waiving nothing forever.
+- An entry whose `fixed_evr` — or anything newer — the image now carries is `resolved`, and that
+  **fails the run**: the acknowledgement is dead, so `main` would otherwise keep releasing a package
+  nobody needs released.
+
+The weekly `check-updates.yml` run retires the entry itself. `bump_version.py prune-waivers` reads the
+live UBI9 repodata for both architectures and deletes every waiver whose fixed build is published
+there, so the deletion arrives in the same automated pull request as the version bumps — with
+`[Security: Retire <advisory>]` in the title, the `release-required` label, and the release commands
+in the body. A retirement counts as an update even in a week where no tarball moved. `make
+prune-waivers DRY_RUN=1` shows what the next weekly run would do.
+
+The waiver file is compliance infrastructure for the diff routing too: a pull request that touches it
+builds the canary cell, so the un-waived build is proven by CI, and merging it runs the full matrix.
+CI's push run then prints a summary notice, because the images already published are still the
+pre-patch build until a release runs.
 
 Because the fixed RPM arrives in the repository first, the image takes it at build time: the OS layer
 runs `microdnf upgrade` before installing the library floor. BuildKit keys a `RUN` by its instruction

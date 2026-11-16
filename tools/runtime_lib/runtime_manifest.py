@@ -13,10 +13,21 @@ import urllib.error
 import urllib.request
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Tuple
 
 SUPPORTED_ARCHS: List[str] = ["x86_64", "arm64"]
 DEFAULT_ARCH = "x86_64"
+
+# Paths whose change always needs a built image even when no runtime directory
+# moved. The compliance contract is applied by the cells — and the waiver file is
+# the one input that decides whether a cell passes — so a change to it that built
+# nothing would ship an unproven policy.
+COMPLIANCE_PATHS: Tuple[str, ...] = ("tools/compliance/ubi-lag-waivers.json",)
+# The cell a non-runtime change builds: one runtime, one arch, the whole action —
+# image, smoke test, gate — so the shared plumbing is proven without occupying
+# every runner.
+CANARY_RUNTIME = "pypy311"
+CANARY_ARCH = "x86_64"
 
 REPO_DEFAULTS: Dict[str, Any] = {
     "runtime_family": "lambda-layer",
@@ -882,6 +893,71 @@ def print_shell_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> None:
         print(f"{key}={shlex.quote(value)}")
 
 
+def diff_paths(base: str) -> List[str]:
+    """Files changed between `base` and HEAD.
+
+    A base that is not in the history (a shallow checkout, a dispatch on a branch
+    with no such ref) is not an error: the answer is "nothing known", and the caller
+    builds the canary rather than an empty matrix.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", f"{base}...HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def build_plan(paths: Iterable[str]) -> Dict[str, Any]:
+    """Which cells a diff needs.
+
+    A changed runtime directory decides the cells. Anything else — tooling,
+    workflows, and the compliance waiver file specifically — falls back to one
+    canary cell rather than to an empty matrix, because a matrix of zero cells is a
+    green job that built nothing and reads as a passing build. A change to a
+    compliance path also adds the canary to a narrowed plan: the waiver decides
+    whether every cell passes, so proving it on a cell that was not otherwise
+    touched is the point.
+    """
+    files = [str(path).strip() for path in paths if str(path).strip()]
+    known = set(list_runtime_ids())
+    changed = sorted(
+        {
+            parts[1]
+            for parts in (path.split("/") for path in files)
+            if len(parts) > 2 and parts[0] == "runtimes" and parts[1] in known
+        }
+    )
+    compliance = sorted(path for path in files if path in COMPLIANCE_PATHS)
+
+    if changed:
+        selected = list(changed)
+        if compliance and CANARY_RUNTIME not in selected:
+            selected.append(CANARY_RUNTIME)
+        return {
+            "mode": "narrowed",
+            "runtimes": sorted(selected),
+            "archs": list(SUPPORTED_ARCHS),
+            "reason": "runtime files changed: " + ", ".join(changed),
+        }
+
+    reason = (
+        "compliance waiver changed: " + ", ".join(compliance)
+        if compliance
+        else "no runtime files changed"
+    )
+    return {
+        "mode": "canary",
+        "runtimes": [CANARY_RUNTIME],
+        "archs": [CANARY_ARCH],
+        "reason": reason,
+    }
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -916,6 +992,22 @@ def build_parser() -> argparse.ArgumentParser:
     check_parser = subparsers.add_parser("check")
     check_parser.add_argument("--runtime", required=True)
     check_parser.add_argument("--arch", default=DEFAULT_ARCH)
+
+    changed_parser = subparsers.add_parser(
+        "changed", help="Which cells a diff against a base ref needs"
+    )
+    changed_parser.add_argument("--base", default="origin/main")
+    changed_parser.add_argument(
+        "--files",
+        nargs="*",
+        help="Classify these paths instead of diffing against --base (used by the tests)",
+    )
+    changed_parser.add_argument(
+        "--shell",
+        action="store_true",
+        help="Emit runtime=, arch= and cell_plan= assignments for a caller to eval",
+    )
+    changed_parser.add_argument("--json", action="store_true")
 
     return parser
 
@@ -980,6 +1072,21 @@ def main() -> None:
     if args.command == "check":
         validate_runtime(args.runtime, arch=args.arch)
         compile_runtime_python(args.runtime)
+        return
+
+    if args.command == "changed":
+        paths = args.files if args.files is not None else diff_paths(args.base)
+        plan = build_plan(paths)
+        if args.shell:
+            arch = "all" if plan["mode"] == "narrowed" else plan["archs"][0]
+            print(f"runtime={shlex.quote(','.join(plan['runtimes']))}")
+            print(f"arch={shlex.quote(arch)}")
+            print(f"cell_plan={shlex.quote(plan['mode'] + ': ' + plan['reason'])}")
+        elif args.json:
+            print(json.dumps(plan))
+        else:
+            print(plan["reason"])
+            print(f"cells: {', '.join(plan['runtimes'])} ({'all archs' if plan['mode'] == 'narrowed' else plan['archs'][0]})")
         return
 
     parser.error("Unhandled command")

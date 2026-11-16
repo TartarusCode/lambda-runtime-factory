@@ -300,8 +300,9 @@ waiver_file="${UBI_LAG_WAIVERS:-$(common::repo_root)/tools/compliance/ubi-lag-wa
 gate_file="${stem}.grype-gate.json"
 set +e
 python3 - "${stem}.grype.json" "${waiver_file}" "${gate_file}" "${stem}.spdx.json" \
-    "${UBI_LAG_WAIVER_TODAY:-}" "${runtime_id}" "${arch}" <<'PYEOF'
+    "${UBI_LAG_WAIVER_TODAY:-}" "${runtime_id}" "${arch}" "$(common::repo_root)" <<'PYEOF'
 import json
+import os
 import sys
 from datetime import date
 
@@ -310,13 +311,33 @@ spdx_path = sys.argv[4] if len(sys.argv) > 4 else ""
 day_arg = sys.argv[5] if len(sys.argv) > 5 else ""
 runtime_id = sys.argv[6] if len(sys.argv) > 6 else ""
 arch = sys.argv[7] if len(sys.argv) > 7 else ""
+repo_root = sys.argv[8] if len(sys.argv) > 8 else ""
 
 SEVERITIES = ("critical", "high")
 REQUIRED = ("advisory", "package", "installed_evr", "fixed_evr", "expires_on", "reason", "cves")
+# Waiver states the gate refuses to pass: the acknowledgement no longer describes a
+# live lag, so leaving it in the tree would keep releasing a finding nobody is
+# tracking. "expired" is different — it releases nothing and the findings block on
+# their own — and "absent" is a record for a package this image does not carry.
+STALE_STATES = ("resolved", "mismatched")
 
 
 def label(text):
     return f"{runtime_id} ({arch}): {text}" if runtime_id else text
+
+
+# One implementation of RPM ordering for the whole pipeline: the weekly retainer
+# retires an entry with the same comparison the gate uses to call one stale.
+if repo_root:
+    sys.path.insert(0, os.path.join(repo_root, "tools", "runtime_lib"))
+try:
+    from ubi_repo import is_at_least, normalize_evr
+except ImportError as error:
+    print(
+        f"::error::cannot load tools/runtime_lib/ubi_repo.py from {repo_root or 'the checkout'}: {error}",
+        file=sys.stderr,
+    )
+    sys.exit(2)
 
 
 def fail(text):
@@ -340,14 +361,7 @@ def load(path, what):
 def evr(value):
     """`0:1.21.1-10.el9_8.1`, `1.21.1-10.el9_8.1` and `1.21.1-10.el9_8.1.x86_64`
     name one build, so the epoch and the arch suffix cannot decide a match."""
-    text = str(value or "").strip()
-    epoch, separator, rest = text.partition(":")
-    if separator and epoch.isdigit():
-        text = rest
-    for suffix in (".x86_64", ".aarch64", ".i686", ".noarch", ".s390x", ".ppc64le"):
-        if text.endswith(suffix):
-            return text[: -len(suffix)]
-    return text
+    return normalize_evr(value)
 
 
 def installed_versions(package):
@@ -371,8 +385,11 @@ def installed_versions(package):
 
 raw = load(waivers_path, f"the UBI-lag POA&M file {waivers_path}")
 entries = raw.get("waivers") if isinstance(raw, dict) else None
-if not isinstance(entries, list) or not entries:
-    fail(f"{waivers_path} declares no waivers")
+# An empty list is the end state, not a broken file: the weekly update run removes
+# the last entry the week the fixed RPM lands, and the file stays as the record of
+# where acknowledgements go.
+if not isinstance(entries, list):
+    fail(f"{waivers_path} has no 'waivers' list")
 
 waivers = []
 for index, entry in enumerate(entries):
@@ -410,9 +427,12 @@ for waiver in waivers:
     elif waiver["installed_evr"] in versions:
         state = "active"
         detail = f"the image carries the waived build {waiver['installed_evr']}"
-    elif waiver["fixed_evr"] in versions:
+    elif any(is_at_least(version, waiver["fixed_evr"]) for version in versions):
         state = "resolved"
-        detail = f"the image carries the fixed build {waiver['fixed_evr']}, so the lag window has closed"
+        detail = (
+            f"the image carries {', '.join(sorted(versions))}, at or past the fixed build "
+            f"{waiver['fixed_evr']}, so the lag window has closed and the entry is dead"
+        )
     else:
         state = "mismatched"
         detail = (
@@ -479,11 +499,14 @@ for match in report.get("matches") or []:
             }
         )
 
-# A mismatched entry fails the run on its own: the POA&M then names a build the
-# image does not carry, so the record an auditor reads is wrong whether or not a
-# finding exists. "resolved" and "absent" are notices — nothing depends on them any
-# more, and the entry should be deleted in the next commit.
-result = "fail" if blocking or any(entry["state"] == "mismatched" for entry in poam) else "pass"
+# A stale entry fails the run on its own, whether or not a finding depends on it:
+# "resolved" means the image already carries the fix, so the acknowledgement is dead
+# and the gate would otherwise keep releasing a package nobody needs released;
+# "mismatched" means the entry names a build the image does not carry, so the record
+# an auditor reads is wrong. "absent" is a notice — the image does not carry the
+# package at all — and "expired" releases nothing, so its findings block by
+# themselves rather than through this check.
+result = "fail" if blocking or any(entry["state"] in STALE_STATES for entry in poam) else "pass"
 
 gate = {
     "runtime_id": runtime_id,
@@ -533,9 +556,12 @@ for entry in poam:
     else:
         message = label(
             f"POA&M {entry['advisory']} for {entry['package']} is {entry['state']}: "
-            f"{entry['detail']} — update or remove tools/compliance/ubi-lag-waivers.json"
+            f"{entry['detail']} — remove it from tools/compliance/ubi-lag-waivers.json"
         )
-        print(f"::warning::{message}" if runtime_id else message, file=sys.stderr)
+        # A stale entry is an error, not a warning: it fails this run, and the
+        # annotation is what a reader sees in the step log before the exit code.
+        level = "error" if entry["state"] in STALE_STATES else "warning"
+        print(f"::{level}::{message}" if runtime_id else message, file=sys.stderr)
 
 summary = (
     f"{len(blocking)} unwaived fixable High/Critical CVE(s), "
