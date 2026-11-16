@@ -96,7 +96,6 @@ for runtime_id in "${runtimes[@]}"; do
         slug=$(grep '^CONTAINER_ARCH=' <<<"${env_text}" | cut -d= -f2- | tr -d "'")
         repository="${registry}/${runtime_id}"
 
-        declare -A counts=()
         declare -A totals=()
         verdict=""
         missing=0
@@ -170,7 +169,7 @@ print(len(types), ",".join(duplicates))
             "${totals[merged]:-?}" "${totals[msoci]:-?}" \
             "${verdict:-ok}"
 
-        unset totals counts
+        unset totals
     done
 done
 

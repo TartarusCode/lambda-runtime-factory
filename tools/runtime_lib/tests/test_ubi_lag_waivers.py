@@ -375,7 +375,6 @@ def test_the_provenance_keeps_raw_counts_and_adds_the_poam_verdict(tmp_path: Pat
             str(payload),
             str(tmp_path),
             "example.invalid/pypy311:3.11",
-            "false",
             str(gate_path),
         ],
         capture_output=True,
@@ -457,9 +456,6 @@ def test_the_provenance_step_is_handed_the_gate_verdict() -> None:
     invocation = invocation.split("<<'PYEOF'", 1)[0]
 
     assert '"${gate_file}"' in invocation, "the provenance block never sees the verdict"
-    assert invocation.index("${sbom_cache_hit}") < invocation.index("${gate_file}"), (
-        "the gate path is the argument after the cache flag"
-    )
 
 
 def test_a_compliance_change_builds_the_canary_cell() -> None:

@@ -72,7 +72,7 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-dev.txt
       - name: Validate manifests
-        run: bash tools/bin/validate-runtimes
+        run: python3 tools/runtime_lib/runtime_manifest.py validate
       - name: Validate shell scripts
         run: |
           for script in tools/bin/*; do
@@ -82,7 +82,7 @@ jobs:
       - name: Validate Python sources
         run: |
           for runtime in $(python3 tools/runtime_lib/runtime_manifest.py list); do
-            bash tools/bin/check-runtime "${runtime}" x86_64
+            python3 tools/runtime_lib/runtime_manifest.py check --runtime "${runtime}" --arch x86_64
           done
       - name: Validate upstream archive URLs
         # A stale derived field (e.g. release_tag) resolves to a 404 the build

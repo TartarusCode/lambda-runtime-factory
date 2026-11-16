@@ -86,7 +86,7 @@ def _base_environment(tmp_path: Path, bin_dir: Path) -> dict[str, str]:
         key: value
         for key, value in os.environ.items()
         # The developer's own build root/cache must not decide the test.
-        if key not in {"BUILD_ROOT", "SBOM_CACHE_DIR", "CONTAINER_REGISTRIES_OVERRIDE"}
+        if key not in {"BUILD_ROOT", "CONTAINER_REGISTRIES_OVERRIDE"}
     }
     environment["PATH"] = f"{bin_dir}:/usr/bin:/bin"
     environment["RUNNER_TEMP"] = str(tmp_path / "runner")
@@ -214,140 +214,13 @@ sys.exit(0)
     return result, artifacts / "compliance", calls
 
 
-def test_a_fresh_scan_populates_the_cache_and_the_next_run_restores_it(tmp_path: Path) -> None:
-    """The package list is the expensive part of the bundle and it only changes when
-    the image changes. The first run scans once; the second run of the same digest
-    restores the same documents and does not scan at all."""
-    first, compliance, calls = _sbom_run(tmp_path)
-
-    assert first.returncode == 0, first.stderr
-    assert "cache miss" in first.stdout
-    assert calls.read_text(encoding="utf-8").count("SYFT docker:") == 1
-
-    cache = tmp_path / "runner" / "lambda-runtime-monorepo" / "sbom-cache" / "pypy311" / "x86_64"
-    meta = json.loads((cache / "sbom-cache-meta.json").read_text(encoding="utf-8"))
-    assert meta["image_digest"] == "sha256:" + "a" * 64
-    assert meta["base_image_digest"] == "sha256:" + "b" * 64
-    assert meta["syft_version"] == "1.57.0"
-    assert meta["packages"] == {"total": 5, "rpm": 4, "runtime": 1}
-
-    spdx_before = (compliance / "pypy311-x86_64.spdx.json").read_bytes()
-    cdx_before = (compliance / "pypy311-x86_64.cdx.json").read_bytes()
-    provenance_before = json.loads(
-        (compliance / "pypy311-x86_64.provenance.json").read_text(encoding="utf-8")
-    )
-    assert provenance_before["sbom_cache_hit"] is False
-
-    calls.write_text("", encoding="utf-8")
-    second, compliance, calls = _sbom_run(tmp_path)
-
-    assert second.returncode == 0, second.stderr
-    assert "cache hit" in second.stdout
-    assert "SYFT docker:" not in calls.read_text(encoding="utf-8"), "a hit must not rescan"
-    # The scan is dynamic even on a hit: the CVE report is recomputed every time.
-    assert "GRYPE " in calls.read_text(encoding="utf-8")
-
-    # Byte-identical documents and a provenance that says where they came from.
-    assert (compliance / "pypy311-x86_64.spdx.json").read_bytes() == spdx_before
-    assert (compliance / "pypy311-x86_64.cdx.json").read_bytes() == cdx_before
-    provenance = json.loads(
-        (compliance / "pypy311-x86_64.provenance.json").read_text(encoding="utf-8")
-    )
-    assert provenance["sbom_cache_hit"] is True
-    assert provenance["sbom_sha256"]["spdx"] == provenance_before["sbom_sha256"]["spdx"]
-
-
-def test_a_rebuilt_image_never_inherits_another_images_package_list(tmp_path: Path) -> None:
-    """The cache key is not the answer: a rebuilt image can carry the same tag, the
-    same runtime and the same Syft version. The recorded image digest is."""
-    _sbom_run(tmp_path)
-    result, compliance, calls = _sbom_run(tmp_path, image_digest="sha256:" + "d" * 64)
-
-    assert result.returncode == 0, result.stderr
-    assert "cache miss: image digest" in result.stdout
-    assert calls.read_text(encoding="utf-8").count("SYFT docker:") == 1
-    provenance = json.loads(
-        (compliance / "pypy311-x86_64.provenance.json").read_text(encoding="utf-8")
-    )
-    assert provenance["sbom_cache_hit"] is False
-
-
-def test_a_new_base_image_digest_invalidates_the_cache(tmp_path: Path) -> None:
-    _sbom_run(tmp_path)
-    result, _compliance, calls = _sbom_run(tmp_path, base_image_digest="sha256:" + "e" * 64)
-
-    assert result.returncode == 0, result.stderr
-    assert "cache miss: base digest" in result.stdout
-    assert calls.read_text(encoding="utf-8").count("SYFT docker:") == 1
-
-
-def test_a_syft_upgrade_invalidates_the_cache(tmp_path: Path) -> None:
-    """A newer Syft recognises packages the old one missed, so its output cannot be
-    served from an entry an older Syft wrote."""
-    _sbom_run(tmp_path)
-    result, _compliance, calls = _sbom_run(tmp_path, syft_version="1.58.0")
-
-    assert result.returncode == 0, result.stderr
-    assert "cache miss: syft 1.57.0 -> 1.58.0" in result.stdout
-    assert calls.read_text(encoding="utf-8").count("SYFT docker:") == 1
-
-
 def test_a_document_that_lost_its_components_is_refused(tmp_path: Path) -> None:
     """The CycloneDX document is attached to the digest as evidence, so an empty one
-    fails the same way an empty SPDX does — and nothing is cached."""
+    fails the same way an empty SPDX does."""
     result, _compliance, _calls = _sbom_run(tmp_path, cdx_components=False)
 
     assert result.returncode != 0
     assert "no components" in result.stderr
-    cache = tmp_path / "runner" / "lambda-runtime-monorepo" / "sbom-cache"
-    assert not (cache / "pypy311" / "x86_64" / "sbom-cache-meta.json").exists()
-
-
-def test_the_cache_directory_is_offered_by_the_manifest_and_honours_the_override() -> None:
-    script = _TOOLS.parent / "runtime_lib" / "runtime_manifest.py"
-    text = script.read_text(encoding="utf-8")
-    assert 'os.environ.get("SBOM_CACHE_DIR") or str(temp_root / "sbom-cache")' in text
-
-    environment = dict(os.environ)
-    environment["SBOM_CACHE_DIR"] = "/tmp/explicit-sbom-cache"
-    result = subprocess.run(
-        [
-            "python3",
-            str(script),
-            "env",
-            "--runtime",
-            "pypy311",
-            "--arch",
-            "x86_64",
-        ],
-        capture_output=True,
-        text=True,
-        env=environment,
-        cwd=_REPO_ROOT,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "SBOM_CACHE_DIR=/tmp/explicit-sbom-cache" in result.stdout
-
-
-def test_the_build_environment_caches_the_sbom_directory_per_runtime_and_arch() -> None:
-    """The `sbom-cache-meta.json` check is what makes a shared cache safe, so the
-    workflow key only has to be good enough to offer the right cell its own entry."""
-    action = yaml.safe_load(
-        (_REPO_ROOT / ".github/actions/runtime-build-env/action.yml").read_text(encoding="utf-8")
-    )
-    steps = action["runs"]["steps"]
-    prepare = next(step for step in steps if step.get("name") == "Prepare cache directories")
-    assert "SBOM_CACHE_DIR=" in prepare["run"]
-
-    cache_step = next(step for step in steps if step.get("name") == "Cache SBOMs")
-    with_ = cache_step["with"]
-    assert with_["path"] == "${{ env.SBOM_CACHE_DIR }}"
-    assert with_["key"].startswith("sbom-${{ inputs.runtime }}-${{ inputs.arch }}-${{ env.SYFT_VERSION }}-")
-    assert "tools/bin/generate-compliance-artifacts" in with_["key"]
-    assert with_["restore-keys"].strip() == (
-        "sbom-${{ inputs.runtime }}-${{ inputs.arch }}-${{ env.SYFT_VERSION }}-"
-    )
-    assert cache_step["if"] == "inputs.runtime != '' && inputs.arch != ''"
 
 
 # --- Task 2a: push-container -----------------------------------------------------
@@ -757,82 +630,6 @@ def test_a_refresh_whose_scan_is_unchanged_does_not_delete_the_live_referrer(
 
     assert not [call for call in calls if call.startswith("manifest delete")]
     assert [call for call in calls if call.startswith("attach")], "the refresh still attaches"
-
-
-# --- Task 5a: ECR Public deletion fallback --------------------------------------
-
-
-def test_ecr_public_deletion_falls_back_to_the_api(tmp_path: Path) -> None:
-    """ECR Public refuses a manifest DELETE on its OCI endpoint, so the referrer has
-    to be removed through the API — addressed by digest, with the repository name
-    taken from after the alias."""
-    referrers = tmp_path / "referrers.json"
-    referrers.write_text(
-        json.dumps(
-            {
-                "referrers": [
-                    {
-                        "artifactType": "application/spdx+json",
-                        "digest": "sha256:keep",
-                        "annotations": {"org.opencontainers.image.created": "2026-11-01T00:00:00Z"},
-                    },
-                    {
-                        "artifactType": "application/spdx+json",
-                        "digest": "sha256:dupe",
-                        "annotations": {"org.opencontainers.image.created": "2026-11-02T00:00:00Z"},
-                    },
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    calls = tmp_path / "calls.log"
-    calls.write_text("", encoding="utf-8")
-
-    _stub(
-        bin_dir / "oras",
-        f"""#!{os.path.realpath(__import__("sys").executable)}
-import pathlib
-import sys
-
-args = sys.argv[1:]
-with open({str(calls)!r}, "a", encoding="utf-8") as handle:
-    handle.write(" ".join(args) + "\\n")
-
-if args and args[0] == "discover":
-    print(pathlib.Path({str(referrers)!r}).read_text(encoding="utf-8"))
-    sys.exit(0)
-if args[:2] == ["manifest", "fetch"]:
-    print('{{"digest": "sha256:subject"}}')
-    sys.exit(0)
-if args[:3] == ["manifest", "delete", "--force"]:
-    sys.exit(1)
-sys.exit(0)
-""",
-    )
-    _stub(
-        bin_dir / "aws",
-        f"""#!{os.path.realpath(__import__("sys").executable)}
-import sys
-
-with open({str(calls)!r}, "a", encoding="utf-8") as handle:
-    handle.write("AWS " + " ".join(sys.argv[1:]) + "\\n")
-sys.exit(0)
-""",
-    )
-
-    environment = _base_environment(tmp_path, bin_dir)
-    environment["CONTAINER_REGISTRIES_OVERRIDE"] = '["public.ecr.aws/alias/project"]'
-    result = _run("prune-duplicate-referrers", ["pypy311", "x86_64", "--delete"], environment)
-
-    assert result.returncode == 0, result.stderr
-    assert "removed sha256:dupe" in result.stdout
-    aws_call = next(line for line in calls.read_text(encoding="utf-8").splitlines() if line.startswith("AWS"))
-    assert "batch-delete-image" in aws_call
-    assert "--repository-name project" in aws_call, "the alias is not part of the repository name"
-    assert "imageDigest=sha256:dupe" in aws_call
 
 
 # --- Task 3: Iron Bank credentials in every container-building workflow ----------

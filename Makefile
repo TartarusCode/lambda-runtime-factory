@@ -8,19 +8,19 @@ DEV_BUILD_ENV := BUILD_BEST_EFFORT_AUDIT=0
 
 all: validate-runtimes build
 
-.PHONY: all list-runtimes validate-runtimes check build build-all build-all-arches audit compliance attest test container container-check container-invoke container-audit container-push container-merge container-soci container-repos verify-referrers prune-referrers prune-superseded clean check-updates prune-waivers bump bump-latest roll-off
+.PHONY: all list-runtimes validate-runtimes check build build-all build-all-arches audit compliance attest test container container-check container-invoke container-audit container-push container-merge container-soci container-repos verify-referrers clean check-updates prune-waivers bump bump-latest roll-off
 
 list-runtimes:
 	python3 tools/runtime_lib/runtime_manifest.py list
 
 validate-runtimes:
-	bash tools/bin/validate-runtimes
+	python3 tools/runtime_lib/runtime_manifest.py validate
 
 test:
 	python3 -m pytest tools/runtime_lib/tests -q
 
 check:
-	bash tools/bin/check-runtime "$(RUNTIME)" "$(ARCH)"
+	python3 tools/runtime_lib/runtime_manifest.py check --runtime "$(RUNTIME)" --arch "$(ARCH)"
 
 # Stage the payload: verify the upstream archive, extract, slim, record
 # /opt/runtime-manifest.json and normalize the STIG permissions. Nothing is
@@ -76,10 +76,6 @@ container-repos:
 verify-referrers:
 	bash tools/bin/verify-referrers $(if $(REGISTRY),--registry "$(REGISTRY)")
 
-# Report (or, with DELETE=1, remove) a referrer attached twice to one digest.
-prune-referrers:
-	bash tools/bin/prune-duplicate-referrers "$(RUNTIME)" "$(ARCH)" $(if $(DELETE),--delete)
-
 container-audit: compliance
 
 container-invoke:
@@ -89,7 +85,7 @@ container-push:
 	bash tools/bin/push-container "$(RUNTIME)" "$(ARCH)"
 
 check-updates:
-	bash tools/bin/bump-runtime check
+	python3 tools/runtime_lib/bump_version.py check
 
 # Retire a UBI-lag waiver once the fixed RPM is published to the UBI9 repository.
 # The weekly update workflow runs `check --prune-waivers`, which calls the same
@@ -97,22 +93,14 @@ check-updates:
 prune-waivers:
 	python3 tools/runtime_lib/bump_version.py prune-waivers $(if $(DRY_RUN),--dry-run)
 
-# Remove the untagged digests a refresh superseded, and their referrers. Dry run
-# unless DELETE=1. Pass SUPERSEDED_DIGEST=sha256:... to name the replaced digest; the
-# release workflow reads it from container.json.
-prune-superseded:
-	bash tools/bin/prune-superseded-digests "$(RUNTIME)" "$(ARCH)" \
-		$(if $(SUPERSEDED_DIGEST),--superseded-digest "$(SUPERSEDED_DIGEST)") \
-		$(if $(DELETE),--delete)
-
 bump:
-	bash tools/bin/bump-runtime bump "$(RUNTIME)" "$(VERSION)"
+	python3 tools/runtime_lib/bump_version.py bump "$(RUNTIME)" "$(VERSION)"
 
 bump-latest:
-	bash tools/bin/bump-runtime bump-latest
+	python3 tools/runtime_lib/bump_version.py bump-latest
 
 roll-off:
-	bash tools/bin/bump-runtime roll-off $(ARGS)
+	python3 tools/runtime_lib/bump_version.py roll-off $(ARGS)
 
 clean:
 	bash tools/bin/clean-runtime "$(RUNTIME)"

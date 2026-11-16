@@ -213,10 +213,7 @@ fi
 # be recorded with numbers a factor of three apart depending on the runner.
 verify_json=$(python3 "$(common::repo_root)/tools/runtime_lib/container_image.py" verify --image "${image}")
 unpacked_bytes=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["unpacked_bytes"])' <<<"${verify_json}")
-container_image_bytes=$(python3 "$(common::repo_root)/tools/runtime_lib/container_image.py" \
-    record-size --runtime "${runtime_id}" --arch "${arch}" --image "${image}" \
-    --unpacked-bytes "${unpacked_bytes}" \
-    | awk '{ print $(NF-1) }')
+container_image_bytes=${unpacked_bytes}
 
 echo "${runtime_id} (${arch}): image ${image} holds ${container_image_bytes} bytes unpacked (summed from the exported rootfs)"
 # --- container.json --------------------------------------------------------------
@@ -243,10 +240,7 @@ record = {
     "image_digest": image_digest,
     "base_image_ref": base_image_ref,
     "base_image_digest": base_image_digest,
-    # Both spellings: the generator reads the directive's name, older callers read
-    # the shorter one.
     "unpacked_size_bytes": int(unpacked_bytes),
-    "unpacked_bytes": int(unpacked_bytes),
     "user": user,
     "workdir": workdir,
     "entrypoint": json.loads(entrypoint or "[]"),
