@@ -101,7 +101,6 @@ def test_bump_latest_with_line_skips_offline_updates(
                 "distribution_version": "1.3.14",
                 "version_line": "1.3",
                 "artifact": {"checksum_file": "checksums/bun.sha256"},
-                "release": {"regions": ["eu-central-1"]},
             }
         ),
         encoding="utf-8",
@@ -129,7 +128,6 @@ def _write_runtime_manifest(root: Path, runtime_id: str, family: str, version: s
         "distribution_version": version,
         "version_line": version_line,
         "artifact": {"checksum_file": "checksums/bun.sha256"},
-        "release": {"regions": ["eu-central-1"]},
     }
     path = root / runtime_id / "runtime.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -196,11 +194,6 @@ def test_add_runtime_line_clones_and_rewrites(
     (fake_runtimes_root / "bun13" / "bootstrap" / "bootstrap").write_text(
         "#!/bin/sh\nexec /opt/bun/bun ...\n", encoding="utf-8"
     )
-    (fake_runtimes_root / "bun13" / "examples" / "sls").mkdir(parents=True)
-    (fake_runtimes_root / "bun13" / "examples" / "sls" / "serverless.yml").write_text(
-        "service: hello-bun13\nfunctions:\n  hello-bun13:\n    layers: [bun13]\n",
-        encoding="utf-8",
-    )
 
     mocker.patch.object(
         bump_version,
@@ -220,11 +213,6 @@ def test_add_runtime_line_clones_and_rewrites(
     assert new_manifest["runtime_id"] == "bun14"
     assert new_manifest["distribution_version"] == "1.4.0"
     assert new_manifest["version_line"] == "1.4"
-
-    sls = (fake_runtimes_root / "bun14" / "examples" / "sls" / "serverless.yml").read_text(
-        encoding="utf-8"
-    )
-    assert "hello-bun14" in sls and "bun13" not in sls
 
     checksum = (fake_runtimes_root / "bun14" / "checksums" / "bun.sha256").read_text(
         encoding="utf-8"

@@ -40,7 +40,7 @@ common::ensure_runtime_built() {
         return 0
     fi
 
-    if [[ ! -d "${LAYER_ROOT}" || ! -f "${PACKAGE_PATH}" ]]; then
+    if [[ ! -d "${PAYLOAD_ROOT}" || ! -f "${PAYLOAD_ROOT}/runtime-manifest.json" ]]; then
         bash "$(common::repo_root)/tools/bin/build-runtime" "${runtime_id}" "${arch}"
         common::load_runtime_env "${runtime_id}" "${arch}"
     fi

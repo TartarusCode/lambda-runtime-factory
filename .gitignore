@@ -1,11 +1,6 @@
 build/
 dist/
-.aws-sam/
 .venv-test/
-template.local.yaml
-template.local.yml
-event.json
-event*.json
 __pycache__/
 *.py[cod]
 

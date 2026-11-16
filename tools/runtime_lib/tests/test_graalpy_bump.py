@@ -27,9 +27,6 @@ def _write_manifest(runtimes_root: Path, python_version: str, version: str) -> N
         "artifact": {
             "checksum_file": "checksums/graalpy.sha256",
         },
-        "release": {
-            "regions": ["eu-central-1", "us-west-1"],
-        },
     }
     path = runtimes_root / runtime_id / "runtime.json"
     path.parent.mkdir(parents=True, exist_ok=True)

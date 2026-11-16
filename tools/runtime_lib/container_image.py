@@ -1,8 +1,7 @@
 """Render and stage the OCI image for a runtime.
 
-Every runtime ships exactly one container, built from the same ``${LAYER_ROOT}``
-payload as its Lambda zip layer, so there is one copy of every runtime and the two
-artifacts cannot drift.
+Every runtime ships exactly one container, staged from the payload `build-runtime`
+produces, so there is one copy of every runtime on disk.
 
 The base is the DoD-hardened Iron Bank UBI9-minimal, and there is deliberately no
 second one. A distroless base would mean two container matrices, two tags per
@@ -151,7 +150,7 @@ def _readelf_needed(path: Path) -> List[str]:
     return needed
 
 
-def scan_payload_sonames(layer_root: Path) -> List[str]:
+def scan_payload_sonames(payload_root: Path) -> List[str]:
     """Union of every shared-library dependency in the payload.
 
     ``readelf`` understands foreign architectures, so an arm64 payload can be
@@ -159,7 +158,7 @@ def scan_payload_sonames(layer_root: Path) -> List[str]:
     separately, and a dangling one would only produce noise.
     """
     sonames: set[str] = set()
-    for dirpath, _dirnames, filenames in os.walk(layer_root):
+    for dirpath, _dirnames, filenames in os.walk(payload_root):
         for name in filenames:
             path = Path(dirpath) / name
             if path.is_symlink():
@@ -168,7 +167,7 @@ def scan_payload_sonames(layer_root: Path) -> List[str]:
     return sorted(sonames)
 
 
-def payload_library_names(layer_root: Path) -> set[str]:
+def payload_library_names(payload_root: Path) -> set[str]:
     """Basenames of libraries the payload ships itself.
 
     A dependency such as ``libpypy3.11-c.so`` is resolved through the payload's
@@ -176,7 +175,7 @@ def payload_library_names(layer_root: Path) -> set[str]:
     installed from the base (no package owns it).
     """
     names: set[str] = set()
-    for _dirpath, _dirnames, filenames in os.walk(layer_root):
+    for _dirpath, _dirnames, filenames in os.walk(payload_root):
         for name in filenames:
             if ".so" in name:
                 names.add(name)
@@ -250,7 +249,7 @@ def _docker_env(env: Dict[str, str]) -> str:
 
 def render_dockerfile(
     *,
-    layer_root: str,
+    payload_root: str,
     workdir: str,
     env: Dict[str, str],
     labels: Optional[Dict[str, str]] = None,
@@ -270,7 +269,7 @@ def render_dockerfile(
     )
 
     replacements = {
-        "@@LAYER_ROOT@@": layer_root.rstrip("/"),
+        "@@PAYLOAD_ROOT@@": payload_root.rstrip("/"),
         "@@WORKDIR@@": workdir,
         "@@ENV@@": _docker_env(env),
         "@@LABELS@@": label_lines,
@@ -290,8 +289,8 @@ def render_dockerfile(
 def prepare(runtime_id: str, arch: str, *, force: bool = False) -> Dict[str, Any]:
     """Stage the container build context and return what the builder needs.
 
-    The payload is the same ``${LAYER_ROOT}`` the zip layer ships, hardlinked into
-    ``context/layer`` where the filesystem allows it, so a ~700 MB Rust toolchain
+    The payload is the ``${PAYLOAD_ROOT}`` build-runtime produced, hardlinked into
+    ``context/payload`` where the filesystem allows it, so a ~700 MB Rust toolchain
     is not copied twice just to satisfy Docker's context boundary. Nothing about the
     payload is re-derived here: build-runtime owns the download, the checksum, the
     extraction, the slimming and the STIG permissions.
@@ -302,16 +301,16 @@ def prepare(runtime_id: str, arch: str, *, force: bool = False) -> Dict[str, Any
             f"{runtime_id} ({arch}) has no container target (container.enabled=false)"
         )
 
-    layer_root = Path(env["LAYER_ROOT"])
-    if not layer_root.is_dir():
+    payload_root = Path(env["PAYLOAD_ROOT"])
+    if not payload_root.is_dir():
         raise ContainerError(
-            f"{runtime_id} ({arch}): no payload at {layer_root}. "
+            f"{runtime_id} ({arch}): no payload at {payload_root}. "
             "Build the runtime package first (tools/bin/build-runtime)."
         )
 
     # The image entrypoints at the payload's bootstrap, so the payload must carry
     # one.
-    bootstrap = layer_root / env["BOOTSTRAP_OUTPUT"]
+    bootstrap = payload_root / env["BOOTSTRAP_OUTPUT"]
     if not bootstrap.exists():
         raise ContainerError(
             f"{runtime_id} ({arch}): the payload has no {bootstrap}; the image "
@@ -328,16 +327,16 @@ def prepare(runtime_id: str, arch: str, *, force: bool = False) -> Dict[str, Any
         shutil.rmtree(context_dir, ignore_errors=True)
     context_dir.mkdir(parents=True, exist_ok=True)
 
-    layer_link = context_dir / "layer"
+    payload_link = context_dir / "payload"
     try:
         subprocess.run(
-            ["cp", "-al", str(layer_root), str(layer_link)],
+            ["cp", "-al", str(payload_root), str(payload_link)],
             check=True,
             capture_output=True,
             text=True,
         )
     except subprocess.CalledProcessError:
-        shutil.copytree(layer_root, layer_link, symlinks=True)
+        shutil.copytree(payload_root, payload_link, symlinks=True)
 
     # The template always COPYs certs/, so the directory must exist even when the
     # repository ships no extra root CAs.
@@ -353,8 +352,8 @@ def prepare(runtime_id: str, arch: str, *, force: bool = False) -> Dict[str, Any
     # the Dockerfile installs in the one layer every runtime shares. A runtime that
     # needed something else would cost every cell the whole ubi9 base pull, so it is
     # an error rather than a per-runtime install.
-    sonames = scan_payload_sonames(layer_root)
-    provided = payload_library_names(layer_root)
+    sonames = scan_payload_sonames(payload_root)
+    provided = payload_library_names(payload_root)
     declared = json.loads(env.get("CONTAINER_PACKAGES") or "[]")
     unsatisfied = json.loads(env.get("CONTAINER_UNSATISFIED_SONAMES") or "[]")
     packages = ironbank_packages(
@@ -391,7 +390,7 @@ def prepare(runtime_id: str, arch: str, *, force: bool = False) -> Dict[str, Any
     }
 
     dockerfile = render_dockerfile(
-        layer_root=env["CONTAINER_LAYER_ROOT"],
+        payload_root=env["CONTAINER_PAYLOAD_ROOT"],
         workdir=env["CONTAINER_WORKDIR"],
         env=json.loads(env["CONTAINER_ENV"]),
         labels=labels,

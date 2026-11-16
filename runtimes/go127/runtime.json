@@ -9,7 +9,7 @@
   },
   "local_testing": {
     "handler": "handler",
-    "code_uri": "examples/sam/hello",
+    "code_uri": "examples/local/hello",
     "skip_local_invoke": true
   }
 }

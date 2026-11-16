@@ -1,7 +1,7 @@
-// The distroless image runs this file directly (no /bin/sh), so the environment
+// The Iron Bank image runs this file directly (no /bin/sh), so the environment
 // the shell bootstrap used to export is initialized here instead. Deno reads
 // DENO_DIR once at startup; the image also sets it as ENV, this is the fallback
-// for the zip layer and for a custom entrypoint.
+// for a custom entrypoint.
 process.env.HOME ??= "/tmp";
 process.env.TMPDIR ??= "/tmp";
 process.env.DENO_DIR ??= "/tmp/.deno";

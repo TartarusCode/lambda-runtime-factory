@@ -158,7 +158,7 @@ install_native_bootstrap() {
         return 0
     fi
 
-    local output="${LAYER_ROOT}/${BOOTSTRAP_OUTPUT}"
+    local output="${PAYLOAD_ROOT}/${BOOTSTRAP_OUTPUT}"
     local tmp_output="${output}.compiled"
     if ! cc -O2 -static -s \
         -DRUNTIME_DIR_NAME="\"${RUNTIME_DIR_NAME}\"" \
@@ -220,14 +220,14 @@ compile_bytecode() {
     fi
 
     local interpreter
-    interpreter=$(python3 - "${CONTAINER_ENTRYPOINT:-[]}" "${LAYER_ROOT}" <<'PYEOF'
+    interpreter=$(python3 - "${CONTAINER_ENTRYPOINT:-[]}" "${PAYLOAD_ROOT}" <<'PYEOF'
 import json
 import sys
 
 entrypoint = json.loads(sys.argv[1] or "[]")
-layer_root = sys.argv[2].rstrip("/")
+payload_root = sys.argv[2].rstrip("/")
 first = entrypoint[0] if entrypoint else ""
-print(layer_root + first[len("/opt"):] if first.startswith("/opt/") else "")
+print(payload_root + first[len("/opt"):] if first.startswith("/opt/") else "")
 PYEOF
 )
     if [[ -z "${interpreter}" || ! -x "${interpreter}" ]]; then
@@ -263,22 +263,22 @@ PYEOF
 
 # Trim a payload to what the runtime actually needs at execution time.
 #
-# The 250 MB deployment-package ceiling is on *unzipped* bytes, and upstream
-# distributions ship stdlib test suites, GUI toolkits, headers, static archives
-# and build-time-only components that a Lambda function never loads.
+# Upstream distributions ship stdlib test suites, GUI toolkits, headers, static
+# archives and build-time-only components that a Lambda function never loads.
+# Pruning them keeps the image small and the scanned attack surface honest.
 #
 # Rule: prune, never rewrite. Package metadata that vulnerability scanning uses to
 # identify a component — `*.dist-info`, `*.egg-info`, `*.json` manifests, license
 # and version files — is never removed here, and the audit runs *after* this so it
-# scans exactly what ships. Set SLIM_LAYER=0 to package the upstream payload as
+# scans exactly what ships. Set SLIM_PAYLOAD=0 to package the upstream payload as
 # extracted, which is how the byte counts before and after are compared.
-slim_layer() {
-    if [[ "${SLIM_LAYER:-1}" != "1" ]]; then
-        echo "Slimming disabled (SLIM_LAYER=${SLIM_LAYER:-1}): packaging the upstream payload as extracted."
+slim_payload() {
+    if [[ "${SLIM_PAYLOAD:-1}" != "1" ]]; then
+        echo "Slimming disabled (SLIM_PAYLOAD=${SLIM_PAYLOAD:-1}): packaging the upstream payload as extracted."
         return 0
     fi
 
-    local root="${LAYER_ROOT}/${RUNTIME_DIR_NAME}"
+    local root="${PAYLOAD_ROOT}/${RUNTIME_DIR_NAME}"
     if [[ ! -d "${root}" ]]; then
         return 0
     fi
@@ -352,10 +352,10 @@ slim_layer() {
 }
 
 rm -rf "${BUILD_DIR}"
-mkdir -p "${LAYER_ROOT}" "${DOWNLOADS_DIR}" "${ARTIFACT_DIR}" "${WORK_DIR}"
+mkdir -p "${PAYLOAD_ROOT}" "${DOWNLOADS_DIR}" "${ARTIFACT_DIR}" "${WORK_DIR}"
 
-cp "${BOOTSTRAP_SOURCE}" "${LAYER_ROOT}/${BOOTSTRAP_OUTPUT}"
-chmod +x "${LAYER_ROOT}/${BOOTSTRAP_OUTPUT}"
+cp "${BOOTSTRAP_SOURCE}" "${PAYLOAD_ROOT}/${BOOTSTRAP_OUTPUT}"
+chmod +x "${PAYLOAD_ROOT}/${BOOTSTRAP_OUTPUT}"
 
 if [[ ! -f "${ARCHIVE_PATH}" ]]; then
     curl --fail --location --proto '=https' --tlsv1.2 \
@@ -382,8 +382,8 @@ case "${ARCHIVE_NAME}" in
         ;;
 esac
 if [[ -n "${BINARY_NAME:-}" && -f "${WORK_DIR}/${BINARY_NAME}" ]]; then
-    mkdir -p "${LAYER_ROOT}/${RUNTIME_DIR_NAME}"
-    mv "${WORK_DIR}/${BINARY_NAME}" "${LAYER_ROOT}/${RUNTIME_DIR_NAME}/${BINARY_NAME}"
+    mkdir -p "${PAYLOAD_ROOT}/${RUNTIME_DIR_NAME}"
+    mv "${WORK_DIR}/${BINARY_NAME}" "${PAYLOAD_ROOT}/${RUNTIME_DIR_NAME}/${BINARY_NAME}"
 else
     source_dir="${WORK_DIR}/${ARCHIVE_ROOT_DIR}"
     if [[ ! -d "${source_dir}" ]]; then
@@ -404,33 +404,33 @@ else
             exit 1
         fi
     fi
-    mv "${source_dir}" "${LAYER_ROOT}/${RUNTIME_DIR_NAME}"
+    mv "${source_dir}" "${PAYLOAD_ROOT}/${RUNTIME_DIR_NAME}"
 fi
 
-mkdir -p "${LAYER_ROOT}/${HELPER_INSTALL_DIR}"
-cp -R "${HELPER_SOURCE}" "${LAYER_ROOT}/${HELPER_INSTALL_DIR}/"
+mkdir -p "${PAYLOAD_ROOT}/${HELPER_INSTALL_DIR}"
+cp -R "${HELPER_SOURCE}" "${PAYLOAD_ROOT}/${HELPER_INSTALL_DIR}/"
 
 # Go and Rust bootstrap through `exec` in a shell today; replace that with a
-# compiled launcher so the payload starts without an interpreter — the same file
-# runs on provided.al2023 and inside the UBI9 image.
+# compiled launcher so the payload starts without an interpreter. The same file
+# is the launcher inside the UBI9 image.
 install_native_bootstrap
 
 # Before the payload is described, so the manifest records what ships.
-slim_layer
+slim_payload
 
 # The vulnerability scan runs against the image (generate-compliance-artifacts),
 # because the RPM database is half of what makes a finding mean anything.
 
 # --- STIG rootless permissions --------------------------------------------------
 #
-# Lambda mounts a layer read-only and runs the function under an arbitrary
-# non-root UID. Upstream archives carry whatever mode their packager used, and a
+# Lambda mounts /opt read-only and runs the function under an arbitrary non-root
+# UID. Upstream archives carry whatever mode their packager used, and a
 # file that is not world-readable (or a directory that is not world-traversable)
 # is a permission-denied at first import — under a UID the build never saw.
 # `a+rX` adds read for everyone and execute only where a directory (or a file
 # that already had any execute bit) needs it, so no binary loses its mode.
-chmod -R a+rX "${LAYER_ROOT}"
-chmod a+rx "${LAYER_ROOT}/${BOOTSTRAP_OUTPUT}"
+chmod -R a+rX "${PAYLOAD_ROOT}"
+chmod a+rx "${PAYLOAD_ROOT}/${BOOTSTRAP_OUTPUT}"
 
 # --- self-describing payload -----------------------------------------------------
 #
@@ -439,7 +439,7 @@ chmod a+rx "${LAYER_ROOT}/${BOOTSTRAP_OUTPUT}"
 # repository — and generate-compliance-artifacts reads the same record instead of
 # re-deriving it.
 upstream_sha256=$(checksum_for)
-python3 - "${LAYER_ROOT}/runtime-manifest.json" "${runtime_id}" "${RUNTIME_FAMILY}" \
+python3 - "${PAYLOAD_ROOT}/runtime-manifest.json" "${runtime_id}" "${RUNTIME_FAMILY}" \
     "${DISTRIBUTION_VERSION}" "${arch}" "${ARCHIVE_URL}" "${upstream_sha256}" <<'PYEOF'
 import json
 import sys
@@ -461,13 +461,13 @@ with open(path, "w", encoding="utf-8") as handle:
     )
     handle.write("\n")
 PYEOF
-chmod a+r "${LAYER_ROOT}/runtime-manifest.json"
+chmod a+r "${PAYLOAD_ROOT}/runtime-manifest.json"
 
-payload_size=$(payload_bytes "${LAYER_ROOT}")
-echo "Staged ${runtime_id} (${arch}) payload: ${payload_size} bytes under ${LAYER_ROOT}"
+payload_size=$(payload_bytes "${PAYLOAD_ROOT}")
+echo "Staged ${runtime_id} (${arch}) payload: ${payload_size} bytes under ${PAYLOAD_ROOT}"
 
 # The image is the artifact. Nothing is zipped, uploaded or published from here:
 # build-container reads this tree and generate-compliance-artifacts inspects the
 # image it produces.
 
-echo "Built ${runtime_id} payload at ${LAYER_ROOT}"
+echo "Built ${runtime_id} payload at ${PAYLOAD_ROOT}"

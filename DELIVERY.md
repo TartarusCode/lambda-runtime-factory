@@ -1,42 +1,7 @@
 # Delivering runtime images with supply-chain evidence
 
 Every runtime in this repository ships **one hardened OCI image** on the Iron Bank UBI9-minimal base,
-plus the SBOMs, vulnerability reports and provenance a DoD continuous-ATO review asks for. There is no
-Lambda layer and no `.zip`.
-
-## Why there is no layer any more
-
-In run `42121477502`, 12 of 24 publish cells failed `PublishLayerVersion`:
-
-```
-InvalidParameterValueException ... PublishLayerVersion:
-Unzipped size must be smaller than 262144000 bytes
-```
-
-That is Lambda's deployment-package ceiling, quoted from the quotas page:
-
-> **250 MB** — the maximum size of the contents of a deployment package, including layers and custom
-> runtimes. (unzipped)
-
-It counts unzipped bytes, it covers the function **and every attached layer** (so splitting a runtime
-across layers does not help; a function may carry at most 5), and it is not adjustable.
-
-After slimming, the numbers were: `graalpy312` 256,817,392 B (98.0% of the ceiling) and `graalpy313`
-250,195,312 B (95.4%) — 3–11 MB left for the function's own code, against a ~225 MB
-`libpythonvm.so` floor that no amount of pruning moves. `rust*` is 1.29 GB. So the ceiling was not a
-tuning problem for six of the twelve runtimes then in the matrix; it was a wall.
-
-`graalpy312` was dropped rather than carried into the image era. Upstream ended the GraalPy 3.12 line
-at `graal-25.2.4`: every release from `graal-25.3.4` onward publishes only `graalpy3.13-*` assets, and
-that 25.2.4 distribution bundles a JDK (`25.0.4+7-LTS-jvmci-25.2-b20`) with a fixable High CVE and no
-newer 3.12 build to move to. `graalpy313` moved to `graal-25.5.5`, whose bundled JDK is
-`25.0.5.0.3+1-LTS-jvmci-25.5-b26` — past the fix. Carrying an unpatched runtime and ignoring the CVE
-is the one thing the compliance contract exists to prevent.
-
-The second reason is worse. **A layer executes on AWS's `provided.al2023` base, not ours.** The STIG
-user, the read-only rootfs, the injected trust store, the RPM-owned libraries and the absence of a
-package manager are properties of the image — and a layer never sees any of them. Publishing both
-meant publishing a compliance claim that only half the artifacts honoured.
+plus the SBOMs, vulnerability reports and provenance a DoD continuous-ATO review asks for.
 
 ## The published contract
 
@@ -198,5 +163,3 @@ Measured on `pypy311` x86_64, 12 cold starts per configuration:
 
 It costs 16 MB and buys nothing measurable: the interpreter's own startup dominates this handler's
 init. It stays an opt-in (`PRECOMPILE_BYTECODE=1`) for a family where imports are the bottleneck.
-
-Source for the layer limits: <https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html>

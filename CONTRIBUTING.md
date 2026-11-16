@@ -63,8 +63,7 @@ The manifest list is the single source of truth for the CI and release matrices 
 `runtime_manifest.py matrix` through the same composite action, and both run every runtime. There
 is no per-runtime opt-out: one artifact per runtime means nothing to narrow.
 
-There is no byte budget any more. The 250 MB unzipped ceiling applied to Lambda layers, and the
-layer is gone; the image has a 10 GB limit that no runtime approaches. The staged payload size is
+The image has a 10 GB uncompressed limit that no runtime approaches. The staged payload size is
 reported in the step log, and the number that matters — the unpacked image size — is measured from
 the exported rootfs by `build-container` and recorded in `container.json`.
 
@@ -85,7 +84,7 @@ Every runtime also has a `container` block, merged from `REPO_DEFAULTS` and the 
   "registry": "ghcr.io/tartaruscode/lambda-runtime-factory",
   "registries": ["ghcr.io/tartaruscode/lambda-runtime-factory", "public.ecr.aws/tartaruscode/lambda-runtime-factory"],
   "workdir": "/var/task",
-  "layer_root": "/opt",
+  "payload_root": "/opt",
   "entrypoint": ["/opt/bootstrap"],
   "smoke_test": {},
   "env": {"HOME": "/tmp", "TMPDIR": "/tmp", "LAMBDA_TASK_ROOT": "/var/task", "GOCACHE": "/tmp/.cache/go-build", "GOPATH": "/tmp/go", "CARGO_HOME": "/tmp/.cargo", "RUSTUP_HOME": "/tmp/.rustup", "DENO_DIR": "/tmp/.deno", "PYTHONPYCACHEPREFIX": "/tmp/.pycache"},
@@ -99,7 +98,7 @@ doubles the container matrix and the tag set for no gain. The only per-family co
 `env` (a `PATH` for the toolchains, a `PYTHONPATH` for the interpreters), `smoke_test` and
 `unsatisfied_sonames`.
 
-The image is built from the **same** `${LAYER_ROOT}` that `build-runtime` staged, so the two steps
+The image is built from the **same** `${PAYLOAD_ROOT}` that `build-runtime` staged, so the two steps
 cannot drift, and `build-container` never re-derives the payload — it reads what the build produced,
 including the `/opt/runtime-manifest.json` that records where those bytes came from.
 
@@ -249,15 +248,15 @@ execs the runtime.
 Per family:
 
 - **pypy / graalpy** — `bootstrap.py3` starts `#!/opt/pypy/bin/pypy` (or graalpy), so a direct
-  `execve` of `/opt/bootstrap` resolves the interpreter. The image carries the layer's
+  `execve` of `/opt/bootstrap` resolves the interpreter. The image carries the payload's
   `site-packages` on `PYTHONPATH`.
 - **bun / deno** — the bootstrap is a `#!/bin/sh` wrapper that `exec`s the runtime with the helper
   and its flags. The environment it exports (`HOME=/tmp`, `DENO_DIR=/tmp/.deno`) is also initialized
   at the top of `helpers/lambda_runtime_*/runtime.ts`, so the bootstrap and the helper share one code
   path.
 - **go / rust** — `build-runtime` compiles `tools/launcher/bootstrap.c` into `/opt/bootstrap` with
-  `cc -O2 -static`, replacing the `#!/bin/sh` exec wrapper. The same ELF runs on `provided.al2023`
-  and inside the image. If the build host is a different architecture, the script is kept and the
+  `cc -O2 -static`, replacing the `#!/bin/sh` exec wrapper. The same ELF is the launcher
+  inside the image. If the build host is a different architecture, the script is kept and the
   build warns.
 
 An image whose runtime has no handler to invoke declares its own smoke test instead
@@ -371,12 +370,12 @@ An image whose runtime has no handler — the Go and Rust toolchain images — r
 its manifest declares in `container.smoke_test` instead: `go version`, or the launcher's
 `_HANDLER is not set` diagnostic for Rust.
 
-Each runtime still carries local SAM assets under `runtimes/<id>/examples/sam/`
-(`template.local.example.yaml`, `events/hello.json`, `hello/`). They are declared in the
-manifest's `local_testing` block and `make check` validates that the referenced files exist, but
-no `make` target builds or invokes a SAM application: the container smoke test is the local
-execution path. CI does not install the SAM CLI; `requirements-ci.txt` pins it if you want to
-drive the template yourself.
+Each runtime carries a tiny handler and event under `runtimes/<id>/examples/local/`
+(`hello/`, `events/hello.json`). The container smoke test mounts the handler at
+`/var/task` and posts the event through the runtime interface emulator; the
+`local_testing` block in the manifest says which handler, event and example
+directory to use. There is no SAM or Serverless application to build, and CI does
+not install either CLI.
 
 ## CI
 
@@ -434,7 +433,6 @@ version-bump PR; its title and body are rendered by `tools/runtime_lib/update_re
 check's JSON report.
 
 CI installs `requirements-dev.txt` (pytest, pytest-mock, pyyaml) for the test suite.
-`requirements-ci.txt` pins the AWS SAM CLI for local use and is not read by any workflow.
 
 ## Cutting a release
 
@@ -489,7 +487,7 @@ a rebuild that produces different bytes gets a new digest and is signed and atte
 ## Adding a new runtime
 
 1. Create a new runtime directory under `runtimes/<runtime-id>/`.
-2. Add a `runtime.json` manifest with artifact, Lambda, release, and local test metadata.
+2. Add a `runtime.json` manifest with artifact and local test metadata.
 3. Add the runtime bootstrap, helper package, checksum file, and examples under that directory.
 4. Run:
 
@@ -499,7 +497,7 @@ python3 tools/runtime_lib/runtime_manifest.py check --runtime <runtime-id> --arc
 make build RUNTIME=<runtime-id>
 ```
 
-5. Add or adapt runtime-specific examples under `runtimes/<runtime-id>/examples/`.
+5. Add or adapt the runtime's local example under `runtimes/<runtime-id>/examples/local/`.
 6. Add or update CI expectations if the runtime needs extra validation beyond the shared defaults.
 
 ## Adding a new version line

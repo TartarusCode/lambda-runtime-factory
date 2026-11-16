@@ -2,8 +2,8 @@
 
 AWS Lambda **runtime images** — one hardened Iron Bank UBI9 OCI image per runtime, built and
 published from one manifest-driven pipeline, with its SBOMs, CVE report and provenance attached to
-the digest. Each runtime is an independent package under `runtimes/`. There is no Lambda layer:
-see [DELIVERY.md](DELIVERY.md) for why the layer half was removed rather than slimmed.
+the digest. Each runtime is an independent package under `runtimes/`, and every one ships a single
+OCI image — there is no separate deployment package.
 
 ## What gets published
 
@@ -120,13 +120,13 @@ the ids the current matrix builds.
 ## Repository layout
 
 ```text
-runtimes/<runtime-id>/   runtime.json, bootstrap/, helpers/, checksums/, examples/
-tools/bin/               build, audit, upload, publish, local-test entrypoints
+runtimes/<runtime-id>/   runtime.json, bootstrap/, helpers/, checksums/, examples/local/
+tools/bin/               build, audit, push and local-test entrypoints
 tools/runtime_lib/       family defaults, manifest resolution, bump tooling, tests
 tools/docker/            Dockerfile — the canonical Iron Bank stage layout
 certs/                   extra root CAs baked into the Iron Bank images (*.crt)
 .github/workflows/       CI, release, audit and weekly version-bump pipelines
-.github/actions/         shared composite actions: matrix, build environment, build + audit
+.github/actions/         shared composite actions: matrix, build environment, login, build + audit
 ```
 
 ## Development

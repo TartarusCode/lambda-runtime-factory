@@ -154,15 +154,15 @@ RUN set -eu; \
 
 @@LABELS@@
 
-# The payload is the ${LAYER_ROOT} tree build-runtime staged — including the
+# The payload is the ${PAYLOAD_ROOT} tree build-runtime staged — including the
 # /opt/runtime-manifest.json that records which upstream bytes it came from — and
 # it is owned by the runtime UID so a read-only mount is the only thing standing
 # between the function and its own payload.
-COPY --chown=${NONROOT_UID}:${NONROOT_GID} layer/ @@LAYER_ROOT@@/
+COPY --chown=${NONROOT_UID}:${NONROOT_GID} payload/ @@PAYLOAD_ROOT@@/
 
 # STIG: every file readable and every directory traversable by any UID, because
 # Lambda runs the function under a UID the build never saw.
-RUN chmod -R a+rX @@LAYER_ROOT@@
+RUN chmod -R a+rX @@PAYLOAD_ROOT@@
 
 @@ENV@@
 
