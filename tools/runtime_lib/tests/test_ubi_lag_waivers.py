@@ -348,6 +348,20 @@ def test_the_gate_decides_the_policy_not_grypes_fail_on() -> None:
     assert "sarif=${stem}.grype.sarif" in scan[0], scan[0]
 
 
+def test_the_provenance_step_is_handed_the_gate_verdict() -> None:
+    """The gate file is a positional argument, and dropping it fails silently: the
+    provenance would simply carry no waiver record, so the artifact would stop saying
+    which findings the gate released and under which advisory."""
+    script = _SCRIPT.read_text(encoding="utf-8")
+    invocation = script.split('python3 - "${stem}" "${payload_manifest}"', 1)[1]
+    invocation = invocation.split("<<'PYEOF'", 1)[0]
+
+    assert '"${gate_file}"' in invocation, "the provenance block never sees the verdict"
+    assert invocation.index("${sbom_cache_hit}") < invocation.index("${gate_file}"), (
+        "the gate path is the argument after the cache flag"
+    )
+
+
 def test_the_os_layer_upgrades_the_base_and_is_restamped_by_every_build_call_site() -> None:
     """`microdnf upgrade` fetches remote repodata, and BuildKit does not track what a
     RUN fetched: without a stamp in the instruction the cached layer is replayed with
