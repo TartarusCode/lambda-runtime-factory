@@ -942,7 +942,7 @@ def test_the_development_documentation_is_linked_and_present() -> None:
     assert contributing.exists()
     assert "CONTRIBUTING.md" in readme
 
-    for target in ("make build", "make local-invoke", "roll-off"):
+    for target in ("make build", "make container-invoke", "roll-off"):
         assert target in contributing.read_text(encoding="utf-8"), (
             f"CONTRIBUTING.md should document {target}"
         )

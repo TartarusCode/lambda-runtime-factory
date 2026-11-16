@@ -130,8 +130,8 @@ certs/                   extra root CAs baked into the Iron Bank images (*.crt)
 ## Development
 
 Building, testing, releasing and extending the packages — the build environment, every `make`
-target, the local SAM flow, the CI and release pipelines, and how to add a runtime or a version
-line — is documented in [CONTRIBUTING.md](CONTRIBUTING.md).
+target, local invocation and the container smoke test, the CI and release pipelines, and how to
+add a runtime or a version line — is documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

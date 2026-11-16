@@ -1,8 +1,9 @@
 # A Lambda container image built on a published runtime, with pure-Python
 # dependencies installed in a builder stage.
 #
-# The runtime image is distroless: no shell, no pip, no compiler. Installing
-# anything with `RUN` in the final stage cannot work, so dependencies are built
+# The runtime image is the published PyPy payload on Iron Bank UBI9-minimal: no
+# compiler, no C headers, and /opt and /var/task are read-only at run time.
+# Installing anything in the final stage cannot work, so dependencies are built
 # elsewhere and copied in. Every file the runtime needs (including the
 # *.dist-info metadata scanners read) travels in /out.
 ARG RUNTIME=ghcr.io/tartaruscode/lambda-runtime-factory/pypy311:3.11
