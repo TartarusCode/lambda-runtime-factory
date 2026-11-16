@@ -217,6 +217,30 @@ package set.
 built image and applies no waiver, so it is expected to be red while an advisory's fixed RPM is
 unavailable. The policy lives in one place, in the gate.
 
+### Digest lineage, and removing what a refresh supersedes
+
+A refresh pushes new bytes over `<version>-<arch>`, so the digest that was there becomes untagged —
+but it stays pullable by digest, and its five referrers stay attached to it. Two things follow from
+that.
+
+The provenance quotes the digest the build replaces. `common::superseded_digest` resolves it before
+the push moves the tag (the comparison is on the config digest the manifest points at, because a
+manifest digest never equals an image id), and the value lands in `container.json` as
+`supersedes_digest` — `null` when the tag is new or the registry serves these bytes — and in
+`provenance.json` beside `base_image_digest`. A registry this job cannot read records nothing rather
+than a guess: an audit run does not log in, so its provenance says "unknown", not "no previous
+image".
+
+`tools/bin/prune-superseded-digests` removes those orphans, bottom-up. It is a dry run until
+`--delete`, and it never removes a digest that a tag points at, a platform manifest inside an active
+index, or any referrer attached to those — those are the published contract. Referrers go first,
+because deleting a subject leaves its referrers unreachable by discovery. Orphans are enumerated from
+the registry where an API lists untagged images (`describe-images` on ECR Public, with
+`--grace-days`, default 7, keeping a manifest that may be mid-publish) and otherwise come from
+`--superseded-digest`, which is what `release-runtime.yml` passes when `prune_superseded` is set. The
+release summary prints the `supersedes → published` mapping for every registry, so the rotation is
+readable after the fact even when nothing is pruned.
+
 ### The entrypoint, and the families that have no handler
 
 One entrypoint for every family: `/opt/bootstrap`, which applies the Lambda filesystem contract and

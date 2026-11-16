@@ -581,6 +581,23 @@ if (( gate_status != 0 )) && (( best_effort )); then
     gate_status=0
 fi
 
+# --- digest lineage -------------------------------------------------------------
+# The provenance attestation is what an auditor reads after the tag has moved, so the
+# digest this build replaces is resolved *before* push-container overwrites the tag.
+# A registry this job cannot read — an audit run does not log in — answers nothing, and
+# the provenance records null rather than a guess: "no previous image" and "could not
+# ask" must not look the same in an attestation.
+mapfile -t lineage_registries < <(python3 -c 'import json,sys
+for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIES_OVERRIDE:-${CONTAINER_REGISTRIES:-[]}}")
+for registry in "${lineage_registries[@]}"; do
+    reference="${registry}/${RUNTIME_ID}:${CONTAINER_TAG}-${CONTAINER_ARCH}"
+    superseded=$(common::superseded_digest "${CONTAINER_LOCAL_IMAGE}" "${reference}")
+    if [[ -n "${superseded}" ]]; then
+        common::record_supersedes "${registry}" "${reference}" "${superseded}"
+        echo "${runtime_id} (${arch}): ${superseded} on ${registry} becomes untagged when this build is published"
+    fi
+done
+
 # --- provenance ----------------------------------------------------------------
 payload_manifest="${LAYER_ROOT}/runtime-manifest.json"
 if [[ ! -f "${payload_manifest}" ]]; then
@@ -644,6 +661,10 @@ provenance = {
     "upstream_sha256": payload.get("upstream_sha256"),
     "base_image_ref": container_record.get("base_image_ref", ""),
     "base_image_digest": container_record.get("base_image_digest", ""),
+    # The digest this build replaced in the registry, resolved before the push moved
+    # the tag. null means nothing was replaced (a new tag, an unchanged image, or a
+    # registry this run could not read), which is why it is quoted rather than implied.
+    "supersedes_digest": container_record.get("supersedes_digest"),
     "image_digest": docker_format("{{.Id}}", image),
     "unpacked_size_bytes": container_record.get("unpacked_size_bytes", container_record.get("unpacked_bytes", 0)),
     "stig_verification": {
