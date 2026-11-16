@@ -28,7 +28,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 runtime_id=$(common::require_runtime_id "${positional[0]:-}")
-common::load_runtime_env "${runtime_id}" "${ARCH:-x86_64}" standard
+common::load_runtime_env "${runtime_id}" "${ARCH:-x86_64}"
 
 mapfile -t registries < <(python3 -c 'import json,sys
 for registry in json.loads(sys.argv[1]): print(registry)' "${CONTAINER_REGISTRIES_OVERRIDE:-${CONTAINER_REGISTRIES}}")

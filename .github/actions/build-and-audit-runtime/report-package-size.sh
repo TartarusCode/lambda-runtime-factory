@@ -56,7 +56,7 @@ else:
     else:
         base = "-"
 
-    size = container.get("unpacked_size_bytes") or container.get("unpacked_bytes") or 0
+    size = container.get("unpacked_size_bytes") or 0
     size_cell = f"{size / 1048576:.1f}" if size else "-"
 
     counts = provenance.get("grype_summary") or {}

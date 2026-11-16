@@ -13,7 +13,7 @@ publishes — tag names, registries, architectures and how to verify them — se
 - Docker with BuildKit (`docker buildx`) is required for the container artifact
 - `readelf` (binutils) is used to resolve the payload's shared libraries
 - Transient build work is staged under `${BUILD_ROOT:-$RUNNER_TEMP}` or `/tmp` to avoid slow
-  cross-OS archive operations; the staged payload, `container.json`, `build-stats.json` and the
+  cross-OS archive operations; the staged payload, `container.json` and the
   compliance bundle stay under `${ARTIFACT_DIR}` there
   - release and CI artifacts are built from temp storage by default
   - the image is published, not exported: `runtime_env` still emits `EXPORT_ARTIFACT_DIR`, but
@@ -64,9 +64,9 @@ The manifest list is the single source of truth for the CI and release matrices 
 is no per-runtime opt-out: one artifact per runtime means nothing to narrow.
 
 There is no byte budget any more. The 250 MB unzipped ceiling applied to Lambda layers, and the
-layer is gone; the image has a 10 GB limit that no runtime approaches. `build-stats.json` now records
-the staged payload size, and the number that matters — the unpacked image size — is measured from the
-exported rootfs by `build-container` and recorded in `container.json`.
+layer is gone; the image has a 10 GB limit that no runtime approaches. The staged payload size is
+reported in the step log, and the number that matters — the unpacked image size — is measured from
+the exported rootfs by `build-container` and recorded in `container.json`.
 
 ## Container images
 
@@ -108,7 +108,7 @@ make build RUNTIME=pypy311 ARCH=x86_64        # payload
 make container RUNTIME=pypy311 ARCH=x86_64    # image from that payload
 make container-check RUNTIME=pypy311 ARCH=x86_64    # assert the STIG contract
 make container-invoke RUNTIME=pypy311 ARCH=x86_64   # smoke test (or the toolchain's own)
-bash tools/bin/audit-container pypy311 x86_64 # Grype scan of the image
+make compliance RUNTIME=pypy311 ARCH=x86_64  # SBOMs, Grype report, provenance
 ```
 
 ### The stage layout
@@ -161,7 +161,7 @@ Three checks read that back from real bytes rather than trusting the Dockerfile:
   published image.
 
 That same rootfs export measures the image's **unpacked** size, which is what the job summary and
-`build-stats.json` record: `docker image inspect .Size` is the compressed size on a containerd image
+`container.json` record: `docker image inspect .Size` is the compressed size on a containerd image
 store and the uncompressed one on the classic overlay2 store, so the same image read 82,283,585 B on
 a CI runner and 251,143,202 B on a developer box. The rootfs sum is the number Lambda counts against
 its 10 GB container limit, and it does not depend on the daemon.
@@ -222,33 +222,26 @@ site forwards it. That rebuild is the price of picking up a patched RPM without 
 base tag; a stamp dropped from one call site would replay the cached layer and silently keep the old
 package set.
 
-`tools/bin/audit-container` remains the raw scan: it reports every fixable High and Critical on the
-built image and applies no waiver, so it is expected to be red while an advisory's fixed RPM is
-unavailable. The policy lives in one place, in the gate.
+The gate is the only policy: there is no second, unfiltered scan script to keep in step with it. A
+finding the waiver does not cover fails an Iron Bank build, and the report, SARIF and provenance
+always carry the raw counts.
 
-### Digest lineage, and removing what a refresh supersedes
+### Digest lineage
 
 A refresh pushes new bytes over `<version>-<arch>`, so the digest that was there becomes untagged —
-but it stays pullable by digest, and its five referrers stay attached to it. Two things follow from
-that.
+but it stays pullable by digest, with its referrers attached. The provenance quotes the digest the
+build replaces. `common::superseded_digest` resolves it before the push moves the tag (the comparison
+is on the config digest the manifest points at, because a manifest digest never equals an image id),
+and the value lands in `container.json` as `supersedes_digest` — `null` when the tag is new or the
+registry serves these bytes — and in `provenance.json` beside `base_image_digest`. A registry this job
+cannot read records nothing rather than a guess: an audit run does not log in, so its provenance says
+"unknown", not "no previous image". The release summary prints the `supersedes → published` mapping
+for every registry, so the rotation is readable after the fact.
 
-The provenance quotes the digest the build replaces. `common::superseded_digest` resolves it before
-the push moves the tag (the comparison is on the config digest the manifest points at, because a
-manifest digest never equals an image id), and the value lands in `container.json` as
-`supersedes_digest` — `null` when the tag is new or the registry serves these bytes — and in
-`provenance.json` beside `base_image_digest`. A registry this job cannot read records nothing rather
-than a guess: an audit run does not log in, so its provenance says "unknown", not "no previous
-image".
-
-`tools/bin/prune-superseded-digests` removes those orphans, bottom-up. It is a dry run until
-`--delete`, and it never removes a digest that a tag points at, a platform manifest inside an active
-index, or any referrer attached to those — those are the published contract. Referrers go first,
-because deleting a subject leaves its referrers unreachable by discovery. Orphans are enumerated from
-the registry where an API lists untagged images (`describe-images` on ECR Public, with
-`--grace-days`, default 7, keeping a manifest that may be mid-publish) and otherwise come from
-`--superseded-digest`, which is what `release-runtime.yml` passes when `prune_superseded` is set. The
-release summary prints the `supersedes → published` mapping for every registry, so the rotation is
-readable after the fact even when nothing is pruned.
+Removal is a registry-retention concern, not part of the release pipeline: configure a lifecycle
+policy for untagged manifests (ECR Public supports one), or delete a specific digest with
+`aws ecr-public batch-delete-image`. Keeping deletion out of the release means an irreversible
+operation no longer depends on a token that may lack `delete:packages` on GHCR.
 
 ### The entrypoint, and the families that have no handler
 
@@ -408,7 +401,7 @@ Between the two:
 - `runtime-checks` (matrix): builds every runtime × architecture, builds the Iron Bank image,
   smoke-tests it rootless and read-only (`local-invoke-container`), checks its STIG contract
   (`check-container`) and generates the compliance bundle
-- caches: upstream runtime downloads, the SBOM cache, the Grype binary and the Grype database
+- caches: upstream runtime downloads, the Grype binary and the Grype database
 - artifacts: the per-cell compliance bundle uploads `if: always()` with `retention-days: 30`
   (`90` in the release workflow)
 - superseded PR runs cancel via workflow concurrency
@@ -484,9 +477,8 @@ Publishing is idempotent for content that has not changed:
 
 The evidence set is checked separately: `make verify-referrers` (optionally
 `REGISTRY=<registry>`) verifies the published contract — five referrers on each per-arch image and
-on its SOCI copy, one signature on each merged index. `make prune-referrers RUNTIME=<id>
-ARCH=<arch>` reports duplicates on one digest and, with `DELETE=1`, removes all but the earliest
-of each type.
+on its SOCI copy, one signature on each merged index. Idempotent attestation keeps a re-release at
+exactly one of each, so there is no duplicate-pruning script to run.
 
 None of this skips validation: every build is measured, smoke-tested and scanned before a push, so
 a rebuild that produces different bytes gets a new digest and is signed and attested again.
@@ -500,7 +492,7 @@ a rebuild that produces different bytes gets a new digest and is signed and atte
 
 ```bash
 python3 tools/runtime_lib/runtime_manifest.py validate --runtime <runtime-id>
-bash tools/bin/check-runtime <runtime-id>
+python3 tools/runtime_lib/runtime_manifest.py check --runtime <runtime-id> --arch x86_64
 make build RUNTIME=<runtime-id>
 ```
 

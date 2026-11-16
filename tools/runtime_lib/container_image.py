@@ -528,56 +528,6 @@ def verify_image_layout(image: str) -> Dict[str, Any]:
     }
 
 
-def record_size(
-    image: str,
-    runtime_id: str,
-    arch: str,
-    *,
-    unpacked_bytes: Optional[int] = None,
-) -> Optional[int]:
-    """Write the built image size into build-stats.json and return the bytes.
-
-    ``unpacked_bytes``, measured from the exported rootfs, is preferred: it means
-    the same thing on every daemon. The fallback reads the daemon's own number,
-    which is the *compressed* size when the daemon uses a containerd image store
-    — the same image then reads roughly three times smaller than on the classic
-    overlay2 store, so the fallback is labelled rather than passed off as the
-    unpacked size.
-
-    There is no package to measure any more: the image is the artifact.
-    """
-    source = "rootfs-export"
-    size = unpacked_bytes
-    if size is None:
-        result = subprocess.run(
-            ["docker", "image", "inspect", "--format", "{{.Size}}", image],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            return None
-        size = int(result.stdout.strip())
-        source = "docker-image-inspect"
-
-    env = runtime_manifest.runtime_env(runtime_id, arch=arch)
-    artifact_dir = Path(env["ARTIFACT_DIR"])
-    stats_path = artifact_dir / "build-stats.json"
-    stats: Dict[str, Any] = {}
-    if stats_path.exists():
-        stats = json.loads(stats_path.read_text(encoding="utf-8"))
-
-    stats.setdefault("runtime_id", runtime_id)
-    stats.setdefault("arch", arch)
-    stats["container_image_bytes"] = size
-    stats["container_image_bytes_measured"] = source
-    stats["container_image"] = image
-    stats_path.parent.mkdir(parents=True, exist_ok=True)
-    stats_path.write_text(
-        json.dumps(stats, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    return size
-
-
 def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -590,21 +540,6 @@ def _main() -> None:
     verify_parser = sub.add_parser("verify", help="Assert the Lambda filesystem contract")
     verify_parser.add_argument("--image", required=True)
 
-    size_parser = sub.add_parser("record-size", help="Record the image size in build-stats")
-    size_parser.add_argument("--runtime", required=True)
-    size_parser.add_argument("--arch", required=True)
-    size_parser.add_argument("--image", required=True)
-    size_parser.add_argument(
-        "--unpacked-bytes",
-        type=int,
-        default=None,
-        help=(
-            "Unpacked size measured from the exported rootfs. Preferred over "
-            "`docker image inspect .Size`, which is the compressed size on a "
-            "containerd image store."
-        ),
-    )
-
     args = parser.parse_args()
 
     if args.command == "prepare":
@@ -616,19 +551,7 @@ def _main() -> None:
         )
         return
 
-    if args.command == "verify":
-        print(json.dumps(verify_image_layout(args.image), indent=2))
-        return
-
-    size = record_size(
-        args.image,
-        args.runtime,
-        args.arch,
-        unpacked_bytes=args.unpacked_bytes,
-    )
-    if size is None:
-        raise SystemExit(f"could not read the size of {args.image}")
-    print(f"{args.image}: {size} bytes")
+    print(json.dumps(verify_image_layout(args.image), indent=2))
 
 
 if __name__ == "__main__":

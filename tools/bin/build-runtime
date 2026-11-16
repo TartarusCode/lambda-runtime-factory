@@ -179,8 +179,7 @@ install_native_bootstrap() {
     echo "Installed the native bootstrap for ${RUNTIME_DIR_NAME} (${ARCH}) at ${output}"
 }
 
-# Sum of the regular files under a directory: the payload size the image copies,
-# recorded in build-stats.json.
+# Sum of the regular files under a directory: the payload size the image copies.
 payload_bytes() {
     python3 - "$1" <<'PYEOF'
 import os
@@ -470,19 +469,5 @@ echo "Staged ${runtime_id} (${arch}) payload: ${payload_size} bytes under ${LAYE
 # The image is the artifact. Nothing is zipped, uploaded or published from here:
 # build-container reads this tree and generate-compliance-artifacts inspects the
 # image it produces.
-python3 - "${runtime_id}" "${arch}" "${payload_size}" "${ARTIFACT_DIR}/build-stats.json" <<'PYEOF'
-import json
-import sys
-
-runtime_id, arch, payload_bytes, stats_path = sys.argv[1:5]
-with open(stats_path, "w", encoding="utf-8") as handle:
-    json.dump(
-        {"runtime_id": runtime_id, "arch": arch, "payload_bytes": int(payload_bytes)},
-        handle,
-        indent=2,
-        sort_keys=True,
-    )
-    handle.write("\n")
-PYEOF
 
 echo "Built ${runtime_id} payload at ${LAYER_ROOT}"

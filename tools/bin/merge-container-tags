@@ -21,7 +21,6 @@ soci=0
 for argument in "${@:2}"; do
     case "${argument}" in
         --soci) soci=1 ;;
-        --ironbank) ;;  # no-op: every image is on the Iron Bank base
         *) echo "Unknown option: ${argument}" >&2; exit 2 ;;
     esac
 done

@@ -24,7 +24,6 @@ source "$(dirname "$0")/_common.sh"
 positional=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --ironbank) shift ;;  # no-op: every image is on the Iron Bank base
         -*) echo "Unknown option: $1" >&2; exit 2 ;;
         *) positional+=("$1"); shift ;;
     esac
@@ -115,7 +114,6 @@ PY
         echo "${runtime_id} (${arch}): the toolchain did not report version ${DISTRIBUTION_VERSION}" >&2
         exit 1
     fi
-    mark_read_only_verified
     mark_read_only_verified
 echo "Container smoke test passed for ${runtime_id} (${arch})"
     exit 0
