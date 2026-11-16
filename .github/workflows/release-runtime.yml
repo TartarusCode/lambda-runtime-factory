@@ -116,13 +116,7 @@ jobs:
   # first: a manual release must not scan against a week-old database just because
   # no push happened to refresh it. Like the CI primer, this is the only writer.
   grype-db:
-    runs-on: ubuntu-26.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/runtime-build-env
-        with:
-          db-refresh: "true"
+    uses: ./.github/workflows/grype-db.yml
 
   # One job validates everything that would otherwise fail in every cell.
   # aws-actions/configure-aws-credentials retries credential loading 12 times
@@ -253,33 +247,14 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Log in to Iron Bank Registry
         # Only when the repository carries the credentials; the fallback base
-        # covers every other case. Retried because registry1.dso.mil answers
-        # `context deadline exceeded` often enough that one attempt turns a
-        # healthy cell into a failed release — but a cell that never reaches it
-        # fails here rather than quietly publishing on the Red Hat mirror.
+        # covers every other case. The retry and the credential names live in the
+        # shared action, so every call site logs in the same way the build decides
+        # whether it has a token.
         if: ${{ env.IRONBANK_TOKEN != '' }}
-        shell: bash
-        env:
-          IRONBANK_USERNAME: ${{ secrets.IRONBANK_USERNAME }}
-          RETRY_DELAY: "15"
-        run: |
-          source tools/bin/_common.sh
-          ib_login() {
-            printf '%s' "${IRONBANK_TOKEN}" \
-              | docker login registry1.dso.mil --username "${IRONBANK_USERNAME}" --password-stdin
-          }
-          if ! common::retry 4 ib_login; then
-            echo "registry1.dso.mil did not answer after 4 attempts" >&2
-            exit 1
-          fi
-      - name: Set up Docker Buildx
-        # The docker-container driver exposes the job's cache service through
-        # `type=gha`, which is how the base pull and the certificate/library
-        # staging are reused across runs and architectures; the default docker
-        # driver has no BuildKit cache export.
-        uses: docker/setup-buildx-action@v4
+        uses: ./.github/actions/iron-bank-login
         with:
-          driver: docker-container
+          token: ${{ secrets.IRONBANK_TOKEN }}
+          username: ${{ secrets.IRONBANK_USERNAME }}
       - name: Configure AWS credentials
         # Amazon ECR Public is the copy Lambda can actually pull from, so the
         # image job needs the same OIDC role the layer publish uses.
@@ -298,46 +273,16 @@ jobs:
         # exists; GHCR creates the package itself.
         if: ${{ github.event.inputs.dry_run != 'true' }}
         run: bash tools/bin/push-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --ensure-only
-      - name: Prepare the image build
-        env:
-          CONTAINER_BUILD_CACHE: gha
-        run: |
-          timeout 300 bash tools/bin/build-container \
-            "${{ matrix.runtime }}" "${{ matrix.arch }}" --prepare-only
-      - name: Build the container image
-        # `docker/build-push-action` rather than a shell `docker buildx build`:
-        # `type=gha` needs the Actions cache runtime variables, which a shell step
-        # does not inherit, so the cache flags parse and every layer misses.
-        uses: docker/build-push-action@v7
+      - name: Build, smoke-test and scan the image
+        # The same sequence CI and the audit run: payload, image, smoke test, STIG
+        # contract, compliance bundle. Only bytes that passed every step are pushed,
+        # and the bundle stays downloadable for 90 days on a release.
+        uses: ./.github/actions/build-and-audit-runtime
         with:
-          context: ${{ env.BUILD_CONTEXT }}
-          file: ${{ env.BUILD_DOCKERFILE }}
-          platforms: ${{ env.BUILD_PLATFORM }}
-          tags: ${{ env.BUILD_IMAGE_TAG }}
-          load: true
-          labels: |
-            org.opencontainers.image.revision=${{ env.BUILD_REVISION }}
-          build-args: |
-            BASE_IMAGE=${{ env.BUILD_BASE_IMAGE }}
-            BUILDER_IMAGE=${{ env.BUILD_BASE_IMAGE }}
-            NONROOT_UID=${{ env.BUILD_NONROOT_UID }}
-            NONROOT_GID=${{ env.BUILD_NONROOT_GID }}
-            UBI_RPM_EPOCH=${{ env.BUILD_UBI_RPM_EPOCH }}
-          cache-from: |
-            type=gha,scope=ubi9-base-${{ matrix.arch }}
-            type=gha,scope=runtime-${{ matrix.runtime }}-${{ matrix.arch }}
-          cache-to: |
-            type=gha,mode=max,scope=ubi9-base-${{ matrix.arch }}
-            type=gha,mode=max,scope=runtime-${{ matrix.runtime }}-${{ matrix.arch }}
-      - name: Measure, smoke-test and scan the image
-        # Only bytes that passed every step are pushed. The smoke test runs before
-        # the compliance bundle so provenance cites the STIG check it performs.
-        run: |
-          timeout 900 bash tools/bin/build-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --finish
-          timeout 600 bash tools/bin/local-invoke-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
-          bash tools/bin/generate-compliance-artifacts "${{ matrix.runtime }}" "${{ matrix.arch }}"
-      - name: Check the image contract
-        run: bash tools/bin/check-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
+          runtime: ${{ matrix.runtime }}
+          arch: ${{ matrix.arch }}
+          container: "true"
+          retention-days: "90"
       - name: Push the per-architecture image
         if: ${{ github.event.inputs.dry_run != 'true' }}
         run: bash tools/bin/push-container "${{ matrix.runtime }}" "${{ matrix.arch }}"
@@ -400,19 +345,6 @@ jobs:
           if [ "${PUBLISH_SOCI}" = "true" ]; then
             bash tools/bin/attest-container "${{ matrix.runtime }}" "${{ matrix.arch }}" --target soci
           fi
-      - name: Upload the compliance bundle
-        # The same files, without a registry client: this is what an auditor
-        # downloads from the release run.
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.runtime }}-${{ matrix.arch }}-compliance
-          path: |
-            ${{ runner.temp }}/lambda-runtime-monorepo/${{ matrix.runtime }}/${{ matrix.arch }}/artifacts/compliance/*
-            ${{ runner.temp }}/lambda-runtime-monorepo/${{ matrix.runtime }}/${{ matrix.arch }}/artifacts/container.json
-          if-no-files-found: warn
-          retention-days: 90
-
       - name: Report the dry run
         if: ${{ github.event.inputs.dry_run == 'true' }}
         run: |

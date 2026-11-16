@@ -224,9 +224,12 @@ def test_the_update_workflow_prunes_and_carries_the_change_into_its_pull_request
     assert "runtimes/**" in pull_request["with"]["add-paths"]
     assert "release-required" in pull_request["with"]["labels"]
     assert pull_request["with"]["title"] == "${{ steps.title.outputs.title }}"
+    assert pull_request["if"] == "steps.check.outputs.updates_found == 'true'", (
+        "a missing output silently skips the PR"
+    )
 
     title = next(step for step in steps if step.get("id") == "title")
-    assert "[Security: Retire" in title["run"], "a reviewer sees the retirement in the title"
+    assert "update_report.py title" in title["run"], "the title is rendered by one module"
 
     label = next(
         step for step in steps if step.get("name") == "Ensure the release-required label exists"
@@ -235,8 +238,26 @@ def test_the_update_workflow_prunes_and_carries_the_change_into_its_pull_request
     assert "--force" in label["run"], "the step has to be idempotent"
 
     body = next(step for step in steps if step.get("name") == "Build PR description")
-    assert "Release Required After Merge" in body["run"]
-    assert "git tag -s" in body["run"], "the body carries the exact release command"
+    assert "update_report.py body" in body["run"]
+
+    from update_report import body as render_body, title as render_title
+
+    data = {
+        "outdated": {"pypy311": {"current": "3.11.8", "latest": "3.11.9"}},
+        "retired_waivers": [
+            {
+                "advisory": "RHSA-2026:99715",
+                "package": "krb5-libs",
+                "fixed_evr": "0:1.21.1-10.el9_9.2",
+                "published_evrs": ["0:1.21.1-10.el9_9.2"],
+            }
+        ],
+    }
+    assert render_title(data).startswith("[Security: Retire RHSA-2026:99715]")
+    rendered = render_body(data, [])
+    assert "| `pypy311` | `3.11.8` | `3.11.9` |" in rendered
+    assert "Release Required After Merge" in rendered
+    assert "git tag -s" in rendered
 
 
 def test_ci_notes_that_a_retired_waiver_needs_a_release() -> None:

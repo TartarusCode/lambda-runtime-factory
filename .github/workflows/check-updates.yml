@@ -79,20 +79,9 @@ jobs:
         if: steps.check.outputs.updates_found == 'true'
         # The title is the only place a reviewer sees that this batch retires a
         # security acknowledgement and therefore needs a release behind it.
-        run: |
-          python3 - "${RUNNER_TEMP}/updates.json" >> "${GITHUB_OUTPUT}" <<'PYTITLE'
-          import json
-          import sys
-
-          data = json.load(open(sys.argv[1], encoding="utf-8"))
-          base = "chore: bump runtime distribution versions and add new lines"
-          retired = data.get("retired_waivers") or []
-          if retired:
-              advisories = ", ".join(sorted({str(item["advisory"]) for item in retired}))
-              print(f"title=[Security: Retire {advisories}] {base}")
-          else:
-              print(f"title={base}")
-          PYTITLE
+        run: >-
+          python3 tools/runtime_lib/update_report.py title
+          --updates "${RUNNER_TEMP}/updates.json" >> "${GITHUB_OUTPUT}"
 
       - name: Ensure the release-required label exists
         if: steps.check.outputs.retired == 'true'
@@ -107,63 +96,14 @@ jobs:
 
       - name: Build PR description
         if: steps.check.outputs.updates_found == 'true'
-        run: |
-          python3 << 'PYBODY'
-          import json, os
-          tmp = os.environ["RUNNER_TEMP"]
-          updates = json.load(open(tmp + "/updates.json"))
-          lines = ["## Runtime Version Bumps", "",
-                   "The following runtimes were updated to their latest upstream versions:", ""]
-          for rid, info in sorted(updates.get("outdated", {}).items()):
-              lines.append(f"- **{rid}**: {info['current']} → {info['latest']}")
-          new_lines = updates.get("new_lines", {})
-          if new_lines:
-              lines += ["", "## New Runtime Lines", "",
-                        "New runtime packages were created for newly available version lines:", ""]
-              for family, info in sorted(new_lines.items()):
-                  lines.append(f"- **{info['id']}**: new {family} line {info['line']} at version {info['version']}")
-          retired = updates.get("retired_waivers", [])
-          if retired:
-              lines += ["", "## Retired Security Waivers", "",
-                        "The fixed RPM these acknowledgements were waiting for is now published by UBI9,",
-                        "so the entries were removed rather than renewed:", ""]
-              for item in retired:
-                  lines.append(
-                      f"- **{item['advisory']}** — `{item['package']}` {item['fixed_evr']}; "
-                      f"UBI9 now publishes {', '.join(item['published_evrs'])}"
-                  )
-              advisories = ", ".join(sorted({str(item["advisory"]) for item in retired}))
-              lines += ["", "## Release Required After Merge", "",
-                        "Merging this deletes the waiver, so the next build installs the fixed RPM and the",
-                        "scan reports the package clean. Publish the patched images rather than waiting for",
-                        "the weekly audit to notice:", "",
-                        "```bash",
-                        "git fetch origin main && git checkout main && git pull",
-                        f'git tag -s "release-$(date -u +%Y.%m.%d)" -m "Release $(date -u +%Y.%m.%d): UBI9 security update ({advisories})"',
-                        'git push origin "release-$(date -u +%Y.%m.%d)"',
-                        "```", "",
-                        "Or dispatch `.github/workflows/release-runtime.yml` from `main` for the affected runtimes."]
-          lines += ["", "Checksums were fetched from the official upstream release channels."]
-
-          failures = []
-          if os.path.exists(tmp + "/bump_failures.json"):
-              failures = json.load(open(tmp + "/bump_failures.json")).get("failures", [])
-          if failures:
-              lines += ["", "## Skipped Runtimes", "",
-                        "These runtimes could not be updated and were left untouched:", ""]
-              for item in failures:
-                  lines.append(f"- **{item['runtime']}**: {item['message']}")
-              lines += ["", "_Resolve these upstream and re-run the workflow to pick them up._"]
-
-          lines += ["", "## Test Plan",
-                    "- [ ] CI validates manifests and checksums",
-                    "- [ ] CI builds all updated runtime packages",
-                    "- [ ] CI audits updated packages with Grype"]
-          open(tmp + "/pr_body.txt", "w").write("\n".join(lines) + "\n")
-          PYBODY
+        run: >-
+          python3 tools/runtime_lib/update_report.py body
+          --updates "${RUNNER_TEMP}/updates.json"
+          --failures "${RUNNER_TEMP}/bump_failures.json"
+          --out "${RUNNER_TEMP}/pr_body.txt"
 
       - name: Create pull request
-        if: steps.check.outputs.outdated == 'true'
+        if: steps.check.outputs.updates_found == 'true'
         uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.GITHUB_TOKEN }}

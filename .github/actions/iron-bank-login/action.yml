@@ -1,0 +1,34 @@
+name: Iron Bank login
+description: >-
+  Log in to registry1.dso.mil with the repository's credentials, retrying the
+  transient timeouts the registry is known for. Shared by CI, the audit and the
+  release so the fallback check and the login can never disagree: the token is
+  the job-level IRONBANK_TOKEN the build also reads.
+
+inputs:
+  token:
+    description: Iron Bank token (secrets.IRONBANK_TOKEN)
+    required: true
+  username:
+    description: Iron Bank username (secrets.IRONBANK_USERNAME)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Log in to Iron Bank Registry
+      shell: bash
+      env:
+        IRONBANK_TOKEN: ${{ inputs.token }}
+        IRONBANK_USERNAME: ${{ inputs.username }}
+        RETRY_DELAY: "15"
+      run: |
+        source tools/bin/_common.sh
+        ib_login() {
+          printf '%s' "${IRONBANK_TOKEN}" \
+            | docker login registry1.dso.mil --username "${IRONBANK_USERNAME}" --password-stdin
+        }
+        if ! common::retry 4 ib_login; then
+          echo "registry1.dso.mil did not answer after 4 attempts" >&2
+          exit 1
+        fi

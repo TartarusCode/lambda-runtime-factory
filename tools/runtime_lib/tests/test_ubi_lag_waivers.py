@@ -555,9 +555,11 @@ def test_the_os_layer_upgrades_the_base_and_is_restamped_by_every_build_call_sit
     publish = next(
         s
         for s in release["jobs"]["publish-containers"]["steps"]
-        if s.get("name") == "Build the container image"
+        if s.get("name") == "Build, smoke-test and scan the image"
     )
-    assert "UBI_RPM_EPOCH=${{ env.BUILD_UBI_RPM_EPOCH }}" in publish["with"]["build-args"]
+    assert publish["uses"] == "./.github/actions/build-and-audit-runtime", (
+        "the release must use the same build path as CI and the audit"
+    )
 
     build_container = _BUILD_CONTAINER.read_text(encoding="utf-8")
     assert "BUILD_UBI_RPM_EPOCH=${ubi_rpm_epoch}" in build_container

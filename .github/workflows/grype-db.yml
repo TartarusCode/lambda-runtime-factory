@@ -1,0 +1,30 @@
+name: grype-db
+
+# One place that refreshes the week's vulnerability database. The CI matrix, the
+# scheduled audit and the release all need the entry primed before their cells
+# restore it, and the cache entry is immutable: exactly one caller may write it.
+# Keeping the job here means the cache key and the "only the default branch
+# writes" rule cannot drift between workflows.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  # Pinned here because a called workflow does not inherit the caller's `env`.
+  # These are the versions the runtime-build-env action installs.
+  GRYPE_VERSION: v0.98.0
+  SYFT_VERSION: v1.57.0
+  COSIGN_VERSION: v3.1.4
+  ORAS_VERSION: v1.3.6
+
+jobs:
+  prime:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/runtime-build-env
+        with:
+          db-refresh: "true"

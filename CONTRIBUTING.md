@@ -414,19 +414,24 @@ instruction below the shared setup, which is what makes that reuse possible.
 Outside Actions there is no cache service: `build-container --cache-from/--cache-to` accept a
 registry ref (pass `$CONTAINER_CACHE_REF` for the conventional
 `<image>:buildcache-<arch>` tag). CI does not use that path. The Grype database has its own rule:
-only the workflow's `grype-db` job writes the week's entry, and only on the default branch.
+only the reusable `grype-db` workflow writes the week's entry, and only on the default branch.
 
-Three composite actions in `.github/actions/` hold the whole per-cell procedure so the workflows
-cannot drift apart:
+Four composite actions in `.github/actions/` hold the per-cell procedure so the workflows cannot
+drift apart:
 
 - `runtime-matrix` — the build/publish matrix, generated from the manifest list (and narrowed to
   the changed runtimes for the fast tier)
-- `runtime-build-env` — the download, SBOM, Grype-binary and Grype-database caches
+- `runtime-build-env` — the download, Grype-binary and Grype-database caches, plus the scan tooling
+- `iron-bank-login` — the retried `registry1.dso.mil` login, shared by CI, the audit and the release
 - `build-and-audit-runtime` — archive tooling, Buildx setup, `make build`, the image build, the
-  smoke test, the STIG contract check and `tools/bin/generate-compliance-artifacts`
+  smoke test, the STIG contract check, `tools/bin/generate-compliance-artifacts` and the compliance
+  bundle upload (retention is an input: 30 days in CI and the audit, 90 on a release)
 
-`.github/workflows/audit-runtimes.yml` runs the same matrix weekly to catch CVE-database drift,
-and `.github/workflows/check-updates.yml` opens the weekly version-bump PR.
+`.github/workflows/grype-db.yml` is a reusable workflow: the three scanning workflows call it so the
+week's cache entry has exactly one writer. `.github/workflows/audit-runtimes.yml` runs the same
+matrix weekly to catch CVE-database drift, and `.github/workflows/check-updates.yml` opens the weekly
+version-bump PR; its title and body are rendered by `tools/runtime_lib/update_report.py` from the
+check's JSON report.
 
 CI installs `requirements-dev.txt` (pytest, pytest-mock, pyyaml) for the test suite.
 `requirements-ci.txt` pins the AWS SAM CLI for local use and is not read by any workflow.

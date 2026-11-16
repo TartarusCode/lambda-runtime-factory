@@ -649,15 +649,16 @@ def test_every_container_workflow_logs_into_iron_bank_with_repository_secrets() 
         # name: (job, the step that builds the image, which the login must precede)
         "ci.yml": ("runtime-checks", "Build and audit runtime package"),
         "audit-runtimes.yml": ("audit", "Build and audit runtime package"),
-        "release-runtime.yml": ("publish-containers", "Build the container image"),
+        "release-runtime.yml": ("publish-containers", "Build, smoke-test and scan the image"),
     }
     for name, (job_name, build_step_name) in jobs.items():
         job = workflows[name]["jobs"][job_name]
         assert job["env"]["IRONBANK_TOKEN"] == "${{ secrets.IRONBANK_TOKEN }}", name
 
         login = next(step for step in job["steps"] if step.get("name") == "Log in to Iron Bank Registry")
-        assert login["env"]["IRONBANK_USERNAME"] == "${{ secrets.IRONBANK_USERNAME }}", name
-        assert "docker login registry1.dso.mil" in login["run"]
+        assert login["uses"] == "./.github/actions/iron-bank-login", name
+        assert login["with"]["token"] == "${{ secrets.IRONBANK_TOKEN }}", name
+        assert login["with"]["username"] == "${{ secrets.IRONBANK_USERNAME }}", name
         assert login["if"] == "${{ env.IRONBANK_TOKEN != '' }}", (
             f"{name} must skip the login when a fork has no secrets"
         )
@@ -668,6 +669,15 @@ def test_every_container_workflow_logs_into_iron_bank_with_repository_secrets() 
             if step.get("name") == build_step_name
         )
         assert job["steps"].index(login) < build_at, f"{name} logs in before it builds"
+
+    action = yaml.safe_load(
+        (_REPO_ROOT / ".github/actions/iron-bank-login/action.yml").read_text(encoding="utf-8")
+    )
+    run = "\n".join(step.get("run", "") for step in action["runs"]["steps"])
+    assert "docker login registry1.dso.mil" in run
+    assert "common::retry 4 ib_login" in run
+    assert "registry1.dso.mil did not answer after 4 attempts" in run
+    assert "USE_FALLBACK_UBI" not in run, "a retry must fail rather than publish on another base"
 
 
 # --- Task 4: pinned retries and the tag-release SOCI default ---------------------
