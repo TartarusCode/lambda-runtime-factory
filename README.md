@@ -43,7 +43,8 @@ cosign download sbom ghcr.io/tartaruscode/lambda-runtime-factory/pypy311:3.11
 
 `provenance.json` is the file to read when the question is "what is in this image": it names the
 upstream archive and its verified SHA-256, the base image and the digest it resolved to, the image
-digest, the unpacked size, the STIG checks and the CVE counts by severity.
+digest, the unpacked size, the STIG checks and the CVE counts by severity — with the counts a
+documented waiver released reported beside them, never instead of them.
 
 ## Container images
 

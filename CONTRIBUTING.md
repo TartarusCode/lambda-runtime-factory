@@ -166,6 +166,44 @@ store and the uncompressed one on the classic overlay2 store, so the same image 
 a CI runner and 251,143,202 B on a developer box. The rootfs sum is the number Lambda counts against
 its 10 GB container limit, and it does not depend on the daemon.
 
+### The CVE gate, and the UBI lag POA&M
+
+`tools/bin/generate-compliance-artifacts` scans the published SPDX document with `--only-fixed` and
+no `--fail-on`: the report and its SARIF carry the findings an operator can act on, and the pass/fail
+decision is taken afterwards, in Python, over that report. A **fixable High or Critical** finding
+fails the cell. The only thing that releases one is an entry in
+`tools/compliance/ubi-lag-waivers.json`, and only when the entry names that CVE, that package, the
+installed build and the fixed build Grype reports.
+
+The file exists because Red Hat publishes a fix to `ubi-9-baseos-rpms` before it republishes the
+`ubi9-minimal` tag. In that window the CVE is real, the fix exists, and nothing the build can reach
+carries it — so the alternatives are a red pipeline nobody can repair and an ignore that deletes the
+finding from the artifact. The POA&M is neither: the finding stays in the report, the gate releases
+it, and `provenance.json` keeps `grype_summary` as the raw counts while adding
+`ubi_lag_waived_high`, `unwaived_blocking_cves` and `active_poam_advisories`. The job summary row
+renders that as `0/14/9/0 · 0 (14 UBI-lag waived)`, so a high count is never left without a verdict.
+
+Each entry expires, in three ways:
+
+- `expires_on` is the last day it releases anything. The day after, the findings block again and the
+  cell log names the expired advisory.
+- An installed build that matches neither `installed_evr` nor `fixed_evr` fails the run on its own
+  (`mismatched`): the record would name a package the image does not carry.
+- An entry whose `fixed_evr` the image now carries is reported as `resolved` — the RPM landed, so the
+  entry is deleted in the next commit instead of waiving nothing forever.
+
+Because the fixed RPM arrives in the repository first, the image takes it at build time: the OS layer
+runs `microdnf upgrade` before installing the library floor. BuildKit keys a `RUN` by its instruction
+and parent layers and does not track what the network returned, so `build-container` stamps that
+layer with `UBI_RPM_EPOCH` — the UTC date, overridable for a forced refresh — and every build call
+site forwards it. That rebuild is the price of picking up a patched RPM without waiting for a new
+base tag; a stamp dropped from one call site would replay the cached layer and silently keep the old
+package set.
+
+`tools/bin/audit-container` remains the raw scan: it reports every fixable High and Critical on the
+built image and applies no waiver, so it is expected to be red while an advisory's fixed RPM is
+unavailable. The policy lives in one place, in the gate.
+
 ### The entrypoint, and the families that have no handler
 
 One entrypoint for every family: `/opt/bootstrap`, which applies the Lambda filesystem contract and
