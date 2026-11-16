@@ -1,6 +1,6 @@
-// The distroless image runs this file directly (no /bin/sh), so the environment
-// the shell bootstrap used to export is initialized here instead. The zip layer on
-// provided.al2023 still goes through bootstrap, which execs the same helper.
+// The Iron Bank image runs this file directly (no /bin/sh), so the environment
+// the shell bootstrap used to export is initialized here instead. A custom
+// entrypoint that goes through bootstrap execs the same helper.
 process.env.HOME ??= "/tmp";
 process.env.TMPDIR ??= "/tmp";
 process.env.LAMBDA_TASK_ROOT ??= "/var/task";

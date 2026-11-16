@@ -3,11 +3,11 @@ name: release-runtime
 # Two ways in, one pipeline.
 #   * Push a `release-YYYY.MM.DD` tag: the tag is the immutable record of the
 #     commit that was published, and it is what a re-run re-publishes.
-#   * Dispatch: an ad-hoc or partial republish (runtime / arch / publicize).
+#   * Dispatch: an ad-hoc or partial republish (runtime / arch / soci).
 #     Dispatch with `dry_run: true` to exercise the whole path — the credential
-#     preflight, the build and the scan — without uploading to S3 or creating a
-#     layer version, which is the only way to reach the preflight's secret and
-#     role checks without publishing anything.
+#     preflight, the build and the scan — without pushing an image, which is the
+#     only way to reach the preflight's secret and role checks without publishing
+#     anything.
 # The workflow deliberately never creates the tag itself — a tag pushed with
 # GITHUB_TOKEN does not trigger workflows, so "tag then publish" and "publish
 # then tag" cannot both work. The tag is the input.
@@ -22,13 +22,8 @@ on:
         description: "Architecture to publish: x86_64, arm64, or 'all'"
         required: true
         default: "all"
-      publicize:
-        description: "Grant public layer permissions after publish"
-        required: true
-        default: false
-        type: boolean
       dry_run:
-        description: "Build and scan only; skip the S3 upload and the publish"
+        description: "Build and scan only; skip the image push"
         required: true
         default: false
         type: boolean
@@ -41,9 +36,8 @@ on:
     tags:
       - "release-*"
 
-# Publishing mutates S3 and creates Lambda layer versions, so runs are queued
-# rather than cancelled: a second dispatch waits instead of killing a publish
-# mid-flight.
+# Publishing mutates registries and moves image tags, so runs are queued rather
+# than cancelled: a second dispatch waits instead of killing a publish mid-flight.
 concurrency:
   group: release-runtime
   cancel-in-progress: false
@@ -99,10 +93,6 @@ jobs:
         with:
           runtime: ${{ github.event.inputs.runtime || 'all' }}
           arch: ${{ github.event.inputs.arch || 'all' }}
-          # Containers are the opposite answer to the same quota: a 10 GB
-          # uncompressed ceiling, so every runtime publishes an image — including
-          # the Go and Rust toolchains that can never be a layer.
-          layer-publishable-only: "false"
       - id: merge
         uses: ./.github/actions/runtime-matrix
         with:
@@ -110,7 +100,6 @@ jobs:
           # One cell per runtime: the merge combines both architectures, so
           # running it per arch would repeat the same manifest edit twice.
           arch: x86_64
-          layer-publishable-only: "false"
 
   # The publish cells only restore the database, so they need the entry primed
   # first: a manual release must not scan against a week-old database just because
@@ -257,7 +246,7 @@ jobs:
           username: ${{ secrets.IRONBANK_USERNAME }}
       - name: Configure AWS credentials
         # Amazon ECR Public is the copy Lambda can actually pull from, so the
-        # image job needs the same OIDC role the layer publish uses.
+        # image job needs the same OIDC role the release uses.
         if: ${{ github.event.inputs.dry_run != 'true' }}
         uses: aws-actions/configure-aws-credentials@v6
         with:
@@ -528,4 +517,4 @@ jobs:
       - name: Report a dispatch with no tag behind it
         if: github.ref_type == 'branch'
         run: |
-          echo "::notice::Dispatched publish with no release tag; the layer arns are in this run's summary. Push a release-YYYY.MM.DD tag to record a release."
+          echo "::notice::Dispatched publish with no release tag; the image tags and digests are in this run's summary. Push a release-YYYY.MM.DD tag to record a release."

@@ -62,7 +62,6 @@ def _write_manifest(root: Path, runtime_id: str, family: str, version: str, **ex
         "display_name": runtime_id,
         "distribution_version": version,
         "artifact": {"checksum_file": "checksums/x.sha256"},
-        "release": {"regions": ["eu-central-1"]},
     }
     manifest.update(extra)
     path = root / runtime_id / "runtime.json"
@@ -149,10 +148,6 @@ def test_add_runtime_line_for_pypy_sets_python_version_and_archive_ext(
 ) -> None:
     """Cloning pypy311 for 3.12 must record the Python line and the .tar.gz extension."""
     _write_manifest(fake_root, "pypy311", "portable-pypy", "pypy3.11-v7.3.23", python_version="3.11")
-    (fake_root / "pypy311" / "examples" / "sls").mkdir(parents=True)
-    (fake_root / "pypy311" / "examples" / "sls" / "serverless.yml").write_text(
-        "service: hello-pypy311\n", encoding="utf-8"
-    )
     mocker.patch.object(
         bump_version,
         "fetch_checksums",
@@ -172,9 +167,6 @@ def test_add_runtime_line_for_pypy_sets_python_version_and_archive_ext(
     assert manifest["version_line"] == "3.12"
     assert manifest["display_name"] == "PyPy 3.12"
     assert manifest["archive_ext"] == ".tar.gz"
-    assert "hello-pypy312" in (fake_root / "pypy312" / "examples" / "sls" / "serverless.yml").read_text(
-        encoding="utf-8"
-    )
 
 
 # --- Roll-off / matrix bounding ------------------------------------------------
@@ -729,8 +721,7 @@ def test_composite_action_steps_only_use_supported_keys() -> None:
 # its own tag: a tag pushed with GITHUB_TOKEN does not trigger workflows, so
 # "tag then publish" and "publish then tag" cannot both work. The tag is the
 # input, the OIDC subject must not depend on which entry point was used, and the
-# published layer versions have to stay traceable to the commit that produced
-# them.
+# published image tags have to stay traceable to the commit that produced them.
 
 _RELEASE_TAG_PATTERN = "^release-[0-9]{4}\\.[0-9]{2}\\.[0-9]{2}(-[0-9]+)?$"
 
@@ -819,7 +810,7 @@ def test_the_release_can_read_the_commits_ci_conclusion() -> None:
 
 
 def test_the_release_record_names_the_container_images() -> None:
-    """A record that listed only the layers would omit the toolchain runtimes."""
+    """A record that listed only handler images would omit the toolchain runtimes."""
     steps = _workflow("release-runtime.yml")["jobs"]["record-release"]["steps"]
     by_name = {step.get("name"): step for step in steps}
 
@@ -882,80 +873,6 @@ def test_every_job_has_a_timeout() -> None:
 
 
 
-# --- Layer publish contract ----------------------------------------------------
-#
-# Publishing a layer version is not idempotent, so a re-run of a release used to
-# mint another version for bytes that were already published. The content hash
-# decides reuse. These tests run the real script against a stubbed aws CLI, so
-# they cover the behaviour rather than the text.
-
-_FAKE_AWS = '''#!/usr/bin/env python3
-import os
-import sys
-
-args = sys.argv[1:]
-with open(os.environ["FAKE_AWS_LOG"], "a", encoding="utf-8") as handle:
-    handle.write(" ".join(args) + "\\n")
-
-command = args[:2]
-if command == ["lambda", "list-layer-versions"]:
-    existing = os.environ.get("FAKE_AWS_EXISTING_VERSION", "")
-    if existing:
-        print(existing)
-        sys.exit(0)
-    sys.exit(254)  # the CLI's ResourceNotFoundException path
-if command == ["lambda", "publish-layer-version"]:
-    print("99")
-    sys.exit(0)
-if command == ["lambda", "add-layer-version-permission"]:
-    error = os.environ.get("FAKE_AWS_PERMISSION_ERROR", "")
-    if error:
-        sys.stderr.write(
-            "An error occurred (" + error + ") when calling the "
-            "AddLayerVersionPermission operation: " + error + "\\n"
-        )
-        sys.exit(255)
-    sys.exit(0)
-sys.exit(2)
-'''
-
-
-def _publish_package_path(tmp_path: Path) -> Path:
-    """Where the build would put the package, straight from the manifest CLI."""
-    output = subprocess.run(
-        [
-            sys.executable,
-            "tools/runtime_lib/runtime_manifest.py",
-            "env",
-            "--runtime",
-            "pypy311",
-            "--arch",
-            "x86_64",
-        ],
-        cwd=_REPO_ROOT,
-        env=dict(os.environ, BUILD_ROOT=str(tmp_path)),
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout
-
-    for line in output.splitlines():
-        if line.startswith("PACKAGE_PATH="):
-            return Path(shlex.split(line.split("=", 1)[1])[0])
-
-    raise AssertionError("runtime_manifest env did not report PACKAGE_PATH")
-
-
-
-
-
-
-
-
-
-
-
-
 # --- Documentation contract ----------------------------------------------------
 #
 # The README's runtime table is written by hand, so it drifts the moment a line is
@@ -991,10 +908,9 @@ def test_the_development_documentation_is_linked_and_present() -> None:
 
 # --- Manifest naming convention -------------------------------------------------
 #
-# `display_name` is what the published artifact description is built from
-# ("{display_name} Lambda Runtime"), so a stale one ships to AWS. bun13 and go126
-# still read "Bun 1.x" and "Go 1.x" while every line added since is named after
-# its version line by _new_display_name().
+# `display_name` is the human name the docs and the release notes use, so a stale
+# one ships a wrong name. bun13 and go126 still read "Bun 1.x" and "Go 1.x" while
+# every line added since is named after its version line by _new_display_name().
 
 _FAMILY_LABELS = {
     "bun": "Bun",
@@ -1016,57 +932,8 @@ def test_display_names_follow_the_family_and_line_convention() -> None:
 
         assert manifest["display_name"] == expected, (
             f"{runtime_id}: display_name is '{manifest['display_name']}', expected '{expected}' — "
-            "it becomes the published layer description"
+            "it becomes the published image description"
         )
-
-
-# --- Deployment settings are repo-level ------------------------------------------
-#
-# Regions and the S3 bucket base name live in REPO_DEFAULTS. A runtime manifest is merged
-# last, so a per-runtime copy of either one silently wins over the global value — which is
-# exactly what happened: every manifest carried its own region list.
-
-
-def test_deployment_regions_are_a_repo_level_setting() -> None:
-    assert runtime_manifest.REPO_DEFAULTS["release"]["regions"] == ["us-east-1"]
-
-    for runtime_id in runtime_manifest.list_runtime_ids():
-        raw = json.loads(
-            runtime_manifest.runtime_manifest_path(runtime_id).read_text(encoding="utf-8")
-        )
-        assert "release" not in raw, (
-            f"{runtime_id}: runtime.json must not redeclare release settings — regions and the "
-            "bucket base name are repo-level (see REPO_DEFAULTS)"
-        )
-
-
-# --- Release visibility ----------------------------------------------------------
-#
-# A tag push carries no workflow inputs, so `github.event.inputs.publicize` is empty
-# on the one path that must never disagree with the README's "layers are public".
-# Comparing it against 'true' selected the private branch silently, and nothing in
-# the run said so.
-
-
-
-
-# --- Layer delivery limits -------------------------------------------------------
-#
-# A deployment package is capped at 250 MB unzipped, and that covers the function
-# plus every layer attached to it, so a runtime shipping a whole upstream toolchain
-# cannot be delivered as a layer however it is split. Those runtimes are built and
-# audited but kept out of the publish matrix. Both halves matter: dropping them from
-# CI as well would let their packages rot unnoticed.
-
-
-
-
-def test_the_release_matrix_asks_for_publishable_runtimes_only() -> None:
-    steps = yaml.safe_load(_workflow_text("release-runtime.yml"))["jobs"]["prepare-matrix"]["steps"]
-    matrix_step = next(step for step in steps if step.get("id") == "matrix")
-
-    # One artifact per runtime: there is no layer-only subset to exclude.
-    assert "layer-publishable-only" not in matrix_step["with"]
 
 
 def test_an_empty_publish_matrix_is_refused_not_silently_green() -> None:
@@ -1078,40 +945,22 @@ def test_an_empty_publish_matrix_is_refused_not_silently_green() -> None:
     assert "-eq 0" in refuse["run"]
 
 
-# --- Deterministic packages ------------------------------------------------------
-#
-# The zip's SHA-256 is the S3 object key *and* the layer-reuse key
-# (Content.CodeSha256). A build that embeds "now" mints a new layer version on every
-# release and the reuse path can never fire — which is exactly what happened: the
-# same runtime and arch produced aff7a46c… and b0dd53dd… from identical inputs.
+# --- Payload slimming ------------------------------------------------------------
 
 
 
 
-# --- Deployment-package budget ---------------------------------------------------
-#
-# AWS caps a deployment package at 250 MB unzipped, and that ceiling covers the
-# function plus every layer attached to it. The build measures the package and
-# refuses to call an oversized one publishable; the publish matrix skips what the
-# build would refuse. Measured on graalpy312 before slimming: 252.7 MB unzipped —
-# 2.7 MB over, which is exactly the failure AWS reported.
-
-
-
-
-
-
-def test_layer_slimming_never_prunes_package_metadata() -> None:
+def test_payload_slimming_never_prunes_package_metadata() -> None:
     """Version identification reads metadata inside the package, so slimming may
     only prune things it does not read."""
     script = (_REPO_ROOT / "tools" / "bin" / "build-runtime").read_text(encoding="utf-8")
-    slim = script.split("slim_layer()", 1)[1].split("\n}\n", 1)[0]
+    slim = script.split("slim_payload()", 1)[1].split("\n}\n", 1)[0]
 
     for metadata in ("dist-info", "egg-info", "METADATA"):
         assert metadata not in slim, (
             f"slimming must not remove {metadata}: that is how a component version is identified"
         )
-    assert "SLIM_LAYER" in slim, "the A/B switch is how the before/after byte counts are compared"
+    assert "SLIM_PAYLOAD" in slim, "the A/B switch is how the before/after byte counts are compared"
 
 
 
@@ -1328,7 +1177,7 @@ def test_slimming_precompiles_bytecode_and_keeps_the_sbom_metadata() -> None:
     # Package metadata is what vulnerability scanning reads; it is documented as
     # never removed and no delete rule targets it.
     assert "*.dist-info" in script
-    assert "*dist-info*" not in script.split("slim_layer")[0]
+    assert "*dist-info*" not in script.split("slim_payload")[0]
     for line in script.splitlines():
         if "dist-info" in line:
             assert "-delete" not in line and "-exec rm" not in line, line
@@ -1433,10 +1282,11 @@ def test_build_runtime_normalizes_stig_permissions_before_staging() -> None:
     chmod_index = script.index("chmod -R a+rX")
     manifest_index = script.index("runtime-manifest.json")
     assert chmod_index < manifest_index, "normalize before describing the payload"
-    assert 'chmod a+rx "${LAYER_ROOT}/${BOOTSTRAP_OUTPUT}"' in script
+    assert 'chmod a+rx "${PAYLOAD_ROOT}/${BOOTSTRAP_OUTPUT}"' in script
     # The image is the artifact, so nothing here zips or publishes.
     assert "zip -qrX" not in script
     assert "PACKAGE_PATH" not in script
+    assert "package_name" not in script
 
 
 
@@ -1566,7 +1416,7 @@ def test_the_runtime_api_headers_are_read_case_insensitively() -> None:
 
 # --- One container per runtime, on the Iron Bank base ---------------------------
 #
-# There is exactly one image per runtime, from the same ${LAYER_ROOT} the zip layer
+# There is exactly one image per runtime, from the same ${PAYLOAD_ROOT} the image
 # ships, on the DoD-hardened Iron Bank UBI9-minimal base. A second base would mean
 # a second container matrix, a second set of tags, and a library-staging hack that
 # leaves the image's RPM database unaware of libraries it carries. These tests hold
@@ -1580,10 +1430,10 @@ def test_every_runtime_has_one_container_target() -> None:
 
             assert container["enabled"] is True, runtime_id
             assert container["workdir"] == "/var/task", runtime_id
-            # One entrypoint for every family: the bootstrap the zip layer ships.
+            # One entrypoint for every family: the bootstrap the image ships.
             assert container["entrypoint"] == ["/opt/bootstrap"], runtime_id
             assert container["user"] == "1001:1001", runtime_id
-            assert container["layer_root"] == "/opt", runtime_id
+            assert container["payload_root"] == "/opt", runtime_id
 
 
 def test_the_single_container_base_is_iron_bank() -> None:
@@ -1650,7 +1500,7 @@ def test_the_container_coordinates_travel_to_the_builder() -> None:
 
 def test_render_dockerfile_substitutes_every_placeholder() -> None:
     dockerfile = container_image.render_dockerfile(
-        layer_root="/opt",
+        payload_root="/opt",
         workdir="/var/task",
         env={"HOME": "/tmp", "TMPDIR": "/tmp", "GOCACHE": "/tmp/.cache/go-build"},
         labels={"com.tartaruscode.lambda.runtime": "pypy311"},
@@ -1660,7 +1510,7 @@ def test_render_dockerfile_substitutes_every_placeholder() -> None:
     assert 'ENV HOME="/tmp"' in dockerfile
     assert 'LABEL com.tartaruscode.lambda.runtime="pypy311"' in dockerfile
     assert "WORKDIR /var/task" in dockerfile
-    assert "COPY --chown=${NONROOT_UID}:${NONROOT_GID} layer/ /opt/" in dockerfile
+    assert "COPY --chown=${NONROOT_UID}:${NONROOT_GID} payload/ /opt/" in dockerfile
     assert "chmod -R a+rX /opt" in dockerfile
     assert 'ENTRYPOINT ["/opt/bootstrap"]' in dockerfile
     assert "USER ${NONROOT_UID}:${NONROOT_GID}" in dockerfile

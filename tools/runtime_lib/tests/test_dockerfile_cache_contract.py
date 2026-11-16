@@ -47,7 +47,7 @@ def test_dockerfile_keeps_the_shared_os_layer_above_every_runtime_specific_instr
     for runtime_specific in (
         "@@LABELS@@",
         "@@ENV@@",
-        "layer/ @@LAYER_ROOT@@/",
+        "payload/ @@PAYLOAD_ROOT@@/",
     ):
         assert _index_of(runtime_specific) > floor_index, (
             f"{runtime_specific} must come after the shared microdnf layer, or BuildKit "

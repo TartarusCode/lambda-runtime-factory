@@ -112,8 +112,8 @@ def _sbom_run(
     build = tmp_path / "runner" / "lambda-runtime-monorepo" / "pypy311" / "x86_64"
     artifacts = build / "artifacts"
     (artifacts / "compliance").mkdir(parents=True, exist_ok=True)
-    (build / "layer").mkdir(parents=True, exist_ok=True)
-    (build / "layer" / "runtime-manifest.json").write_text(
+    (build / "payload").mkdir(parents=True, exist_ok=True)
+    (build / "payload" / "runtime-manifest.json").write_text(
         json.dumps(
             {
                 "runtime_id": "pypy311",

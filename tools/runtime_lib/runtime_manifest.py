@@ -30,18 +30,13 @@ CANARY_RUNTIME = "pypy311"
 CANARY_ARCH = "x86_64"
 
 REPO_DEFAULTS: Dict[str, Any] = {
-    "runtime_family": "lambda-layer",
-    "lambda": {
-        "compatible_runtimes": ["provided.al2023"],
-    },
-    "release": {
-        "bucket_base_name": "tartarus-runtimes",
-        "regions": ["us-east-1"],
-    },
+    "runtime_family": "portable",
+    # The local container smoke test runs a tiny example handler and event. Only
+    # the container path uses these; nothing here builds a SAM application.
     "local_testing": {
-        "sam_template": "examples/sam/template.local.example.yaml",
-        "event": "examples/sam/events/hello.json",
-        "function_logical_id": "HelloFunction",
+        "event": "examples/local/events/hello.json",
+        "code_uri": "examples/local/hello",
+        "function_name": "HelloFunction",
         "handler": "hello.handler",
     },
     # Every runtime ships one OCI image, on the DoD-hardened Iron Bank UBI9 base.
@@ -112,7 +107,7 @@ REPO_DEFAULTS: Dict[str, Any] = {
         ],
         "registry": "ghcr.io/tartaruscode/lambda-runtime-factory",
         "workdir": "/var/task",
-        "layer_root": "/opt",
+        "payload_root": "/opt",
         # One entrypoint for every family: the payload's bootstrap, which applies
         # the Lambda filesystem contract and execs the runtime. An interpreter
         # bootstrap is a shebang script naming the payload's own interpreter;
@@ -198,7 +193,6 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "archive_url": "https://downloads.python.org/pypy/{distribution_version}-{arch_slug}{archive_ext}",
             "archive_root_dir": "{distribution_version}-{arch_slug}",
             "runtime_dir_name": "pypy",
-            "package_name": "{distribution_version}-{arch}.zip",
             "checksum_file": "checksums/pypy.sha256",
             "checksum_name": "{distribution_version}-{arch_slug}{archive_ext}",
         },
@@ -224,7 +218,6 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "archive_url": "https://github.com/oven-sh/bun/releases/download/bun-v{distribution_version}/bun-{arch_slug}.zip",
             "archive_root_dir": "bun-{arch_slug}",
             "runtime_dir_name": "bun",
-            "package_name": "bun-v{distribution_version}-{arch}.zip",
             "checksum_file": "checksums/bun.sha256",
             "checksum_name": "bun-{arch_slug}.zip",
         },
@@ -246,7 +239,6 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "archive_root_dir": "deno",
             "binary_name": "deno",
             "runtime_dir_name": "deno",
-            "package_name": "deno-v{distribution_version}-{arch}.zip",
             "checksum_file": "checksums/deno.sha256",
             "checksum_name": "deno-{arch_slug}.zip",
         },
@@ -277,7 +269,6 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "archive_url": "https://github.com/oracle/graalpython/releases/download/graal-{release_tag}/graalpy{python_version}-{distribution_version}-{arch_slug}.tar.gz",
             "archive_root_dir": "graalpy{python_version}-{distribution_version}-{arch_slug}",
             "runtime_dir_name": "graalpy",
-            "package_name": "graalpy{python_version}-{distribution_version}-{arch}.zip",
             "checksum_file": "checksums/graalpy.sha256",
             "checksum_name": "graalpy{python_version}-{distribution_version}-{arch_slug}.tar.gz",
         },
@@ -301,7 +292,6 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "archive_url": "https://go.dev/dl/go{distribution_version}.{arch_slug}.tar.gz",
             "archive_root_dir": "go",
             "runtime_dir_name": "go",
-            "package_name": "go{distribution_version}-{arch}.zip",
             "checksum_file": "checksums/go.sha256",
             "checksum_name": "go{distribution_version}.{arch_slug}.tar.gz",
         },
@@ -332,7 +322,6 @@ RUNTIME_FAMILY_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "archive_url": "https://static.rust-lang.org/dist/rust-{distribution_version}-{arch_slug}.tar.gz",
             "archive_root_dir": "rust-{distribution_version}-{arch_slug}",
             "runtime_dir_name": "rust",
-            "package_name": "rust-{distribution_version}-{arch}.zip",
             "checksum_file": "checksums/rust.sha256",
             "checksum_name": "rust-{distribution_version}-{arch_slug}.tar.gz",
         },
@@ -476,16 +465,6 @@ def _apply_defaults(runtime_id: str, data: Dict[str, Any], arch: str = DEFAULT_A
     }
     merged = _format_values(merged, context)
 
-    merged.setdefault("lambda", {})
-    merged["lambda"].setdefault("layer_name", runtime_id)
-    merged["lambda"].setdefault(
-        "description",
-        f"{merged.get('display_name', runtime_id)} Lambda Runtime",
-    )
-
-    merged.setdefault("release", {})
-    merged["release"].setdefault("s3_key_prefix", runtime_id)
-
     return merged
 
 
@@ -510,9 +489,7 @@ def validate_runtime_data(runtime_id: str, data: Dict[str, Any]) -> None:
             "runtime_id",
             "runtime_family",
             "artifact",
-            "lambda",
             "layout",
-            "release",
             "local_testing",
         ],
         f"runtime {runtime_id}",
@@ -532,14 +509,8 @@ def validate_runtime_data(runtime_id: str, data: Dict[str, Any]) -> None:
             "checksum_name",
             "archive_root_dir",
             "runtime_dir_name",
-            "package_name",
         ],
         f"runtime {runtime_id} artifact",
-    )
-    _require_keys(
-        data["lambda"],
-        ["layer_name", "description", "compatible_runtimes"],
-        f"runtime {runtime_id} lambda",
     )
     _require_keys(
         data["layout"],
@@ -547,13 +518,8 @@ def validate_runtime_data(runtime_id: str, data: Dict[str, Any]) -> None:
         f"runtime {runtime_id} layout",
     )
     _require_keys(
-        data["release"],
-        ["bucket_base_name", "regions", "s3_key_prefix"],
-        f"runtime {runtime_id} release",
-    )
-    _require_keys(
         data["local_testing"],
-        ["sam_template", "event", "function_logical_id"],
+        ["event", "handler", "function_name"],
         f"runtime {runtime_id} local_testing",
     )
     _require_keys(
@@ -570,7 +536,7 @@ def validate_runtime_data(runtime_id: str, data: Dict[str, Any]) -> None:
             "registry",
             "registries",
             "workdir",
-            "layer_root",
+            "payload_root",
             "entrypoint",
             "env",
             "user",
@@ -642,11 +608,6 @@ def validate_runtime_data(runtime_id: str, data: Dict[str, Any]) -> None:
             f"container.registries ({', '.join(registries)})"
         )
 
-    if not data["lambda"]["compatible_runtimes"]:
-        raise ValueError(f"Runtime {runtime_id} must declare compatible runtimes")
-    if not data["release"]["regions"]:
-        raise ValueError(f"Runtime {runtime_id} must declare at least one release region")
-
 
 def _absolute(runtime_id: str, relative_path: str) -> Path:
     return runtimes_root() / runtime_id / Path(relative_path)
@@ -670,7 +631,7 @@ def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> Dict[str, str]:
         or temp_root / "download-cache"
     )
     dist_dir = repo_root() / "dist" / runtime_id / arch
-    layer_root = build_dir / "layer"
+    payload_root = build_dir / "payload"
     downloads_dir = download_cache_root / runtime_id
     work_dir = build_dir / "work"
     container = data["container"]
@@ -696,7 +657,7 @@ def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> Dict[str, str]:
         "LAMBDA_ARCH": arch,
         "BUILD_DIR": str(build_dir),
         "DIST_DIR": str(dist_dir),
-        "LAYER_ROOT": str(layer_root),
+        "PAYLOAD_ROOT": str(payload_root),
         "DOWNLOADS_DIR": str(downloads_dir),
         "WORK_DIR": str(work_dir),
         "ARCHIVE_NAME": data["artifact"]["archive_name"],
@@ -707,35 +668,18 @@ def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> Dict[str, str]:
         "ARCHIVE_ROOT_DIR": data["artifact"]["archive_root_dir"],
         "BINARY_NAME": data["artifact"].get("binary_name", ""),
         "RUNTIME_DIR_NAME": data["artifact"]["runtime_dir_name"],
-        "PACKAGE_NAME": data["artifact"]["package_name"],
         "ARTIFACT_DIR": str(build_dir / "artifacts"),
-        "PACKAGE_PATH": str(build_dir / "artifacts" / data["artifact"]["package_name"]),
         "BOOTSTRAP_SOURCE": str(_absolute(runtime_id, data["layout"]["bootstrap"])),
         "BOOTSTRAP_OUTPUT": data["layout"]["bootstrap_output"],
         "HELPER_SOURCE": str(_absolute(runtime_id, data["layout"]["helper_source"])),
         "HELPER_INSTALL_DIR": data["layout"]["helper_install_dir"],
-        "LAYER_NAME": data["lambda"]["layer_name"],
-        "LAYER_DESCRIPTION": data["lambda"]["description"],
-        "COMPATIBLE_RUNTIMES": " ".join(data["lambda"]["compatible_runtimes"]),
-        "BUCKET_BASE_NAME": data["release"]["bucket_base_name"],
-        "RELEASE_REGIONS": " ".join(data["release"]["regions"]),
-        "S3_KEY_PREFIX": data["release"]["s3_key_prefix"],
-        "LOCAL_TEMPLATE": str(_absolute(runtime_id, data["local_testing"]["sam_template"])),
         "LOCAL_EVENT": str(_absolute(runtime_id, data["local_testing"]["event"])),
-        "LOCAL_FUNCTION_NAME": data["local_testing"]["function_logical_id"],
+        "LOCAL_FUNCTION_NAME": data["local_testing"]["function_name"],
         "LOCAL_HANDLER": data["local_testing"]["handler"],
-        "LOCAL_ROOT": str(build_dir / "local"),
-        "LOCAL_LAYER_DIR": str(build_dir / "local" / "layer"),
-        "LOCAL_SOURCE_DIR": str(build_dir / "local" / "source"),
-        "LOCAL_TEMPLATE_RENDERED": str(build_dir / "local" / "template.rendered.yaml"),
-        "LOCAL_BUILD_DIR": str(build_dir / "local" / ".aws-sam" / "build"),
-        "LOCAL_BUILD_TEMPLATE": str(build_dir / "local" / ".aws-sam" / "build" / "template.yaml"),
-        "LOCAL_INVOKE_DIR": str(build_dir / "local" / "invoke"),
-        "LOCAL_INVOKE_TEMPLATE": str(build_dir / "local" / "template.invoke.yaml"),
         "LOCAL_CODE_URI": str(
             _absolute(
                 runtime_id,
-                data["local_testing"].get("code_uri", "examples/sam/hello"),
+                data["local_testing"].get("code_uri", "examples/local/hello"),
             )
         ),
         # Container coordinates. The entrypoint and environment travel as JSON so
@@ -756,7 +700,7 @@ def runtime_env(runtime_id: str, arch: str = DEFAULT_ARCH) -> Dict[str, str]:
         "CONTAINER_ARCH": container_arch,
         "CONTAINER_PLATFORM": f"linux/{container_arch}",
         "CONTAINER_WORKDIR": container["workdir"],
-        "CONTAINER_LAYER_ROOT": container["layer_root"],
+        "CONTAINER_PAYLOAD_ROOT": container["payload_root"],
         "CONTAINER_USER": container["user"],
         "CONTAINER_ENTRYPOINT": json.dumps(container["entrypoint"]),
         "CONTAINER_ENV": json.dumps(container["env"], sort_keys=True),
@@ -778,13 +722,18 @@ def validate_runtime(runtime_id: str, arch: str = DEFAULT_ARCH) -> None:
         _absolute(runtime_id, data["artifact"]["checksum_file"]),
         _absolute(runtime_id, data["layout"]["bootstrap"]),
         _absolute(runtime_id, data["layout"]["helper_source"]),
-        _absolute(runtime_id, data["local_testing"]["sam_template"]),
         _absolute(runtime_id, data["local_testing"]["event"]),
     ]
 
     for file_path in files_to_check:
         if not file_path.exists():
             raise FileNotFoundError(f"Referenced path does not exist: {file_path}")
+
+    code_dir = _absolute(
+        runtime_id, data["local_testing"].get("code_uri", "examples/local/hello")
+    )
+    if not code_dir.is_dir():
+        raise FileNotFoundError(f"Referenced example directory does not exist: {code_dir}")
 
 
 def _head_status(url: str, timeout: int = 30) -> int | None:

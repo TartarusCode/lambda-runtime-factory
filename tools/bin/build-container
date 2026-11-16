@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the OCI image for one runtime and architecture.
 #
-# The image is generated from the ${LAYER_ROOT} payload that build-runtime staged,
+# The image is generated from the ${PAYLOAD_ROOT} payload that build-runtime staged,
 # so the two steps cannot drift. There is one base for every runtime: the
 # DoD-hardened Iron Bank UBI9-minimal, rendered from
 # tools/docker/Dockerfile. It runs as UID 1001, is read-only at run time
@@ -59,7 +59,7 @@ fi
 
 # The payload is the build input, so it has to exist before the image build reads
 # it; a cache hit restores artifacts/ only.
-if [[ ! -d "${LAYER_ROOT}" || -z "$(ls -A "${LAYER_ROOT}" 2>/dev/null)" ]]; then
+if [[ ! -d "${PAYLOAD_ROOT}" || -z "$(ls -A "${PAYLOAD_ROOT}" 2>/dev/null)" ]]; then
     common::ensure_runtime_built "${runtime_id}" "${arch}"
     common::load_runtime_env "${runtime_id}" "${arch}"
 fi

@@ -288,7 +288,7 @@ def test_the_row_says_why_a_high_count_did_not_block(tmp_path: Path) -> None:
     assert "0 (14 UBI-lag waived)" in text, "the row must say why 14 High did not block"
 
 
-def test_no_workflow_or_script_references_the_removed_layer_tools() -> None:
+def test_no_workflow_or_script_references_removed_tools() -> None:
     """A stale call site is how a release dies minutes in, per cell. The tokens are
     full script paths so that legitimate names — `audit-runtimes.yml`, the
     `build-and-audit-runtime` action — cannot trip the check."""
@@ -304,7 +304,6 @@ def test_no_workflow_or_script_references_the_removed_layer_tools() -> None:
         "tools/bin/local-invoke-runtime",
         "runtime_lib/package_size.py",
         "Dockerfile.ironbank",
-        "layer_publishable",
     )
     hits = []
     for root in (_REPO_ROOT / ".github", _REPO_ROOT / "tools"):
