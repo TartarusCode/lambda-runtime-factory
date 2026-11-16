@@ -90,7 +90,16 @@ def _fixture(
     return report, spdx, waivers
 
 
-def _gate(tmp_path: Path, report: Path, spdx: Path, waivers: Path, today: str = TODAY):
+def _gate(
+    tmp_path: Path,
+    report: Path,
+    spdx: Path,
+    waivers: Path,
+    today: str = TODAY,
+    *,
+    enforcement: str = "enforced",
+    base_source: str = "ironbank",
+):
     gate_path = tmp_path / "gate.json"
     result = subprocess.run(
         [
@@ -105,6 +114,8 @@ def _gate(tmp_path: Path, report: Path, spdx: Path, waivers: Path, today: str = 
             "pypy311",
             "x86_64",
             str(_REPO_ROOT),
+            enforcement,
+            base_source,
         ],
         capture_output=True,
         text=True,
@@ -158,21 +169,22 @@ def test_a_waiver_for_a_build_the_image_no_longer_carries_fails(tmp_path: Path) 
     assert result.returncode == 2, result.stderr
 
 
-def test_a_resolved_waiver_fails_the_gate_until_it_is_deleted(tmp_path: Path) -> None:
-    """The lag window closing is not a pass. The image carries the fixed build, so the
-    acknowledgement is dead: leaving it in the tree would keep releasing a package
-    nobody needs released, and `main` would carry a POA&M entry for a fixed CVE. The
-    weekly retainer deletes it; until then this is a hard failure."""
+def test_a_resolved_waiver_is_a_notice_not_a_failure(tmp_path: Path) -> None:
+    """The lag window closing is not an error. The image carries the fixed build, so
+    the acknowledgement is dead, but nothing is being released: the cell says so with
+    a notice and the weekly retainer deletes the entry."""
     report, spdx, waivers = _fixture(tmp_path, [], installed=KRB5_FIXED)
 
     result, gate = _gate(tmp_path, report, spdx, waivers)
 
-    assert result.returncode == 2, result.stderr
-    assert gate["result"] == "fail"
+    assert result.returncode == 0, result.stderr
+    assert gate["result"] == "pass"
     assert gate["blocking"] == [], "there is no finding left to block on"
     assert gate["poam"][0]["state"] == "resolved"
-    assert "remove it from tools/compliance/ubi-lag-waivers.json" in result.stderr
-    assert "::error::" in result.stderr, "a stale entry is an error annotation, not a warning"
+    assert "::notice::" in result.stderr
+    assert "resolved upstream" in result.stderr
+    assert "time to clean up tools/compliance/ubi-lag-waivers.json" in result.stderr
+    assert "::error::" not in result.stderr, "a resolved waiver must not fail the cell"
 
 
 def test_a_build_newer_than_the_fixed_one_is_resolved_too(tmp_path: Path) -> None:
@@ -182,8 +194,61 @@ def test_a_build_newer_than_the_fixed_one_is_resolved_too(tmp_path: Path) -> Non
 
     result, gate = _gate(tmp_path, report, spdx, waivers)
 
-    assert result.returncode == 2, result.stderr
+    assert result.returncode == 0, result.stderr
     assert gate["poam"][0]["state"] == "resolved"
+
+
+def test_a_fallback_build_records_blocking_findings_without_failing(tmp_path: Path) -> None:
+    """The Red Hat fallback exists so an unauthenticated build can still be exercised.
+    It is not a release artifact, so its verdict is recorded — blocking list,
+    provenance, step log — but the cell succeeds instead of going red over a base
+    nobody publishes."""
+    report, spdx, waivers = _fixture(tmp_path, [_match()])
+    waivers.write_text(json.dumps({"waivers": []}), encoding="utf-8")
+
+    result, gate = _gate(
+        tmp_path, report, spdx, waivers, enforcement="advisory", base_source="fallback"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert gate["result"] == "fail", "the verdict stays a failure; only enforcement changes"
+    assert gate["enforcement"] == "advisory"
+    assert gate["base_source"] == "fallback"
+    assert len(gate["blocking"]) == 1
+    assert "did not enforce it" in result.stderr
+    assert "fallback base" in result.stderr
+    assert "::warning::" in result.stderr
+    assert "::error::" not in result.stderr
+
+
+def test_an_iron_bank_build_enforces_the_same_verdict(tmp_path: Path) -> None:
+    """The exception is scoped to the fallback: the identical report on an Iron Bank
+    build is still a hard failure."""
+    report, spdx, waivers = _fixture(tmp_path, [_match()])
+    waivers.write_text(json.dumps({"waivers": []}), encoding="utf-8")
+
+    result, gate = _gate(
+        tmp_path, report, spdx, waivers, enforcement="enforced", base_source="ironbank"
+    )
+
+    assert result.returncode == 2, result.stderr
+    assert gate["enforcement"] == "enforced"
+    assert gate["base_source"] == "ironbank"
+    assert "::error::" in result.stderr
+
+
+def test_a_release_requires_iron_bank_credentials() -> None:
+    """The fallback's advisory verdict must never reach a published image. The release
+    preflight is the boundary: without the token the workflow stops before it builds,
+    so an unenforced scan cannot be published by a dispatch that lost its secret."""
+    release = yaml.safe_load(
+        (_REPO_ROOT / ".github" / "workflows" / "release-runtime.yml").read_text(encoding="utf-8")
+    )
+    steps = release["jobs"]["preflight"]["steps"]
+    guard = next(s for s in steps if s.get("name") == "Require Iron Bank credentials")
+
+    assert guard["env"]["IRONBANK_TOKEN"] == "${{ secrets.IRONBANK_TOKEN }}"
+    assert "exit 1" in guard["run"], "an empty token has to fail the preflight"
 
 
 def test_an_empty_waiver_file_is_the_valid_end_state(tmp_path: Path) -> None:
@@ -326,6 +391,8 @@ def test_the_provenance_keeps_raw_counts_and_adds_the_poam_verdict(tmp_path: Pat
     assert sorted(provenance["waived_cve_ids"]) == sorted(cves)
     assert provenance["active_poam_advisories"] == [shipped_waiver()["advisory"]]
     assert provenance["cve_gate"] == "pass"
+    assert provenance["cve_gate_enforcement"] == "enforced"
+    assert provenance["cve_gate_base_source"] == "ironbank"
 
 
 def test_the_shipped_poam_is_a_usable_record() -> None:

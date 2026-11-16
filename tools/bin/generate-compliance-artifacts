@@ -21,6 +21,12 @@
 # cannot install yet is a time-boxed POA&M entry there, so the scan keeps naming the
 # CVE while the build is allowed to ship.
 #
+# Enforcement follows the base. An image built from registry1.dso.mil is the release
+# artifact and its verdict is enforced; a build from the Red Hat fallback (a fork PR
+# or a local run without IRONBANK_TOKEN) writes the same bundle and logs the same
+# counts, but records the verdict as advisory and exits 0. The fallback never
+# publishes, so an unenforced scan cannot reach a consumer.
+#
 # Writes into ${ARTIFACT_DIR}/compliance/:
 #   <runtime>-<arch>.spdx.json        SPDX 2.3 JSON
 #   <runtime>-<arch>.cdx.json         CycloneDX JSON
@@ -99,6 +105,20 @@ PY
 
 image_digest=$(record_field image_digest)
 base_image_digest=$(record_field base_image_digest "${CONTAINER_BASE_IMAGE_DIGEST:-}")
+base_image_ref=$(record_field base_image_ref)
+# Only an image built on registry1.dso.mil is a compliance-enforced artifact. A
+# build from the Red Hat fallback (a fork PR or a local run without IRONBANK_TOKEN)
+# still runs the scan and writes the bundle, but its verdict is recorded as
+# advisory: the fallback exists so unauthenticated builds can be exercised, and it
+# never publishes a release. `--best-effort` asks for the same treatment locally.
+base_source="ironbank"
+if [[ -n "${base_image_ref}" && "${base_image_ref}" != registry1.dso.mil/* ]]; then
+    base_source="fallback"
+fi
+enforcement="enforced"
+if [[ "${base_source}" == "fallback" ]] || (( best_effort )); then
+    enforcement="advisory"
+fi
 # Without container.json (a bare local run, before `build-container --finish`) the
 # local image id is still the same content hash, so the cache stays honest.
 if [[ -z "${image_digest}" ]]; then
@@ -300,7 +320,8 @@ waiver_file="${UBI_LAG_WAIVERS:-$(common::repo_root)/tools/compliance/ubi-lag-wa
 gate_file="${stem}.grype-gate.json"
 set +e
 python3 - "${stem}.grype.json" "${waiver_file}" "${gate_file}" "${stem}.spdx.json" \
-    "${UBI_LAG_WAIVER_TODAY:-}" "${runtime_id}" "${arch}" "$(common::repo_root)" <<'PYEOF'
+    "${UBI_LAG_WAIVER_TODAY:-}" "${runtime_id}" "${arch}" "$(common::repo_root)" \
+    "${enforcement}" "${base_source}" <<'PYEOF'
 import json
 import os
 import sys
@@ -312,14 +333,19 @@ day_arg = sys.argv[5] if len(sys.argv) > 5 else ""
 runtime_id = sys.argv[6] if len(sys.argv) > 6 else ""
 arch = sys.argv[7] if len(sys.argv) > 7 else ""
 repo_root = sys.argv[8] if len(sys.argv) > 8 else ""
+enforcement = sys.argv[9] if len(sys.argv) > 9 else "enforced"
+base_source = sys.argv[10] if len(sys.argv) > 10 else "ironbank"
 
 SEVERITIES = ("critical", "high")
 REQUIRED = ("advisory", "package", "installed_evr", "fixed_evr", "expires_on", "reason", "cves")
-# Waiver states the gate refuses to pass: the acknowledgement no longer describes a
-# live lag, so leaving it in the tree would keep releasing a finding nobody is
-# tracking. "expired" is different — it releases nothing and the findings block on
-# their own — and "absent" is a record for a package this image does not carry.
-STALE_STATES = ("resolved", "mismatched")
+# Waiver states the gate refuses to pass: the acknowledgement names a build the
+# image does not carry, so the record an auditor reads is wrong. "resolved" is
+# deliberately absent — the fixed RPM is already in the image, so there is nothing
+# left to release; retirement belongs to the weekly `prune-waivers` run, and a
+# notice here is enough to prompt the cleanup. "expired" releases nothing and the
+# findings block on their own; "absent" is a record for a package this image does
+# not carry.
+STALE_STATES = ("mismatched",)
 
 
 def label(text):
@@ -499,12 +525,11 @@ for match in report.get("matches") or []:
             }
         )
 
-# A stale entry fails the run on its own, whether or not a finding depends on it:
-# "resolved" means the image already carries the fix, so the acknowledgement is dead
-# and the gate would otherwise keep releasing a package nobody needs released;
-# "mismatched" means the entry names a build the image does not carry, so the record
-# an auditor reads is wrong. "absent" is a notice — the image does not carry the
-# package at all — and "expired" releases nothing, so its findings block by
+# A stale entry fails the run on its own when it names a build the image does not
+# carry (`mismatched`): the record an auditor reads is wrong. `resolved` is not a
+# failure — the image already carries the fix, so nothing is being released; the
+# weekly retainer deletes the entry and the notice below prompts the cleanup.
+# "absent" is a notice and "expired" releases nothing, so its findings block by
 # themselves rather than through this check.
 result = "fail" if blocking or any(entry["state"] in STALE_STATES for entry in poam) else "pass"
 
@@ -513,9 +538,16 @@ gate = {
     "arch": arch,
     "today": today.isoformat(),
     "result": result,
+    # Enforcement is a property of the base, not of the findings. An Iron Bank
+    # image is the release artifact, so its verdict is enforced; a Red Hat
+    # fallback build records the same verdict without failing, because it never
+    # publishes. Provenance keeps both facts so a reader can tell them apart.
+    "enforcement": enforcement,
+    "base_source": base_source,
     "policy": (
-        "fixable High and Critical findings fail unless an active, unexpired UBI-lag "
-        "POA&M entry names that CVE, package and installed build"
+        "fixable High and Critical findings fail an Iron Bank build unless an active, "
+        "unexpired UBI-lag POA&M entry names that CVE, package and installed build; a "
+        "fallback build records the verdict without enforcing it"
     ),
     "blocking": blocking,
     "waived": waived,
@@ -553,13 +585,23 @@ for entry in poam:
             ),
             file=sys.stderr,
         )
+    elif entry["state"] == "resolved":
+        # The lag window closed: the image carries the fixed build, so the entry
+        # releases nothing. The weekly retainer owns the deletion; this is the
+        # friendly prompt, not a red build.
+        notice = label(
+            f"POA&M {entry['advisory']} is now resolved upstream — "
+            "time to clean up tools/compliance/ubi-lag-waivers.json"
+        )
+        print(f"::notice::{notice}", file=sys.stderr)
     else:
         message = label(
             f"POA&M {entry['advisory']} for {entry['package']} is {entry['state']}: "
             f"{entry['detail']} — remove it from tools/compliance/ubi-lag-waivers.json"
         )
-        # A stale entry is an error, not a warning: it fails this run, and the
-        # annotation is what a reader sees in the step log before the exit code.
+        # A mismatched entry is an error: it fails this run. Absent and expired
+        # are warnings — the record is informational and the findings block on
+        # their own where they still apply.
         level = "error" if entry["state"] in STALE_STATES else "warning"
         print(f"::{level}::{message}" if runtime_id else message, file=sys.stderr)
 
@@ -567,6 +609,17 @@ summary = (
     f"{len(blocking)} unwaived fixable High/Critical CVE(s), "
     f"{len(waived)} waived ({gate['waived_high']} High, {gate['waived_critical']} Critical)"
 )
+if result == "fail" and enforcement == "advisory":
+    # The fallback image is not a release artifact. Keep the verdict, keep the
+    # blocking list in the log, and let the cell succeed so a fork PR can be
+    # exercised without Iron Bank credentials.
+    advisory = label(
+        "the severity gate recorded a failure but did not enforce it: "
+        f"this image was built from the {base_source} base, which is not a release "
+        f"artifact; {summary}"
+    )
+    print(f"::warning::{advisory}", file=sys.stderr)
+    sys.exit(0)
 if result == "fail":
     print(f"::error::{label('the severity gate failed: ' + summary)}" if runtime_id else label(
         f"the severity gate failed: {summary}"
@@ -698,6 +751,11 @@ if gate:
     provenance.update(
         {
             "cve_gate": gate.get("result", ""),
+            # Whether that verdict was enforced, and which base produced it. A
+            # fallback build carries "advisory" here even when the gate found
+            # blocking CVEs, because the image never publishes.
+            "cve_gate_enforcement": gate.get("enforcement", "enforced"),
+            "cve_gate_base_source": gate.get("base_source", "ironbank"),
             "ubi_lag_waived_high": gate.get("waived_high", 0),
             "ubi_lag_waived_critical": gate.get("waived_critical", 0),
             "waived_cve_ids": sorted(

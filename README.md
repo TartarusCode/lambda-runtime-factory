@@ -22,7 +22,8 @@ Every runtime ships **one container image**, plus the compliance bundle that mak
   database (which is what gives the SBOM its RHEL lineage), and bakes any `certs/*.crt` root CA into
   its trust store. A build without Iron Bank credentials falls back to
   `registry.access.redhat.com/ubi9/ubi-minimal`, which serves the same userland — the published base
-  is recorded in the provenance manifest, so the two are never confused.
+  is recorded in the provenance manifest, so the two are never confused. A fallback build records
+  its CVE verdict as advisory and is never published; only an Iron Bank build is a release artifact.
 - **`-soci` tags** — the same image with a SOCI index bundled in, for functions on **Lambda Managed
   Instances**, which then lazy-load it instead of downloading the whole thing. There is no moving
   `-soci` tag: that image is immutable by design.
