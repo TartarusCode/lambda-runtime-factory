@@ -1709,13 +1709,30 @@ def test_an_unsatisfied_soname_must_be_declared_and_justified() -> None:
 
     assert container_image.required_ubi_packages(["libc.so"], unsatisfied=["libc.so"]) == []
 
-    declared = {
-        runtime_id: runtime_manifest.load_runtime(runtime_id)["container"]["unsatisfied_sonames"]
-        for runtime_id in runtime_manifest.list_active_runtime_ids()
-        if runtime_manifest.load_runtime(runtime_id)["container"]["unsatisfied_sonames"]
+    active = runtime_manifest.list_active_runtime_ids()
+    manifests = {
+        runtime_id: runtime_manifest.load_runtime(runtime_id) for runtime_id in active
     }
-    assert declared, "the rust family should declare its musl soname"
-    assert set(declared) == {"rust198", "rust199"}, declared
+
+    declared = {
+        runtime_id: data["container"]["unsatisfied_sonames"]
+        for runtime_id, data in manifests.items()
+        if data["container"]["unsatisfied_sonames"]
+    }
+    # The expectation is the family, not a list of ids: every new rust line clones
+    # the previous one and inherits the declaration, so a hardcoded set goes stale
+    # the moment a line is added.
+    musl = {
+        runtime_id
+        for runtime_id, data in manifests.items()
+        if data["runtime_family"] == "rust-musl"
+    }
+
+    assert musl, "the rust family should declare its musl soname"
+    assert set(declared) == musl, (
+        f"only the musl toolchain may waive a soname; declared={sorted(declared)} "
+        f"rust-musl={sorted(musl)}"
+    )
     for runtime_id, names in declared.items():
         assert names == ["libc.so"], runtime_id
 

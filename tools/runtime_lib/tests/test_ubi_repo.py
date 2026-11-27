@@ -126,8 +126,33 @@ def test_a_repository_that_fails_is_skipped_rather_than_fatal() -> None:
 
 
 def _waiver_file(tmp_path: Path) -> Path:
+    """Write the fixture waiver. Deliberately not a copy of the shipped file: the
+    shipped file's valid end state is empty, so using it as the fixture made these
+    tests fail the day the retainer retired the entry it describes."""
     path = tmp_path / "ubi-lag-waivers.json"
-    path.write_text(_POAM.read_text(encoding="utf-8"), encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            {
+                "waivers": [
+                    {
+                        "advisory": "RHSA-2026:99715",
+                        "package": "krb5-libs",
+                        "fixed_evr": "0:" + FIXED,
+                        "expires_on": "2026-11-30",
+                        "reason": (
+                            "RHEL 9 advisory RHSA-2026:99715 published 2026-11-12; "
+                            "the fixed RPM 0:1.21.1-10.el9_9.2 is not yet published "
+                            "to UBI9 BaseOS repodata, so no build can install it."
+                        ),
+                        "cves": ["CVE-2026-112321", "CVE-2026-71199"],
+                    }
+                ]
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return path
 
 

@@ -220,6 +220,55 @@ def test_add_runtime_line_clones_and_rewrites(
     assert "bun-linux-x64.zip" in checksum
 
 
+def test_add_runtime_line_records_the_line_in_the_readme(
+    mocker: pytest.MockFixture,
+    fake_runtimes_root: Path,
+    isolated_readme: Path,
+) -> None:
+    """The README's table is what `test_the_readme_lists_every_active_runtime` reads,
+    and the row is prose — so the clone writes it instead of leaving CI to go red the
+    next time a line is added."""
+    _write_runtime_manifest(fake_runtimes_root, "bun13", "bun", "1.3.14", "1.3")
+    mocker.patch.object(
+        bump_version, "fetch_checksums", return_value=[("aa11", "bun.zip")]
+    )
+
+    bump_version.add_runtime_line("bun", "1.4.0")
+
+    table = isolated_readme.read_text(encoding="utf-8").splitlines()
+    added = [line for line in table if "`bun14`" in line]
+    assert len(added) == 1, table
+    assert added[0] == (
+        "| `bun14` | Bun 1.4 | 1.4 | Bun bootstraps the Runtime API directly |"
+    )
+    # Directly after the row it cloned, so the family stays in version order.
+    assert table.index(added[0]) == table.index(
+        next(line for line in table if "`bun13`" in line)
+    ) + 1
+
+    # A second run must not add the row twice.
+    bump_version.record_runtime_in_readme(
+        "bun14",
+        {"runtime_id": "bun14", "display_name": "Bun 1.4", "version_line": "1.4"},
+        "bun13",
+    )
+    assert isolated_readme.read_text(encoding="utf-8").splitlines() == table
+
+
+def test_a_readme_that_cannot_name_the_source_line_fails_loudly(
+    isolated_readme: Path,
+) -> None:
+    """Dropping the row silently would put the drift back; the bump has to say so."""
+    isolated_readme.write_text(
+        "# Runtime factory\n\nNo table here.\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match=r"`bun13`"):
+        bump_version.record_runtime_in_readme(
+            "bun14", {"display_name": "Bun 1.4", "version_line": "1.4"}, "bun13"
+        )
+
+
 def test_bump_latest_adds_new_lines(
     mocker: pytest.MockFixture,
     monkeypatch: pytest.MonkeyPatch,

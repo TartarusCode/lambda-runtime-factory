@@ -14,6 +14,37 @@ if str(_RUNTIME_LIB_DIR) not in sys.path:
     sys.path.insert(0, str(_RUNTIME_LIB_DIR))
 
 
+# A runtime table shaped like the README's, with a row for each family the
+# new-line tests clone from.
+_README_FIXTURE = """\
+# Runtime factory
+
+## Runtimes
+
+| Runtime id | Runtime | Line | Notes |
+| --- | --- | --- | --- |
+| `bun13` | Bun 1.3 | 1.3 | Bun bootstraps the Runtime API directly |
+| `pypy311` | PyPy 3.11 | 3.11 | Portable PyPy build from python.org |
+
+Ids follow the framework and version line.
+"""
+
+
+@pytest.fixture(autouse=True)
+def isolated_readme(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the README writer at a scratch file.
+
+    `add_runtime_line` records the new line in the README's runtime table, so a test
+    that creates one would otherwise edit the checkout's own README.
+    """
+    import bump_version
+
+    path = tmp_path / "README.md"
+    path.write_text(_README_FIXTURE, encoding="utf-8")
+    monkeypatch.setattr(bump_version, "readme_path", lambda: path)
+    return path
+
+
 @pytest.fixture()
 def bun_releases() -> list[dict[str, object]]:
     """Fake GitHub releases API response for oven-sh/bun (releases list)."""

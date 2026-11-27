@@ -119,6 +119,7 @@ jobs:
           # tree should ride along.
           add-paths: |
             runtimes/**
+            README.md
             tools/compliance/ubi-lag-waivers.json
           body-path: ${{ runner.temp }}/pr_body.txt
 
