@@ -42,6 +42,17 @@ WAIVER_RELATIVE_PATH = "tools/compliance/ubi-lag-waivers.json"
 # leave the arm64 cells carrying a finding that nothing they can reach will fix.
 WAIVER_RPM_ARCHS: Tuple[str, ...] = ("x86_64", "arm64")
 
+# The README's runtime table is what a reader picks a base from, and
+# `test_the_readme_lists_every_active_runtime` fails the build when an active runtime
+# is missing from it. The row cannot be derived from the manifest alone — the Notes
+# cell is prose only the neighbouring line knows — so creating a line records it next
+# to the row it cloned.
+README_RELATIVE_PATH = "README.md"
+_README_RUNTIME_ROW = re.compile(
+    r"^\|\s*`(?P<id>[^`]+)`\s*"
+    r"\|(?P<name>[^|]*)\|(?P<line>[^|]*)\|(?P<notes>[^|]*)\|\s*$"
+)
+
 
 def _github_headers(accept: str = "application/vnd.github+json") -> Dict[str, str]:
     """Headers for GitHub API requests, authenticated when a token is available.
@@ -613,6 +624,48 @@ def detect_new_lines() -> Dict[str, Dict[str, str]]:
     return new_lines
 
 
+def readme_path() -> Path:
+    return repo_root() / README_RELATIVE_PATH
+
+
+def record_runtime_in_readme(
+    new_id: str, manifest: Dict[str, Any], source_id: str
+) -> None:
+    """Record a new runtime line in the README's runtime table.
+
+    The row goes directly after the one it cloned, so the table keeps its
+    oldest-to-newest order within a family.
+    """
+    path = readme_path()
+    if not path.exists():
+        print(f"  {path} is missing; the runtime table was not updated")
+        return
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    rows = {
+        match["id"]: (index, match)
+        for index, line in enumerate(lines)
+        if (match := _README_RUNTIME_ROW.match(line))
+    }
+    if new_id in rows:
+        return
+    if source_id not in rows:
+        raise ValueError(
+            f"{README_RELATIVE_PATH} lists no `{source_id}` row, so `{new_id}` has "
+            "nowhere to go — add the row by hand"
+        )
+
+    index, source = rows[source_id]
+    notes = source["notes"].strip()
+    line_value = str(
+        manifest.get("version_line") or manifest.get("python_version") or ""
+    )
+    display = str(manifest.get("display_name") or new_id)
+    lines.insert(index + 1, f"| `{new_id}` | {display} | {line_value} | {notes} |")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"  Recorded {new_id} in {README_RELATIVE_PATH}")
+
+
 def add_runtime_line(family: str, version: str, *, dry_run: bool = False) -> str:
     """Create a runtime directory for a new version line by cloning the newest same-family runtime."""
     new_id = _new_line_id(family, version)
@@ -665,6 +718,11 @@ def add_runtime_line(family: str, version: str, *, dry_run: bool = False) -> str
     except Exception:
         shutil.rmtree(dest, ignore_errors=True)
         raise
+
+    # Outside the cleanup block on purpose: the clone is complete, so a README that
+    # cannot name the new line is a documentation defect to report — not a reason to
+    # throw away a runtime that was created correctly.
+    record_runtime_in_readme(new_id, manifest, source_id)
 
     print(f"  Created {new_id} at version {version} (line {_line_for(family, version)})")
     return new_id

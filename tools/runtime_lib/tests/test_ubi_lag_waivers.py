@@ -29,9 +29,43 @@ KRB5_INSTALLED = "1.21.1-10.el9_8.1"
 KRB5_FIXED = "1.21.1-10.el9_9.2"
 TODAY = "2026-11-16"
 
+# The fixture is deliberately a literal, not the shipped file. An empty
+# `{"waivers": []}` is the POA&M's valid end state — the retainer leaves it behind
+# once the fixed RPM reaches UBI9 — so a test that read the repository's copy would
+# go red on the day the waiver it describes was retired, which is the day the
+# mechanism worked.
+SAMPLE_WAIVER = {
+    "advisory": "RHSA-2026:99715",
+    "package": "krb5-libs",
+    "fixed_evr": "0:1.21.1-10.el9_9.2",
+    "expires_on": "2026-11-30",
+    "reason": (
+        "RHEL 9 advisory RHSA-2026:99715 published 2026-11-12; the fixed RPM "
+        "0:1.21.1-10.el9_9.2 is not yet published to UBI9 BaseOS repodata or "
+        "Iron Bank ubi9-minimal, so no base image and no build-time upgrade can "
+        "install it."
+    ),
+    "cves": [
+        "CVE-2026-107364",
+        "CVE-2026-112315",
+        "CVE-2026-112316",
+        "CVE-2026-112317",
+        "CVE-2026-112318",
+        "CVE-2026-112319",
+        "CVE-2026-112320",
+        "CVE-2026-112321",
+        "CVE-2026-112322",
+        "CVE-2026-112323",
+        "CVE-2026-118380",
+        "CVE-2026-119079",
+        "CVE-2026-71199",
+        "CVE-2026-71200",
+    ],
+}
 
-def shipped_waiver() -> dict:
-    return json.loads(_POAM.read_text(encoding="utf-8"))["waivers"][0]
+
+def sample_waiver() -> dict:
+    return json.loads(json.dumps(SAMPLE_WAIVER))
 
 
 def _match(
@@ -76,7 +110,7 @@ def _fixture(
     )
 
     waivers = tmp_path / "ubi-lag-waivers.json"
-    waivers.write_text(json.dumps({"waivers": [waiver or shipped_waiver()]}), encoding="utf-8")
+    waivers.write_text(json.dumps({"waivers": [waiver or sample_waiver()]}), encoding="utf-8")
     return report, spdx, waivers
 
 
@@ -124,7 +158,7 @@ def _gate(
 
 def test_a_fixable_high_without_a_waiver_still_fails_the_gate(tmp_path: Path) -> None:
     """The gate has to keep its teeth: the waiver mechanism is not a way past it."""
-    waiver = shipped_waiver()
+    waiver = sample_waiver()
     waiver["cves"] = ["CVE-2026-999999"]
     report, spdx, waivers = _fixture(tmp_path, [_match()], waiver=waiver)
 
@@ -140,7 +174,7 @@ def test_a_fixable_high_without_a_waiver_still_fails_the_gate(tmp_path: Path) ->
 def test_an_expired_waiver_stops_covering_its_findings(tmp_path: Path) -> None:
     """`expires_on` is the last day the entry waives anything, so the acknowledgement
     cannot outlive the lag window on its own."""
-    waiver = shipped_waiver()
+    waiver = sample_waiver()
     waiver["expires_on"] = "2026-11-15"
     report, spdx, waivers = _fixture(tmp_path, [_match()], waiver=waiver)
 
@@ -254,7 +288,7 @@ def test_the_active_rhsa_waiver_passes_while_the_finding_stays_in_the_report(
     """The whole point: 14 fixable High findings, zero blocking, and the report still
     names all 14 — a waiver that removed them would leave an artifact claiming the
     image is clean."""
-    cves = shipped_waiver()["cves"]
+    cves = sample_waiver()["cves"]
     report, spdx, waivers = _fixture(
         tmp_path, [_match(cve=cve) for cve in cves], installed=KRB5_INSTALLED
     )
@@ -266,7 +300,7 @@ def test_the_active_rhsa_waiver_passes_while_the_finding_stays_in_the_report(
     assert gate["blocking"] == []
     assert len(gate["waived"]) == len(cves)
     assert gate["waived_high"] == len(cves)
-    assert gate["active_advisories"] == [shipped_waiver()["advisory"]]
+    assert gate["active_advisories"] == [sample_waiver()["advisory"]]
     assert gate["poam"][0]["state"] == "active"
 
     # And the report the gate read is untouched: the findings are still in it.
@@ -278,7 +312,7 @@ def test_a_waiver_matches_on_cve_and_package_not_the_installed_build(tmp_path: P
     """A POA&M acknowledges a CVE for a package until a date. The old exact-build
     match made the entry fail whenever either base patched on a different day, which
     is the whole problem a single waiver list cannot solve."""
-    waiver = shipped_waiver()
+    waiver = sample_waiver()
     waiver["installed_evr"] = "0:9.9.9-1.el9"  # an extra field must not affect matching
     report, spdx, waivers = _fixture(tmp_path, [_match()], waiver=waiver)
 
@@ -341,7 +375,7 @@ def test_a_malformed_poam_fails_instead_of_waiving_nothing(tmp_path: Path) -> No
 def test_the_provenance_keeps_raw_counts_and_adds_the_poam_verdict(tmp_path: Path) -> None:
     """An auditor reads `high=14` and `0 unwaived`, not `high=0`: the severity counts
     stay what Grype found, and the waiver is reported beside them."""
-    cves = shipped_waiver()["cves"]
+    cves = sample_waiver()["cves"]
     report, spdx, waivers = _fixture(
         tmp_path, [_match(cve=cve) for cve in cves], installed=KRB5_INSTALLED
     )
@@ -391,15 +425,20 @@ def test_the_provenance_keeps_raw_counts_and_adds_the_poam_verdict(tmp_path: Pat
     assert provenance["unwaived_blocking_cves"] == 0
     assert provenance["unwaived_blocking_cve_ids"] == []
     assert sorted(provenance["waived_cve_ids"]) == sorted(cves)
-    assert provenance["active_poam_advisories"] == [shipped_waiver()["advisory"]]
+    assert provenance["active_poam_advisories"] == [sample_waiver()["advisory"]]
     assert provenance["cve_gate"] == "pass"
     assert provenance["cve_gate_enforcement"] == "enforced"
     assert provenance["cve_gate_base_source"] == "ironbank"
 
 
 def test_the_shipped_poam_is_a_usable_record() -> None:
+    """Every entry the file holds has to be readable by the gate. The file is
+    allowed to hold none: emptying the list is what the retainer does when the
+    lag window closes, and that end state must not fail the build."""
     document = json.loads(_POAM.read_text(encoding="utf-8"))
-    assert document.get("waivers"), "the file must hold the acknowledgements the gate reads"
+    assert isinstance(document.get("waivers"), list), (
+        "the file must carry the waivers key"
+    )
 
     for entry in document["waivers"]:
         assert {
