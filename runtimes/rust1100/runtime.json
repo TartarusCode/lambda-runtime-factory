@@ -1,0 +1,15 @@
+{
+  "runtime_id": "rust1100",
+  "runtime_family": "rust-musl",
+  "display_name": "Rust 1.100",
+  "distribution_version": "1.100.0",
+  "version_line": "1.100",
+  "artifact": {
+    "checksum_file": "checksums/rust.sha256"
+  },
+  "local_testing": {
+    "handler": "handler",
+    "code_uri": "examples/local/hello",
+    "skip_local_invoke": true
+  }
+}

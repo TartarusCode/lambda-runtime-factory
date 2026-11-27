@@ -111,6 +111,7 @@ so `rustc` itself cannot run inside a glibc image (UBI9 ships no musl loader). T
 | `pypy312` | PyPy 3.12 | 3.12 | Portable PyPy build from python.org; ships the Runtime API bootstrap and the helper package |
 | `rust198` | Rust 1.98 | 1.98 | Rust musl toolchain image |
 | `rust199` | Rust 1.99 | 1.99 | Rust musl toolchain image |
+| `rust1100` | Rust 1.100 | 1.100 | Rust musl toolchain image |
 
 
 Ids follow the framework and version line: a runtime tracks one line (`go126` is Go 1.26), and a
