@@ -657,12 +657,6 @@ def add_runtime_line(family: str, version: str, *, dry_run: bool = False) -> str
         _apply_upstream_overrides(family, version, checksums, manifest)
         manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
-        for rel in ("examples/sam/Makefile", "examples/sls/serverless.yml"):
-            path = dest / rel
-            if path.exists():
-                text = path.read_text(encoding="utf-8").replace(source_id, new_id)
-                path.write_text(text, encoding="utf-8")
-
         checksum_rel = _apply_defaults(new_id, manifest)["artifact"]["checksum_file"]
         checksum_path = dest / checksum_rel
         checksum_path.parent.mkdir(parents=True, exist_ok=True)

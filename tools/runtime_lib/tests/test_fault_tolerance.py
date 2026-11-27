@@ -107,7 +107,6 @@ def _write_pypy_manifest(root: Path, version: str) -> None:
         "display_name": "PyPy 3.11",
         "distribution_version": version,
         "artifact": {"checksum_file": "checksums/pypy.sha256"},
-        "release": {"regions": ["eu-central-1"]},
     }
     path = root / "pypy311" / "runtime.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -217,7 +216,6 @@ def test_add_runtime_line_failure_leaves_no_partial_directory(
                 "distribution_version": "1.3.14",
                 "version_line": "1.3",
                 "artifact": {"checksum_file": "checksums/bun.sha256"},
-                "release": {"regions": ["eu-central-1"]},
             }
         ),
         encoding="utf-8",
@@ -351,7 +349,6 @@ def _write_graalpy_manifest(root: Path, version: str, release_tag: str | None = 
         "distribution_version": version,
         "python_version": "3.13",
         "artifact": {"checksum_file": "checksums/graalpy.sha256"},
-        "release": {"regions": ["eu-central-1"]},
     }
     if release_tag is not None:
         manifest["release_tag"] = release_tag

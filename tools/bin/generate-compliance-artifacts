@@ -186,7 +186,7 @@ for registry in "${lineage_registries[@]}"; do
 done
 
 # --- provenance ----------------------------------------------------------------
-payload_manifest="${LAYER_ROOT}/runtime-manifest.json"
+payload_manifest="${PAYLOAD_ROOT}/runtime-manifest.json"
 if [[ ! -f "${payload_manifest}" ]]; then
     echo "Missing ${payload_manifest}: rebuild the payload so the image records where it came from" >&2
     exit 1

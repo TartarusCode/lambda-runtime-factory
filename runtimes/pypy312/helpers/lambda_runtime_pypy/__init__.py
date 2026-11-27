@@ -1,4 +1,4 @@
-"""Developer helpers shipped with the PyPy Lambda runtime layer."""
+"""Developer helpers shipped with the PyPy Lambda runtime image."""
 
 from lambda_runtime_pypy.init import register_init_hook, run_configured_init_hooks
 from lambda_runtime_pypy.logging import clear_context, get_logger, set_context
